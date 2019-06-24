@@ -53,7 +53,7 @@ ifeq ($(abspath $(CONFIG_ENV)),$(SPDK_ROOT_DIR)/lib/$(ENV_NAME))
 DIRS-y += $(ENV_NAME)
 endif
 
-DEPDIRS-bdev := copy conf json jsonrpc log rpc thread trace util
+DEPDIRS-bdev := copy conf env_dpdk json jsonrpc log rpc thread trace util
 DEPDIRS-blob := log util
 DEPDIRS-copy := thread
 DEPDIRS-event := bdev conf copy env_dpdk json jsonrpc log rpc thread trace util
