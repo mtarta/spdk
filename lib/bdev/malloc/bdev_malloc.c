@@ -35,6 +35,7 @@
 
 #include "bdev_malloc.h"
 #include "spdk/bdev.h"
+#include "spdk/bdev_malloc.h"
 #include "spdk/conf.h"
 #include "spdk/endian.h"
 #include "spdk/env.h"
@@ -49,8 +50,8 @@
 
 struct malloc_disk {
 	struct spdk_bdev		disk;
-	void				*malloc_buf;
 	TAILQ_ENTRY(malloc_disk)	link;
+	void				*malloc_buf;
 };
 
 struct malloc_task {
@@ -123,8 +124,8 @@ malloc_disk_free(struct malloc_disk *malloc_disk)
 	spdk_dma_free(malloc_disk);
 }
 
-static int
-bdev_malloc_destruct(void *ctx)
+int
+spdk_bdev_malloc_destruct(void *ctx)
 {
 	struct malloc_disk *malloc_disk = ctx;
 
@@ -316,15 +317,15 @@ static int _bdev_malloc_submit_request(struct spdk_io_channel *ch, struct spdk_b
 	return 0;
 }
 
-static void bdev_malloc_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io)
+void spdk_bdev_malloc_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io)
 {
 	if (_bdev_malloc_submit_request(ch, bdev_io) != 0) {
 		spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
 	}
 }
 
-static bool
-bdev_malloc_io_type_supported(void *ctx, enum spdk_bdev_io_type io_type)
+bool
+spdk_bdev_malloc_io_type_supported(void *ctx, enum spdk_bdev_io_type io_type)
 {
 	switch (io_type) {
 	case SPDK_BDEV_IO_TYPE_READ:
@@ -340,14 +341,14 @@ bdev_malloc_io_type_supported(void *ctx, enum spdk_bdev_io_type io_type)
 	}
 }
 
-static struct spdk_io_channel *
-bdev_malloc_get_io_channel(void *ctx)
+struct spdk_io_channel *
+spdk_bdev_malloc_get_io_channel(void *ctx)
 {
 	return spdk_copy_engine_get_io_channel();
 }
 
-static void
-bdev_malloc_write_json_config(struct spdk_bdev *bdev, struct spdk_json_write_ctx *w)
+void
+spdk_bdev_malloc_write_json_config(struct spdk_bdev *bdev, struct spdk_json_write_ctx *w)
 {
 	char uuid_str[SPDK_UUID_STRING_LEN];
 
@@ -368,11 +369,11 @@ bdev_malloc_write_json_config(struct spdk_bdev *bdev, struct spdk_json_write_ctx
 }
 
 static const struct spdk_bdev_fn_table malloc_fn_table = {
-	.destruct		= bdev_malloc_destruct,
-	.submit_request		= bdev_malloc_submit_request,
-	.io_type_supported	= bdev_malloc_io_type_supported,
-	.get_io_channel		= bdev_malloc_get_io_channel,
-	.write_config_json	= bdev_malloc_write_json_config,
+	.destruct		= spdk_bdev_malloc_destruct,
+	.submit_request		= spdk_bdev_malloc_submit_request,
+	.io_type_supported	= spdk_bdev_malloc_io_type_supported,
+	.get_io_channel		= spdk_bdev_malloc_get_io_channel,
+	.write_config_json	= spdk_bdev_malloc_write_json_config,
 };
 
 struct spdk_bdev *create_malloc_disk(const char *name, const struct spdk_uuid *uuid,

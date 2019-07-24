@@ -31,18 +31,33 @@
  *   OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-#ifndef SPDK_BDEV_MALLOC_RPC_H
-#define SPDK_BDEV_MALLOC_RPC_H
+/** \file
+ * Malloc Block Device Interface
+ *
+ * For information on why this exists, see json rpc.
+ */
+
+#ifndef SPDK_BDEV_MALLOC_H
+#define SPDK_BDEV_MALLOC_H
+
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 #include "spdk/stdinc.h"
 
 #include "spdk/bdev.h"
+#include "spdk/json.h"
+#include "spdk/thread.h"
 
-typedef void (*spdk_delete_malloc_complete)(void *cb_arg, int bdeverrno);
+int spdk_bdev_malloc_destruct(void *ctx);
+void spdk_bdev_malloc_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io);
+bool spdk_bdev_malloc_io_type_supported(void *ctx, enum spdk_bdev_io_type io_type);
+struct spdk_io_channel *spdk_bdev_malloc_get_io_channel(void *ctx);
+void spdk_bdev_malloc_write_json_config(struct spdk_bdev *bdev, struct spdk_json_write_ctx *w);
 
-struct spdk_bdev *create_malloc_disk(const char *name, const struct spdk_uuid *uuid,
-				     uint64_t num_blocks, uint32_t block_size);
+#ifdef __cplusplus
+}
+#endif
 
-void delete_malloc_disk(struct spdk_bdev *bdev, spdk_delete_malloc_complete cb_fn, void *cb_arg);
-
-#endif /* SPDK_BDEV_MALLOC_RPC_H */
+#endif /* SPDK_BDEV_MALLOC_H */
