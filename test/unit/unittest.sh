@@ -65,6 +65,10 @@ if grep -q '#define SPDK_CONFIG_CRYPTO 1' $rootdir/include/spdk/config.h; then
 	$valgrind $testdir/lib/bdev/crypto.c/crypto_ut
 fi
 
+if grep -q '#define SPDK_CONFIG_REDUCE 1' $rootdir/include/spdk/config.h; then
+        $valgrind $testdir/lib/bdev/compress.c/compress_ut
+fi
+
 if grep -q '#define SPDK_CONFIG_PMDK 1' $rootdir/include/spdk/config.h; then
 	$valgrind $testdir/lib/bdev/pmem/bdev_pmem_ut
 fi
@@ -93,6 +97,7 @@ $valgrind $testdir/lib/nvme/nvme_ns_ocssd_cmd.c/nvme_ns_ocssd_cmd_ut
 $valgrind $testdir/lib/nvme/nvme_qpair.c/nvme_qpair_ut
 $valgrind $testdir/lib/nvme/nvme_pcie.c/nvme_pcie_ut
 $valgrind $testdir/lib/nvme/nvme_quirks.c/nvme_quirks_ut
+$valgrind $testdir/lib/nvme/nvme_tcp.c/nvme_tcp_ut
 if grep -q '#define SPDK_CONFIG_RDMA 1' $rootdir/include/spdk/config.h; then
 	$valgrind $testdir/lib/nvme/nvme_rdma.c/nvme_rdma_ut
 fi
@@ -120,8 +125,11 @@ $valgrind $testdir/lib/scsi/dev.c/dev_ut
 $valgrind $testdir/lib/scsi/lun.c/lun_ut
 $valgrind $testdir/lib/scsi/scsi.c/scsi_ut
 $valgrind $testdir/lib/scsi/scsi_bdev.c/scsi_bdev_ut
+$valgrind $testdir/lib/scsi/scsi_pr.c/scsi_pr_ut
 
 $valgrind $testdir/lib/lvol/lvol.c/lvol_ut
+
+$valgrind $testdir/lib/notify/notify.c/notify_ut
 
 $valgrind $testdir/lib/iscsi/conn.c/conn_ut
 $valgrind $testdir/lib/iscsi/param.c/param_ut
@@ -147,15 +155,14 @@ $valgrind $testdir/lib/util/dif.c/dif_ut
 
 if [ $(uname -s) = Linux ]; then
 $valgrind $testdir/lib/vhost/vhost.c/vhost_ut
-fi
 
-if grep -q '#define SPDK_CONFIG_FTL 1' $rootdir/include/spdk/config.h; then
 $valgrind $testdir/lib/ftl/ftl_rwb.c/ftl_rwb_ut
 $valgrind $testdir/lib/ftl/ftl_ppa/ftl_ppa_ut
 $valgrind $testdir/lib/ftl/ftl_band.c/ftl_band_ut
 $valgrind $testdir/lib/ftl/ftl_reloc.c/ftl_reloc_ut
 $valgrind $testdir/lib/ftl/ftl_wptr/ftl_wptr_ut
 $valgrind $testdir/lib/ftl/ftl_md/ftl_md_ut
+$valgrind $testdir/lib/ftl/ftl_io.c/ftl_io_ut
 fi
 
 # local unit test coverage

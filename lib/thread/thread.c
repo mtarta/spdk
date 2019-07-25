@@ -42,15 +42,9 @@
 #include "spdk_internal/log.h"
 #include "spdk_internal/thread.h"
 
-#ifdef __linux__
-#include <sys/prctl.h>
-#endif
-
-#ifdef __FreeBSD__
-#include <pthread_np.h>
-#endif
-
 #define SPDK_MSG_BATCH_SIZE		8
+#define SPDK_MAX_DEVICE_NAME_LEN	256
+#define SPDK_MAX_THREAD_NAME_LEN	256
 
 static pthread_mutex_t g_devlist_mutex = PTHREAD_MUTEX_INITIALIZER;
 
@@ -59,7 +53,7 @@ static size_t g_ctx_sz = 0;
 
 struct io_device {
 	void				*io_device;
-	char				*name;
+	char				name[SPDK_MAX_DEVICE_NAME_LEN + 1];
 	spdk_io_channel_create_cb	create_cb;
 	spdk_io_channel_destroy_cb	destroy_cb;
 	spdk_io_device_unregister_cb	unregister_cb;
@@ -111,7 +105,11 @@ struct spdk_poller {
 struct spdk_thread {
 	TAILQ_HEAD(, spdk_io_channel)	io_channels;
 	TAILQ_ENTRY(spdk_thread)	tailq;
-	char				*name;
+	char				name[SPDK_MAX_THREAD_NAME_LEN + 1];
+
+	bool				exit;
+
+	struct spdk_cpuset		cpumask;
 
 	uint64_t			tsc_last;
 	struct spdk_thread_stats	stats;
@@ -149,18 +147,6 @@ _get_thread(void)
 	return tls_thread;
 }
 
-static void
-_set_thread_name(const char *thread_name)
-{
-#if defined(__linux__)
-	prctl(PR_SET_NAME, thread_name, 0, 0, 0);
-#elif defined(__FreeBSD__)
-	pthread_set_name_np(pthread_self(), thread_name);
-#else
-#error missing platform support for thread name
-#endif
-}
-
 int
 spdk_thread_lib_init(spdk_new_thread_fn new_thread_fn, size_t ctx_sz)
 {
@@ -196,87 +182,19 @@ spdk_thread_lib_fini(void)
 
 	if (g_spdk_msg_mempool) {
 		spdk_mempool_free(g_spdk_msg_mempool);
+		g_spdk_msg_mempool = NULL;
 	}
+
+	g_new_thread_fn = NULL;
+	g_ctx_sz = 0;
 }
 
-struct spdk_thread *
-spdk_thread_create(const char *name)
-{
-	struct spdk_thread *thread;
-	struct spdk_msg *msgs[SPDK_MSG_MEMPOOL_CACHE_SIZE];
-	int rc, i;
-
-	thread = calloc(1, sizeof(*thread) + g_ctx_sz);
-	if (!thread) {
-		SPDK_ERRLOG("Unable to allocate memory for thread\n");
-		return NULL;
-	}
-
-	TAILQ_INIT(&thread->io_channels);
-	TAILQ_INIT(&thread->active_pollers);
-	TAILQ_INIT(&thread->timer_pollers);
-	SLIST_INIT(&thread->msg_cache);
-	thread->msg_cache_count = 0;
-
-	thread->tsc_last = spdk_get_ticks();
-
-	thread->messages = spdk_ring_create(SPDK_RING_TYPE_MP_SC, 65536, SPDK_ENV_SOCKET_ID_ANY);
-	if (!thread->messages) {
-		SPDK_ERRLOG("Unable to allocate memory for message ring\n");
-		free(thread);
-		return NULL;
-	}
-
-	/* Fill the local message pool cache. */
-	rc = spdk_mempool_get_bulk(g_spdk_msg_mempool, (void **)msgs, SPDK_MSG_MEMPOOL_CACHE_SIZE);
-	if (rc == 0) {
-		/* If we can't populate the cache it's ok. The cache will get filled
-		 * up organically as messages are passed to the thread. */
-		for (i = 0; i < SPDK_MSG_MEMPOOL_CACHE_SIZE; i++) {
-			SLIST_INSERT_HEAD(&thread->msg_cache, msgs[i], link);
-			thread->msg_cache_count++;
-		}
-	}
-
-	if (name) {
-		_set_thread_name(name);
-		thread->name = strdup(name);
-	} else {
-		thread->name = spdk_sprintf_alloc("%p", thread);
-	}
-
-	SPDK_DEBUGLOG(SPDK_LOG_THREAD, "Allocating new thread %s\n", thread->name);
-
-	pthread_mutex_lock(&g_devlist_mutex);
-	TAILQ_INSERT_TAIL(&g_threads, thread, tailq);
-	g_thread_count++;
-	pthread_mutex_unlock(&g_devlist_mutex);
-
-	if (g_new_thread_fn) {
-		g_new_thread_fn(thread);
-	}
-
-	return thread;
-}
-
-void
-spdk_set_thread(struct spdk_thread *thread)
-{
-	tls_thread = thread;
-}
-
-void
-spdk_thread_exit(struct spdk_thread *thread)
+static void
+_free_thread(struct spdk_thread *thread)
 {
 	struct spdk_io_channel *ch;
 	struct spdk_msg *msg;
 	struct spdk_poller *poller, *ptmp;
-
-	SPDK_DEBUGLOG(SPDK_LOG_THREAD, "Freeing thread %s\n", thread->name);
-
-	if (tls_thread == thread) {
-		tls_thread = NULL;
-	}
 
 	TAILQ_FOREACH(ch, &thread->io_channels, tailq) {
 		SPDK_ERRLOG("thread %s still has channel for io_device %s\n",
@@ -310,8 +228,6 @@ spdk_thread_exit(struct spdk_thread *thread)
 	TAILQ_REMOVE(&g_threads, thread, tailq);
 	pthread_mutex_unlock(&g_devlist_mutex);
 
-	free(thread->name);
-
 	msg = SLIST_FIRST(&thread->msg_cache);
 	while (msg != NULL) {
 		SLIST_REMOVE_HEAD(&thread->msg_cache, link);
@@ -325,11 +241,107 @@ spdk_thread_exit(struct spdk_thread *thread)
 
 	assert(thread->msg_cache_count == 0);
 
-	if (thread->messages) {
-		spdk_ring_free(thread->messages);
+	spdk_ring_free(thread->messages);
+	free(thread);
+}
+
+struct spdk_thread *
+spdk_thread_create(const char *name, struct spdk_cpuset *cpumask)
+{
+	struct spdk_thread *thread;
+	struct spdk_msg *msgs[SPDK_MSG_MEMPOOL_CACHE_SIZE];
+	int rc, i;
+
+	thread = calloc(1, sizeof(*thread) + g_ctx_sz);
+	if (!thread) {
+		SPDK_ERRLOG("Unable to allocate memory for thread\n");
+		return NULL;
 	}
 
-	free(thread);
+	if (cpumask) {
+		spdk_cpuset_copy(&thread->cpumask, cpumask);
+	} else {
+		spdk_cpuset_negate(&thread->cpumask);
+	}
+
+	TAILQ_INIT(&thread->io_channels);
+	TAILQ_INIT(&thread->active_pollers);
+	TAILQ_INIT(&thread->timer_pollers);
+	SLIST_INIT(&thread->msg_cache);
+	thread->msg_cache_count = 0;
+
+	thread->tsc_last = spdk_get_ticks();
+
+	thread->messages = spdk_ring_create(SPDK_RING_TYPE_MP_SC, 65536, SPDK_ENV_SOCKET_ID_ANY);
+	if (!thread->messages) {
+		SPDK_ERRLOG("Unable to allocate memory for message ring\n");
+		free(thread);
+		return NULL;
+	}
+
+	/* Fill the local message pool cache. */
+	rc = spdk_mempool_get_bulk(g_spdk_msg_mempool, (void **)msgs, SPDK_MSG_MEMPOOL_CACHE_SIZE);
+	if (rc == 0) {
+		/* If we can't populate the cache it's ok. The cache will get filled
+		 * up organically as messages are passed to the thread. */
+		for (i = 0; i < SPDK_MSG_MEMPOOL_CACHE_SIZE; i++) {
+			SLIST_INSERT_HEAD(&thread->msg_cache, msgs[i], link);
+			thread->msg_cache_count++;
+		}
+	}
+
+	if (name) {
+		snprintf(thread->name, sizeof(thread->name), "%s", name);
+	} else {
+		snprintf(thread->name, sizeof(thread->name), "%p", thread);
+	}
+
+	SPDK_DEBUGLOG(SPDK_LOG_THREAD, "Allocating new thread %s\n", thread->name);
+
+	pthread_mutex_lock(&g_devlist_mutex);
+	TAILQ_INSERT_TAIL(&g_threads, thread, tailq);
+	g_thread_count++;
+	pthread_mutex_unlock(&g_devlist_mutex);
+
+	if (g_new_thread_fn) {
+		rc = g_new_thread_fn(thread);
+		if (rc != 0) {
+			_free_thread(thread);
+			return NULL;
+		}
+	}
+
+	return thread;
+}
+
+void
+spdk_set_thread(struct spdk_thread *thread)
+{
+	tls_thread = thread;
+}
+
+void
+spdk_thread_exit(struct spdk_thread *thread)
+{
+	SPDK_DEBUGLOG(SPDK_LOG_THREAD, "Exit thread %s\n", thread->name);
+
+	assert(tls_thread == thread);
+
+	thread->exit = true;
+}
+
+void
+spdk_thread_destroy(struct spdk_thread *thread)
+{
+	SPDK_DEBUGLOG(SPDK_LOG_THREAD, "Destroy thread %s\n", thread->name);
+
+	assert(thread->exit == true);
+
+	if (tls_thread == thread) {
+		tls_thread = NULL;
+	}
+
+	_free_thread(thread);
 }
 
 void *
@@ -340,6 +352,12 @@ spdk_thread_get_ctx(struct spdk_thread *thread)
 	}
 
 	return NULL;
+}
+
+struct spdk_cpuset *
+spdk_thread_get_cpumask(struct spdk_thread *thread)
+{
+	return &thread->cpumask;
 }
 
 struct spdk_thread *
@@ -386,6 +404,10 @@ _spdk_msg_queue_run_batch(struct spdk_thread *thread, uint32_t max_msgs)
 
 		assert(msg != NULL);
 		msg->fn(msg->arg);
+
+		if (thread->exit) {
+			break;
+		}
 
 		if (thread->msg_cache_count < SPDK_MSG_MEMPOOL_CACHE_SIZE) {
 			/* Insert the messages at the head. We want to re-use the hot
@@ -446,6 +468,10 @@ spdk_thread_poll(struct spdk_thread *thread, uint32_t max_msgs, uint64_t now)
 				   active_pollers_head, tailq, tmp) {
 		int poller_rc;
 
+		if (thread->exit) {
+			break;
+		}
+
 		if (poller->state == SPDK_POLLER_STATE_UNREGISTERED) {
 			TAILQ_REMOVE(&thread->active_pollers, poller, tailq);
 			free(poller);
@@ -477,6 +503,10 @@ spdk_thread_poll(struct spdk_thread *thread, uint32_t max_msgs, uint64_t now)
 
 	TAILQ_FOREACH_SAFE(poller, &thread->timer_pollers, tailq, tmp) {
 		int timer_rc = 0;
+
+		if (thread->exit) {
+			break;
+		}
 
 		if (poller->state == SPDK_POLLER_STATE_UNREGISTERED) {
 			TAILQ_REMOVE(&thread->timer_pollers, poller, tailq);
@@ -519,9 +549,6 @@ spdk_thread_poll(struct spdk_thread *thread, uint32_t max_msgs, uint64_t now)
 	} else if (rc > 0) {
 		/* Poller status busy */
 		thread->stats.busy_tsc += now - thread->tsc_last;
-	} else {
-		/* Poller status unknown */
-		thread->stats.unknown_tsc += now - thread->tsc_last;
 	}
 	thread->tsc_last = now;
 
@@ -656,7 +683,7 @@ spdk_thread_send_msg(const struct spdk_thread *thread, spdk_msg_fn fn, void *ctx
 	msg->fn = fn;
 	msg->arg = ctx;
 
-	rc = spdk_ring_enqueue(thread->messages, (void **)&msg, 1);
+	rc = spdk_ring_enqueue(thread->messages, (void **)&msg, 1, NULL);
 	if (rc != 1) {
 		assert(false);
 		spdk_mempool_put(g_spdk_msg_mempool, msg);
@@ -783,7 +810,6 @@ spdk_for_each_thread(spdk_msg_fn fn, void *ctx, spdk_msg_fn cpl)
 	ct->ctx = ctx;
 	ct->cpl = cpl;
 
-	pthread_mutex_lock(&g_devlist_mutex);
 	thread = _get_thread();
 	if (!thread) {
 		SPDK_ERRLOG("No thread allocated\n");
@@ -792,6 +818,8 @@ spdk_for_each_thread(spdk_msg_fn fn, void *ctx, spdk_msg_fn cpl)
 		return;
 	}
 	ct->orig_thread = thread;
+
+	pthread_mutex_lock(&g_devlist_mutex);
 	ct->cur_thread = TAILQ_FIRST(&g_threads);
 	pthread_mutex_unlock(&g_devlist_mutex);
 
@@ -828,9 +856,9 @@ spdk_io_device_register(void *io_device, spdk_io_channel_create_cb create_cb,
 
 	dev->io_device = io_device;
 	if (name) {
-		dev->name = strdup(name);
+		snprintf(dev->name, sizeof(dev->name), "%s", name);
 	} else {
-		dev->name = spdk_sprintf_alloc("%p", dev);
+		snprintf(dev->name, sizeof(dev->name), "%p", dev);
 	}
 	dev->create_cb = create_cb;
 	dev->destroy_cb = destroy_cb;
@@ -848,7 +876,6 @@ spdk_io_device_register(void *io_device, spdk_io_channel_create_cb create_cb,
 		if (tmp->io_device == io_device) {
 			SPDK_ERRLOG("io_device %p already registered (old:%s new:%s)\n",
 				    io_device, tmp->name, dev->name);
-			free(dev->name);
 			free(dev);
 			pthread_mutex_unlock(&g_devlist_mutex);
 			return;
@@ -867,7 +894,6 @@ _finish_unregister(void *arg)
 		      dev->name, dev->io_device, dev->unregister_thread->name);
 
 	dev->unregister_cb(dev->io_device);
-	free(dev->name);
 	free(dev);
 }
 
@@ -875,7 +901,6 @@ static void
 _spdk_io_device_free(struct io_device *dev)
 {
 	if (dev->unregister_cb == NULL) {
-		free(dev->name);
 		free(dev);
 	} else {
 		assert(dev->unregister_thread != NULL);

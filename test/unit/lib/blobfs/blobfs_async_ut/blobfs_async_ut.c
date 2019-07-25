@@ -49,6 +49,14 @@
 struct spdk_filesystem *g_fs;
 struct spdk_file *g_file;
 int g_fserrno;
+struct spdk_trace_histories *g_trace_histories;
+DEFINE_STUB_V(spdk_trace_add_register_fn, (struct spdk_trace_register_fn *reg_fn));
+DEFINE_STUB_V(spdk_trace_register_description, (const char *name,
+		uint16_t tpoint_id, uint8_t owner_type,
+		uint8_t object_type, uint8_t new_object,
+		uint8_t arg1_is_ptr, const char *arg1_name));
+DEFINE_STUB_V(_spdk_trace_record, (uint64_t tsc, uint16_t tpoint_id, uint16_t poller_id,
+				   uint32_t size, uint64_t object_id, uint64_t arg1));
 
 /* Return NULL to test hardcoded defaults. */
 struct spdk_conf_section *
@@ -376,6 +384,124 @@ fs_rename(void)
 }
 
 static void
+fs_rw_async(void)
+{
+	struct spdk_filesystem *fs;
+	struct spdk_bs_dev *dev;
+	uint8_t w_buf[4096];
+	uint8_t r_buf[4096];
+
+	dev = init_dev();
+
+	spdk_fs_init(dev, NULL, NULL, fs_op_with_handle_complete, NULL);
+	poll_threads();
+	SPDK_CU_ASSERT_FATAL(g_fs != NULL);
+	CU_ASSERT(g_fserrno == 0);
+	fs = g_fs;
+	SPDK_CU_ASSERT_FATAL(fs->bs->dev == dev);
+
+	g_file = NULL;
+	g_fserrno = 1;
+	spdk_fs_open_file_async(fs, "file1", SPDK_BLOBFS_OPEN_CREATE, open_cb, NULL);
+	poll_threads();
+	CU_ASSERT(g_fserrno == 0);
+	SPDK_CU_ASSERT_FATAL(g_file != NULL);
+
+	/* Write file */
+	CU_ASSERT(g_file->length == 0);
+	g_fserrno = 1;
+	memset(w_buf, 0x5a, sizeof(w_buf));
+	spdk_file_write_async(g_file, fs->sync_target.sync_io_channel, w_buf, 0, 4096,
+			      fs_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_fserrno == 0);
+	CU_ASSERT(g_file->length == 4096);
+
+	/* Read file */
+	g_fserrno = 1;
+	memset(r_buf, 0x0, sizeof(r_buf));
+	spdk_file_read_async(g_file, fs->sync_target.sync_io_channel, r_buf, 0, 4096,
+			     fs_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_fserrno == 0);
+	CU_ASSERT(memcmp(r_buf, w_buf, sizeof(r_buf)) == 0);
+
+	g_fserrno = 1;
+	spdk_file_close_async(g_file, fs_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_fserrno == 0);
+
+	g_fserrno = 1;
+	spdk_fs_unload(fs, fs_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_fserrno == 0);
+}
+
+static void
+fs_writev_readv_async(void)
+{
+	struct spdk_filesystem *fs;
+	struct spdk_bs_dev *dev;
+	struct iovec w_iov[2];
+	struct iovec r_iov[2];
+	uint8_t w_buf[4096];
+	uint8_t r_buf[4096];
+
+	dev = init_dev();
+
+	spdk_fs_init(dev, NULL, NULL, fs_op_with_handle_complete, NULL);
+	poll_threads();
+	SPDK_CU_ASSERT_FATAL(g_fs != NULL);
+	CU_ASSERT(g_fserrno == 0);
+	fs = g_fs;
+	SPDK_CU_ASSERT_FATAL(fs->bs->dev == dev);
+
+	g_file = NULL;
+	g_fserrno = 1;
+	spdk_fs_open_file_async(fs, "file1", SPDK_BLOBFS_OPEN_CREATE, open_cb, NULL);
+	poll_threads();
+	CU_ASSERT(g_fserrno == 0);
+	SPDK_CU_ASSERT_FATAL(g_file != NULL);
+
+	/* Write file */
+	CU_ASSERT(g_file->length == 0);
+	g_fserrno = 1;
+	memset(w_buf, 0x5a, sizeof(w_buf));
+	w_iov[0].iov_base = w_buf;
+	w_iov[0].iov_len = 2048;
+	w_iov[1].iov_base = w_buf + 2048;
+	w_iov[1].iov_len = 2048;
+	spdk_file_writev_async(g_file, fs->sync_target.sync_io_channel,
+			       w_iov, 2, 0, 4096, fs_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_fserrno == 0);
+	CU_ASSERT(g_file->length == 4096);
+
+	/* Read file */
+	g_fserrno = 1;
+	memset(r_buf, 0x0, sizeof(r_buf));
+	r_iov[0].iov_base = r_buf;
+	r_iov[0].iov_len = 2048;
+	r_iov[1].iov_base = r_buf + 2048;
+	r_iov[1].iov_len = 2048;
+	spdk_file_readv_async(g_file, fs->sync_target.sync_io_channel,
+			      r_iov, 2, 0, 4096, fs_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_fserrno == 0);
+	CU_ASSERT(memcmp(r_buf, w_buf, sizeof(r_buf)) == 0);
+
+	g_fserrno = 1;
+	spdk_file_close_async(g_file, fs_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_fserrno == 0);
+
+	g_fserrno = 1;
+	spdk_fs_unload(fs, fs_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_fserrno == 0);
+}
+
+static void
 tree_find_buffer_ut(void)
 {
 	struct cache_tree *root;
@@ -485,7 +611,7 @@ channel_ops_sync(void)
 {
 	struct spdk_filesystem *fs;
 	struct spdk_bs_dev *dev;
-	struct spdk_io_channel *channel;
+	struct spdk_fs_thread_ctx *channel;
 
 	dev = init_dev();
 
@@ -496,10 +622,10 @@ channel_ops_sync(void)
 	fs = g_fs;
 	SPDK_CU_ASSERT_FATAL(fs->bs->dev == dev);
 
-	channel =  spdk_fs_alloc_io_channel_sync(fs);
+	channel =  spdk_fs_alloc_thread_ctx(fs);
 	CU_ASSERT(channel != NULL);
 
-	spdk_fs_free_io_channel(channel);
+	spdk_fs_free_thread_ctx(channel);
 
 	g_fserrno = 1;
 	spdk_fs_unload(fs, fs_op_complete, NULL);
@@ -529,6 +655,8 @@ int main(int argc, char **argv)
 		CU_add_test(suite, "fs_create", fs_create) == NULL ||
 		CU_add_test(suite, "fs_truncate", fs_truncate) == NULL ||
 		CU_add_test(suite, "fs_rename", fs_rename) == NULL ||
+		CU_add_test(suite, "fs_rw_async", fs_rw_async) == NULL ||
+		CU_add_test(suite, "fs_writev_readv_async", fs_writev_readv_async) == NULL ||
 		CU_add_test(suite, "tree_find_buffer", tree_find_buffer_ut) == NULL ||
 		CU_add_test(suite, "channel_ops", channel_ops) == NULL ||
 		CU_add_test(suite, "channel_ops_sync", channel_ops_sync) == NULL

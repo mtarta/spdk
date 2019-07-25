@@ -72,10 +72,6 @@ construct_iscsi_bdev_cb(void *cb_arg, struct spdk_bdev *bdev, int status)
 						 spdk_strerror(-status));
 	} else {
 		w = spdk_jsonrpc_begin_result(request);
-		if (w == NULL) {
-			return;
-		}
-
 		spdk_json_write_string(w, spdk_bdev_get_name(bdev));
 		spdk_jsonrpc_end_result(request, w);
 	}
@@ -92,21 +88,18 @@ spdk_rpc_construct_iscsi_bdev(struct spdk_jsonrpc_request *request,
 				    SPDK_COUNTOF(rpc_construct_iscsi_bdev_decoders),
 				    &req)) {
 		SPDK_ERRLOG("spdk_json_decode_object failed\n");
-		rc = -EINVAL;
-		goto invalid;
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
+						 "spdk_json_decode_object failed");
+		goto cleanup;
 	}
 
 	rc = create_iscsi_disk(req.name, req.url, req.initiator_iqn, construct_iscsi_bdev_cb, request);
 	if (rc) {
-		goto invalid;
+		spdk_jsonrpc_send_error_response(request, rc, spdk_strerror(-rc));
 	}
 
+cleanup:
 	free_rpc_construct_iscsi_bdev(&req);
-	return;
-
-invalid:
-	free_rpc_construct_iscsi_bdev(&req);
-	spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS, spdk_strerror(-rc));
 }
 SPDK_RPC_REGISTER("construct_iscsi_bdev", spdk_rpc_construct_iscsi_bdev, SPDK_RPC_RUNTIME)
 
@@ -128,12 +121,7 @@ static void
 _spdk_rpc_delete_iscsi_bdev_cb(void *cb_arg, int bdeverrno)
 {
 	struct spdk_jsonrpc_request *request = cb_arg;
-	struct spdk_json_write_ctx *w;
-
-	w = spdk_jsonrpc_begin_result(request);
-	if (w == NULL) {
-		return;
-	}
+	struct spdk_json_write_ctx *w = spdk_jsonrpc_begin_result(request);
 
 	spdk_json_write_bool(w, bdeverrno == 0);
 	spdk_jsonrpc_end_result(request, w);
@@ -145,29 +133,24 @@ spdk_rpc_delete_iscsi_bdev(struct spdk_jsonrpc_request *request,
 {
 	struct rpc_delete_iscsi req = {NULL};
 	struct spdk_bdev *bdev;
-	int rc;
 
 	if (spdk_json_decode_object(params, rpc_delete_iscsi_decoders,
 				    SPDK_COUNTOF(rpc_delete_iscsi_decoders),
 				    &req)) {
-		rc = -EINVAL;
-		goto invalid;
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
+						 "spdk_json_decode_object failed");
+		goto cleanup;
 	}
 
 	bdev = spdk_bdev_get_by_name(req.name);
 	if (bdev == NULL) {
-		rc = -ENODEV;
-		goto invalid;
+		spdk_jsonrpc_send_error_response(request, -ENODEV, spdk_strerror(ENODEV));
+		goto cleanup;
 	}
 
 	delete_iscsi_disk(bdev, _spdk_rpc_delete_iscsi_bdev_cb, request);
 
+cleanup:
 	free_rpc_delete_iscsi(&req);
-
-	return;
-
-invalid:
-	free_rpc_delete_iscsi(&req);
-	spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS, spdk_strerror(-rc));
 }
 SPDK_RPC_REGISTER("delete_iscsi_bdev", spdk_rpc_delete_iscsi_bdev, SPDK_RPC_RUNTIME)

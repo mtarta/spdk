@@ -45,6 +45,8 @@ struct rpc_construct_ftl {
 	char *traddr;
 	char *punits;
 	char *uuid;
+	char *cache_bdev;
+	struct spdk_ftl_conf ftl_conf;
 };
 
 static void
@@ -55,6 +57,7 @@ free_rpc_construct_ftl(struct rpc_construct_ftl *req)
 	free(req->traddr);
 	free(req->punits);
 	free(req->uuid);
+	free(req->cache_bdev);
 }
 
 static const struct spdk_json_object_decoder rpc_construct_ftl_decoders[] = {
@@ -63,6 +66,63 @@ static const struct spdk_json_object_decoder rpc_construct_ftl_decoders[] = {
 	{"traddr", offsetof(struct rpc_construct_ftl, traddr), spdk_json_decode_string},
 	{"punits", offsetof(struct rpc_construct_ftl, punits), spdk_json_decode_string},
 	{"uuid", offsetof(struct rpc_construct_ftl, uuid), spdk_json_decode_string, true},
+	{"cache", offsetof(struct rpc_construct_ftl, cache_bdev), spdk_json_decode_string, true},
+	{
+		"allow_open_bands", offsetof(struct rpc_construct_ftl, ftl_conf) +
+		offsetof(struct spdk_ftl_conf, allow_open_bands), spdk_json_decode_bool, true
+	},
+	{
+		"overprovisioning", offsetof(struct rpc_construct_ftl, ftl_conf) +
+		offsetof(struct spdk_ftl_conf, lba_rsvd), spdk_json_decode_uint64, true
+	},
+	{
+		"limit_crit", offsetof(struct rpc_construct_ftl, ftl_conf) +
+		offsetof(struct spdk_ftl_conf, limits[SPDK_FTL_LIMIT_CRIT]) +
+		offsetof(struct spdk_ftl_limit, limit),
+		spdk_json_decode_uint64, true
+	},
+	{
+		"limit_crit_threshold", offsetof(struct rpc_construct_ftl, ftl_conf) +
+		offsetof(struct spdk_ftl_conf, limits[SPDK_FTL_LIMIT_CRIT]) +
+		offsetof(struct spdk_ftl_limit, thld),
+		spdk_json_decode_uint64, true
+	},
+	{
+		"limit_high", offsetof(struct rpc_construct_ftl, ftl_conf) +
+		offsetof(struct spdk_ftl_conf, limits[SPDK_FTL_LIMIT_HIGH]) +
+		offsetof(struct spdk_ftl_limit, limit),
+		spdk_json_decode_uint64, true
+	},
+	{
+		"limit_high_threshold", offsetof(struct rpc_construct_ftl, ftl_conf) +
+		offsetof(struct spdk_ftl_conf, limits[SPDK_FTL_LIMIT_HIGH]) +
+		offsetof(struct spdk_ftl_limit, thld),
+		spdk_json_decode_uint64, true
+	},
+	{
+		"limit_low", offsetof(struct rpc_construct_ftl, ftl_conf) +
+		offsetof(struct spdk_ftl_conf, limits[SPDK_FTL_LIMIT_LOW]) +
+		offsetof(struct spdk_ftl_limit, limit),
+		spdk_json_decode_uint64, true
+	},
+	{
+		"limit_low_threshold", offsetof(struct rpc_construct_ftl, ftl_conf) +
+		offsetof(struct spdk_ftl_conf, limits[SPDK_FTL_LIMIT_LOW]) +
+		offsetof(struct spdk_ftl_limit, thld),
+		spdk_json_decode_uint64, true
+	},
+	{
+		"limit_start", offsetof(struct rpc_construct_ftl, ftl_conf) +
+		offsetof(struct spdk_ftl_conf, limits[SPDK_FTL_LIMIT_START]) +
+		offsetof(struct spdk_ftl_limit, limit),
+		spdk_json_decode_uint64, true
+	},
+	{
+		"limit_start_threshold", offsetof(struct rpc_construct_ftl, ftl_conf) +
+		offsetof(struct spdk_ftl_conf, limits[SPDK_FTL_LIMIT_START]) +
+		offsetof(struct spdk_ftl_limit, thld),
+		spdk_json_decode_uint64, true
+	},
 };
 
 #define FTL_RANGE_MAX_LENGTH 32
@@ -82,10 +142,6 @@ _spdk_rpc_construct_ftl_bdev_cb(const struct ftl_bdev_info *bdev_info, void *ctx
 	}
 
 	w = spdk_jsonrpc_begin_result(request);
-	if (!w) {
-		return;
-	}
-
 	spdk_uuid_fmt_lower(bdev_uuid, sizeof(bdev_uuid), &bdev_info->uuid);
 	spdk_json_write_object_begin(w);
 	spdk_json_write_named_string(w, "name", bdev_info->name);
@@ -103,6 +159,8 @@ spdk_rpc_construct_ftl_bdev(struct spdk_jsonrpc_request *request,
 	char range[FTL_RANGE_MAX_LENGTH];
 	int rc;
 
+	spdk_ftl_conf_init_defaults(&req.ftl_conf);
+
 	if (spdk_json_decode_object(params, rpc_construct_ftl_decoders,
 				    SPDK_COUNTOF(rpc_construct_ftl_decoders),
 				    &req)) {
@@ -111,8 +169,16 @@ spdk_rpc_construct_ftl_bdev(struct spdk_jsonrpc_request *request,
 		goto invalid;
 	}
 
+	if (req.cache_bdev && !spdk_bdev_get_by_name(req.cache_bdev)) {
+		spdk_jsonrpc_send_error_response_fmt(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+						     "No such bdev: %s", req.cache_bdev);
+		goto invalid;
+	}
+
 	opts.name = req.name;
 	opts.mode = SPDK_FTL_MODE_CREATE;
+	opts.cache_bdev = req.cache_bdev;
+	opts.ftl_conf = req.ftl_conf;
 
 	/* Parse trtype */
 	rc = spdk_nvme_transport_id_parse_trtype(&opts.trid.trtype, req.trtype);
@@ -142,12 +208,15 @@ spdk_rpc_construct_ftl_bdev(struct spdk_jsonrpc_request *request,
 	}
 
 	if (req.uuid) {
-		opts.mode = 0;
 		if (spdk_uuid_parse(&opts.uuid, req.uuid) < 0) {
 			spdk_jsonrpc_send_error_response_fmt(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
 							     "Failed to parse uuid: %s",
 							     req.uuid);
 			goto invalid;
+		}
+
+		if (!spdk_mem_all_zero(&opts.uuid, sizeof(opts.uuid))) {
+			opts.mode &= ~SPDK_FTL_MODE_CREATE;
 		}
 	}
 
@@ -177,12 +246,7 @@ static void
 _spdk_rpc_delete_ftl_bdev_cb(void *cb_arg, int bdeverrno)
 {
 	struct spdk_jsonrpc_request *request = cb_arg;
-	struct spdk_json_write_ctx *w;
-
-	w = spdk_jsonrpc_begin_result(request);
-	if (w == NULL) {
-		return;
-	}
+	struct spdk_json_write_ctx *w = spdk_jsonrpc_begin_result(request);
 
 	spdk_json_write_bool(w, bdeverrno == 0);
 	spdk_jsonrpc_end_result(request, w);

@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
-set -e
-HOTPLUG_DIR=$(readlink -f $(dirname $0))
 
-. $HOTPLUG_DIR/common.sh
+testdir=$(readlink -f $(dirname $0))
+rootdir=$(readlink -f $testdir/../../..)
+source $rootdir/test/common/autotest_common.sh
+source $rootdir/test/vhost/common.sh
+source $rootdir/test/vhost/hotplug/common.sh
 
 function prepare_fio_cmd_tc1() {
     print_test_fio_header
@@ -10,7 +12,7 @@ function prepare_fio_cmd_tc1() {
     run_fio="$fio_bin --eta=never "
     for vm_num in $1; do
         cp $fio_job $tmp_attach_job
-        vm_dir=$VM_BASE_DIR/$vm_num
+        vm_dir=$VM_DIR/$vm_num
         vm_check_scsi_location $vm_num
         for disk in $SCSI_DISK; do
             echo "[nvme-host$disk]" >> $tmp_attach_job

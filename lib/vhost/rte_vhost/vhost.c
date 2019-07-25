@@ -181,7 +181,7 @@ reset_device(struct virtio_net *dev)
  * there is a new virtio device being attached).
  */
 int
-vhost_new_device(uint64_t features)
+vhost_new_device(uint64_t features, struct vhost_device_ops const *ops)
 {
 	struct virtio_net *dev;
 	int i;
@@ -207,6 +207,7 @@ vhost_new_device(uint64_t features)
 	vhost_devices[i] = dev;
 	dev->vid = i;
 	dev->features = features;
+	dev->notify_ops = ops;
 
 	return i;
 }
@@ -501,4 +502,29 @@ rte_vhost_get_vring_base(int vid, uint16_t vring_idx,
 	*last_used_idx = vq->last_used_idx;
 
 	return 0;
+}
+
+int
+rte_vhost_vring_call(int vid, uint16_t vring_idx)
+{
+	struct virtio_net *dev;
+	struct vhost_virtqueue *vq;
+
+	dev = get_device(vid);
+	if(!dev)
+		return -1;
+
+	if (vring_idx >= VHOST_MAX_VRING)
+		return -1;
+
+	vq = dev->virtqueue[vring_idx];
+	if (!vq)
+		return -1;
+
+	if (vq->callfd != -1) {
+		eventfd_write(vq->callfd, (eventfd_t)1);
+		return 0;
+	}
+
+	return -1;
 }

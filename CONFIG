@@ -34,6 +34,9 @@
 # Installation prefix
 CONFIG_PREFIX="/usr/local"
 
+# Target architecture
+CONFIG_ARCH=native
+
 # Build with debug logging. Turn off for performance testing and normal usage
 CONFIG_DEBUG=n
 
@@ -94,7 +97,7 @@ CONFIG_RBD=n
 
 # Build vhost library.
 CONFIG_VHOST=y
-CONFIG_VHOST_INTERNAL_LIB=y
+CONFIG_VHOST_INTERNAL_LIB=n
 
 # Build vhost initiator (Virtio) driver.
 CONFIG_VIRTIO=y
@@ -125,9 +128,6 @@ CONFIG_VTUNE_DIR=
 
 # Build the dpdk igb_uio driver
 CONFIG_IGB_UIO_DRIVER=n
-
-# Build FTL library
-CONFIG_FTL=n
 
 # Build Intel IPSEC_MB library
 CONFIG_IPSEC_MB=n

@@ -1,16 +1,24 @@
-: ${SPDK_AUTOTEST_X=true}; export SPDK_AUTOTEST_X
+function xtrace_disable() {
+	PREV_BASH_OPTS="$-"
+	set +x
+}
 
-if $SPDK_AUTOTEST_X; then
-	set -x
-fi
-
+xtrace_disable
 set -e
+shopt -s expand_aliases
 
-# Export flag to skip the known bug that exists in librados
-# Bug is reported on ceph bug tracker with number 24078
-export ASAN_OPTIONS=new_delete_type_mismatch=0
+# Dummy function to be called after restoring xtrace just so that it appears in the
+# xtrace log. This way we can consistently track when xtrace is enabled/disabled.
+function xtrace_enable() {
+	# We have to do something inside a function in bash, and calling any command
+	# (even `:`) will produce an xtrace entry, so we just define another function.
+	function xtrace_dummy() { :; }
+}
 
-PS4=' \t	\$ '
+# Keep it as alias to avoid xtrace_enable backtrace always pointing to xtrace_restore.
+# xtrace_enable will appear as called directly from the user script, from the same line
+# that "called" xtrace_restore.
+alias xtrace_restore='if [[ "$PREV_BASH_OPTS" == *"x"* ]]; then set -x; xtrace_enable; fi'
 
 : ${RUN_NIGHTLY:=0}
 export RUN_NIGHTLY
@@ -18,54 +26,75 @@ export RUN_NIGHTLY
 : ${RUN_NIGHTLY_FAILING:=0}
 export RUN_NIGHTLY_FAILING
 
-if [[ ! -z $1 ]]; then
-	if [ -f $1 ]; then
-		source $1
-	fi
-fi
-
-# If certain utilities are not installed, preemptively disable the tests
-if ! hash ceph; then
-	SPDK_TEST_RBD=0
-fi
-
-if ! hash pmempool; then
-	SPDK_TEST_PMDK=0
-fi
-
 # Set defaults for missing test config options
-: ${SPDK_BUILD_DOC=1}; export SPDK_BUILD_DOC
-: ${SPDK_BUILD_SHARED_OBJECT=1}; export SPDK_BUILD_SHARED_OBJECT
-: ${SPDK_RUN_CHECK_FORMAT=1}; export SPDK_RUN_CHECK_FORMAT
-: ${SPDK_RUN_SCANBUILD=1}; export SPDK_RUN_SCANBUILD
-: ${SPDK_RUN_VALGRIND=1}; export SPDK_RUN_VALGRIND
-: ${SPDK_RUN_FUNCTIONAL_TEST=1}; export SPDK_RUN_FUNCTIONAL_TEST
-: ${SPDK_TEST_UNITTEST=1}; export SPDK_TEST_UNITTEST
-: ${SPDK_TEST_ISAL=1}; export SPDK_TEST_ISAL
-: ${SPDK_TEST_ISCSI=1}; export SPDK_TEST_ISCSI
-: ${SPDK_TEST_ISCSI_INITIATOR=1}; export SPDK_TEST_ISCSI_INITIATOR
-: ${SPDK_TEST_NVME=1}; export SPDK_TEST_NVME
-: ${SPDK_TEST_NVME_CLI=1}; export SPDK_TEST_NVME_CLI
-: ${SPDK_TEST_NVMF=1}; export SPDK_TEST_NVMF
-: ${SPDK_TEST_RBD=1}; export SPDK_TEST_RBD
-: ${SPDK_TEST_VHOST=1}; export SPDK_TEST_VHOST
-: ${SPDK_TEST_BLOCKDEV=1}; export SPDK_TEST_BLOCKDEV
-: ${SPDK_TEST_IOAT=1}; export SPDK_TEST_IOAT
-: ${SPDK_TEST_EVENT=1}; export SPDK_TEST_EVENT
-: ${SPDK_TEST_BLOBFS=1}; export SPDK_TEST_BLOBFS
-: ${SPDK_TEST_VHOST_INIT=1}; export SPDK_TEST_VHOST_INIT
-: ${SPDK_TEST_PMDK=1}; export SPDK_TEST_PMDK
-: ${SPDK_TEST_LVOL=1}; export SPDK_TEST_LVOL
-: ${SPDK_TEST_JSON=1}; export SPDK_TEST_JSON
-: ${SPDK_TEST_REDUCE=1}; export SPDK_TEST_REDUCE
-: ${SPDK_RUN_ASAN=1}; export SPDK_RUN_ASAN
-: ${SPDK_RUN_UBSAN=1}; export SPDK_RUN_UBSAN
-: ${SPDK_RUN_INSTALLED_DPDK=1}; export SPDK_RUN_INSTALLED_DPDK
-: ${SPDK_TEST_CRYPTO=1}; export SPDK_TEST_CRYPTO
+: ${SPDK_BUILD_DOC=0}; export SPDK_BUILD_DOC
+: ${SPDK_BUILD_SHARED_OBJECT=0}; export SPDK_BUILD_SHARED_OBJECT
+: ${SPDK_RUN_CHECK_FORMAT=0}; export SPDK_RUN_CHECK_FORMAT
+: ${SPDK_RUN_SCANBUILD=0}; export SPDK_RUN_SCANBUILD
+: ${SPDK_RUN_VALGRIND=0}; export SPDK_RUN_VALGRIND
+: ${SPDK_RUN_FUNCTIONAL_TEST=0}; export SPDK_RUN_FUNCTIONAL_TEST
+: ${SPDK_TEST_UNITTEST=0}; export SPDK_TEST_UNITTEST
+: ${SPDK_TEST_ISAL=0}; export SPDK_TEST_ISAL
+: ${SPDK_TEST_ISCSI=0}; export SPDK_TEST_ISCSI
+: ${SPDK_TEST_ISCSI_INITIATOR=0}; export SPDK_TEST_ISCSI_INITIATOR
+: ${SPDK_TEST_NVME=0}; export SPDK_TEST_NVME
+: ${SPDK_TEST_NVME_CLI=0}; export SPDK_TEST_NVME_CLI
+: ${SPDK_TEST_NVMF=0}; export SPDK_TEST_NVMF
+: ${SPDK_TEST_NVMF_TRANSPORT="rdma"}; export SPDK_TEST_NVMF_TRANSPORT
+: ${SPDK_TEST_RBD=0}; export SPDK_TEST_RBD
+: ${SPDK_TEST_VHOST=0}; export SPDK_TEST_VHOST
+: ${SPDK_TEST_BLOCKDEV=0}; export SPDK_TEST_BLOCKDEV
+: ${SPDK_TEST_IOAT=0}; export SPDK_TEST_IOAT
+: ${SPDK_TEST_EVENT=0}; export SPDK_TEST_EVENT
+: ${SPDK_TEST_BLOBFS=0}; export SPDK_TEST_BLOBFS
+: ${SPDK_TEST_VHOST_INIT=0}; export SPDK_TEST_VHOST_INIT
+: ${SPDK_TEST_PMDK=0}; export SPDK_TEST_PMDK
+: ${SPDK_TEST_LVOL=0}; export SPDK_TEST_LVOL
+: ${SPDK_TEST_JSON=0}; export SPDK_TEST_JSON
+: ${SPDK_TEST_REDUCE=0}; export SPDK_TEST_REDUCE
+: ${SPDK_TEST_VPP=0}; export SPDK_TEST_VPP
+: ${SPDK_RUN_ASAN=0}; export SPDK_RUN_ASAN
+: ${SPDK_RUN_UBSAN=0}; export SPDK_RUN_UBSAN
+: ${SPDK_RUN_INSTALLED_DPDK=0}; export SPDK_RUN_INSTALLED_DPDK
+: ${SPDK_TEST_CRYPTO=0}; export SPDK_TEST_CRYPTO
 : ${SPDK_TEST_FTL=0}; export SPDK_TEST_FTL
 : ${SPDK_TEST_BDEV_FTL=0}; export SPDK_TEST_BDEV_FTL
-: ${SPDK_TEST_OCF=1}; export SPDK_TEST_OCF
+: ${SPDK_TEST_OCF=0}; export SPDK_TEST_OCF
 : ${SPDK_TEST_FTL_EXTENDED=0}; export SPDK_TEST_FTL_EXTENDED
+: ${SPDK_TEST_VMD=0}; export SPDK_TEST_VMD
+: ${SPDK_AUTOTEST_X=true}; export SPDK_AUTOTEST_X
+
+# Export PYTHONPATH with addition of RPC framework. New scripts can be created
+# specific use cases for tests.
+export PYTHONPATH=$PYTHONPATH:$rootdir/scripts
+
+# Export flag to skip the known bug that exists in librados
+# Bug is reported on ceph bug tracker with number 24078
+export ASAN_OPTIONS=new_delete_type_mismatch=0
+export UBSAN_OPTIONS='halt_on_error=1:print_stacktrace=1:abort_on_error=1'
+
+# Export LeakSanitizer option to use suppression file in order to prevent false positives
+# and known leaks in external executables or libraries from showing up.
+asan_suppression_file="/var/tmp/asan_suppression_file"
+sudo rm -rf "$asan_suppression_file"
+
+# ASAN has some bugs around thread_local variables.  We have a destructor in place
+# to free the thread contexts, but ASAN complains about the leak before those
+# destructors have a chance to run.  So suppress this one specific leak using
+# LSAN_OPTIONS.
+echo "leak:spdk_fs_alloc_thread_ctx" >> "$asan_suppression_file"
+
+# Suppress known leaks in fio project
+echo "leak:/usr/src/fio/parse.c" >> "$asan_suppression_file"
+echo "leak:/usr/src/fio/iolog.c" >> "$asan_suppression_file"
+echo "leak:/usr/src/fio/init.c" >> "$asan_suppression_file"
+
+# Suppress leaks in libiscsi
+echo "leak:libiscsi.so" >> "$asan_suppression_file"
+
+export LSAN_OPTIONS=suppressions="$asan_suppression_file"
+
+export DEFAULT_RPC_ADDR="/var/tmp/spdk.sock"
 
 if [ -z "$DEPENDENCY_DIR" ]; then
 	export DEPENDENCY_DIR=/home/sys_sgsw
@@ -73,13 +102,32 @@ else
 	export DEPENDENCY_DIR
 fi
 
-if [ ! -z "$HUGEMEM" ]; then
-	export HUGEMEM
-fi
-
 # pass our valgrind desire on to unittest.sh
 if [ $SPDK_RUN_VALGRIND -eq 0 ]; then
 	export valgrind=''
+fi
+
+if [ "$(uname -s)" = "Linux" ]; then
+	MAKE=make
+	MAKEFLAGS=${MAKEFLAGS:--j$(nproc)}
+	DPDK_LINUX_DIR=/usr/share/dpdk/x86_64-default-linuxapp-gcc
+	if [ -d $DPDK_LINUX_DIR ] && [ $SPDK_RUN_INSTALLED_DPDK -eq 1 ]; then
+		WITH_DPDK_DIR=$DPDK_LINUX_DIR
+	fi
+	# Override the default HUGEMEM in scripts/setup.sh to allocate 8GB in hugepages.
+	export HUGEMEM=8192
+elif [ "$(uname -s)" = "FreeBSD" ]; then
+	MAKE=gmake
+	MAKEFLAGS=${MAKEFLAGS:--j$(sysctl -a | grep -E -i 'hw.ncpu' | awk '{print $2}')}
+	DPDK_FREEBSD_DIR=/usr/local/share/dpdk/x86_64-native-bsdapp-clang
+	if [ -d $DPDK_FREEBSD_DIR ] && [ $SPDK_RUN_INSTALLED_DPDK -eq 1 ]; then
+		WITH_DPDK_DIR=$DPDK_FREEBSD_DIR
+	fi
+	# FreeBSD runs a much more limited set of tests, so keep the default 2GB.
+	export HUGEMEM=2048
+else
+	echo "Unknown OS \"$(uname -s)\""
+	exit 1
 fi
 
 config_params='--enable-debug --enable-werror'
@@ -89,85 +137,9 @@ if echo -e "#include <libunwind.h>\nint main(int argc, char *argv[]) {return 0;}
 	config_params+=' --enable-log-bt'
 fi
 
-if [ $SPDK_TEST_CRYPTO -eq 1 ]; then
-	config_params+=' --with-crypto'
-fi
-
-if [ $SPDK_TEST_OCF -eq 1 ]; then
-	config_params+=" --with-ocf"
-fi
-
-export UBSAN_OPTIONS='halt_on_error=1:print_stacktrace=1:abort_on_error=1'
-
-# On Linux systems, override the default HUGEMEM in scripts/setup.sh to
-#  allocate 8GB in hugepages.
-# FreeBSD runs a much more limited set of tests, so keep the default 2GB.
-if [ `uname -s` = "Linux" ]; then
-	export HUGEMEM=8192
-fi
-
-DEFAULT_RPC_ADDR=/var/tmp/spdk.sock
-
-case `uname` in
-	FreeBSD)
-		DPDK_FREEBSD_DIR=/usr/local/share/dpdk/x86_64-native-bsdapp-clang
-		if [ -d $DPDK_FREEBSD_DIR ] && [ $SPDK_RUN_INSTALLED_DPDK -eq 1 ]; then
-			WITH_DPDK_DIR=$DPDK_FREEBSD_DIR
-		fi
-		MAKE=gmake
-		MAKEFLAGS=${MAKEFLAGS:--j$(sysctl -a | egrep -i 'hw.ncpu' | awk '{print $2}')}
-		SPDK_RUN_ASAN=0
-		SPDK_RUN_UBSAN=0
-		;;
-	Linux)
-		DPDK_LINUX_DIR=/usr/share/dpdk/x86_64-default-linuxapp-gcc
-		if [ -d $DPDK_LINUX_DIR ] && [ $SPDK_RUN_INSTALLED_DPDK -eq 1 ]; then
-			WITH_DPDK_DIR=$DPDK_LINUX_DIR
-		fi
-		MAKE=make
-		MAKEFLAGS=${MAKEFLAGS:--j$(nproc)}
-		config_params+=' --enable-coverage'
-		if [ $SPDK_RUN_UBSAN -eq 1 ]; then
-			config_params+=' --enable-ubsan'
-		fi
-		if [ $SPDK_RUN_ASAN -eq 1 ]; then
-			if ldconfig -p | grep -q asan; then
-				config_params+=' --enable-asan'
-			else
-				SPDK_RUN_ASAN=0
-			fi
-		fi
-		;;
-	*)
-		echo "Unknown OS in $0"
-		exit 1
-		;;
-esac
-
-# By default, --with-dpdk is not set meaning the SPDK build will use the DPDK submodule.
-# If a DPDK installation is found in a well-known location though, WITH_DPDK_DIR will be
-# set which will override the default and use that DPDK installation instead.
-if [ ! -z "$WITH_DPDK_DIR" ]; then
-	config_params+=" --with-dpdk=$WITH_DPDK_DIR"
-fi
-
+# for options with dependencies but no test flag, set them here
 if [ -f /usr/include/infiniband/verbs.h ]; then
 	config_params+=' --with-rdma'
-fi
-
-if [ -f /usr/include/libpmemblk.h ]; then
-	config_params+=' --with-pmdk'
-else
-	# PMDK not installed so disable PMDK tests explicitly here
-	SPDK_TEST_PMDK=0; export SPDK_TEST_PMDK
-fi
-
-if [ -f /usr/include/libpmem.h ]; then
-	config_params+=' --with-reduce'
-else
-	# PMDK not installed so disable any reduce tests explicitly here
-	#  since reduce depends on libpmem
-	SPDK_TEST_REDUCE=0; export SPDK_TEST_REDUCE
 fi
 
 if [ -d /usr/src/fio ]; then
@@ -178,35 +150,71 @@ if [ -d ${DEPENDENCY_DIR}/vtune_codes ]; then
 	config_params+=' --with-vtune='${DEPENDENCY_DIR}'/vtune_codes'
 fi
 
-if [ -d /usr/include/rbd ] &&  [ -d /usr/include/rados ]; then
-	config_params+=' --with-rbd'
-fi
-
 if [ -d /usr/include/iscsi ]; then
-	libiscsi_version=`grep LIBISCSI_API_VERSION /usr/include/iscsi/iscsi.h | head -1 | awk '{print $3}' | awk -F '(' '{print $2}' | awk -F ')' '{print $1}'`
+	libiscsi_version=$(grep LIBISCSI_API_VERSION /usr/include/iscsi/iscsi.h | head -1 | awk '{print $3}' | awk -F '(' '{print $2}' | awk -F ')' '{print $1}')
 	if [ $libiscsi_version -ge 20150621 ]; then
 		config_params+=' --with-iscsi-initiator'
-	else
-		export SPDK_TEST_ISCSI_INITIATOR=0
 	fi
-else
-	export SPDK_TEST_ISCSI_INITIATOR=0
 fi
 
-if [ ! -d "${DEPENDENCY_DIR}/nvme-cli" ]; then
-	export SPDK_TEST_NVME_CLI=0
+# for options with both dependencies and a test flag, set them here
+if [ -f /usr/include/libpmemblk.h ] && [ $SPDK_TEST_PMDK -eq 1 ]; then
+	config_params+=' --with-pmdk'
 fi
 
-if [ $SPDK_TEST_FTL -eq 1 ]; then
-	config_params+=' --with-ftl'
+if [ -f /usr/include/libpmem.h ] && [ $SPDK_TEST_REDUCE -eq 1 ]; then
+	if [ $SPDK_TEST_ISAL -eq 1 ]; then
+		config_params+=' --with-reduce'
+	else
+		echo "reduce not enabled because isal is not enabled."
+	fi
+fi
+
+if [ -d /usr/include/rbd ] &&  [ -d /usr/include/rados ] && [ $SPDK_TEST_RBD -eq 1 ]; then
+	if [ $SPDK_TEST_ISAL -eq 0 ]; then
+		config_params+=' --with-rbd'
+	else
+		echo "rbd not enabled because isal is enabled."
+	fi
+fi
+
+if [ $SPDK_TEST_VPP -eq 1 ]; then
+	VPP_PATH="/usr/local/src/vpp-19.04/build-root/install-vpp_debug-native/vpp/"
+	export LD_LIBRARY_PATH=${LD_LIBRARY_PATH}:${VPP_PATH}/lib/
+	export PATH=${PATH}:${VPP_PATH}/bin/
+	config_params+=" --with-vpp=${VPP_PATH}"
+fi
+
+# for options with no required dependencies, just test flags, set them here
+if [ $SPDK_TEST_CRYPTO -eq 1 ]; then
+	config_params+=' --with-crypto'
+fi
+
+if [ $SPDK_TEST_OCF -eq 1 ]; then
+	config_params+=" --with-ocf"
+fi
+
+if [ $SPDK_RUN_UBSAN -eq 1 ]; then
+	config_params+=' --enable-ubsan'
+fi
+
+if [ $SPDK_RUN_ASAN -eq 1 ]; then
+	config_params+=' --enable-asan'
+fi
+
+if [ "$(uname -s)" = "Linux" ]; then
+	config_params+=' --enable-coverage'
 fi
 
 if [ $SPDK_TEST_ISAL -eq 0 ]; then
 	config_params+=' --without-isal'
 fi
 
-if [ $SPDK_TEST_REDUCE -eq 0 ]; then
-        config_params+=' --without-reduce'
+# By default, --with-dpdk is not set meaning the SPDK build will use the DPDK submodule.
+# If a DPDK installation is found in a well-known location though, WITH_DPDK_DIR will be
+# set which will override the default and use that DPDK installation instead.
+if [ ! -z "$WITH_DPDK_DIR" ]; then
+	config_params+=" --with-dpdk=$WITH_DPDK_DIR"
 fi
 
 export config_params
@@ -220,6 +228,21 @@ if [ -z "$output_dir" ]; then
 	export output_dir
 fi
 
+TEST_MODE=
+for i in "$@"; do
+	case "$i" in
+		--iso)
+			TEST_MODE=iso
+			;;
+		--transport=*)
+			TEST_TRANSPORT="${i#*=}"
+			;;
+		--sock=*)
+			TEST_SOCK="${i#*=}"
+			;;
+	esac
+done
+
 function timing() {
 	direction="$1"
 	testname="$2"
@@ -230,6 +253,7 @@ function timing() {
 		export timing_stack="${timing_stack};${now}"
 		export test_stack="${test_stack};${testname}"
 	else
+		touch "$output_dir/timing.txt"
 		child_time=$(grep "^${test_stack:1};" $output_dir/timing.txt | awk '{s+=$2} END {print s}')
 
 		start_time=$(echo "$timing_stack" | sed -e 's@^.*;@@')
@@ -243,17 +267,15 @@ function timing() {
 }
 
 function timing_enter() {
-	local shell_restore_x="$( [[ "$-" =~ x ]] && echo 'set -x' )"
-	set +x
+	xtrace_disable
 	timing "enter" "$1"
-	$shell_restore_x
+	xtrace_restore
 }
 
 function timing_exit() {
-	local shell_restore_x="$( [[ "$-" =~ x ]] && echo 'set -x' )"
-	set +x
+	xtrace_disable
 	timing "exit" "$1"
-	$shell_restore_x
+	xtrace_restore
 }
 
 function timing_finish() {
@@ -278,14 +300,14 @@ function report_test_completion() {
 
 function process_core() {
 	ret=0
-	for core in $(find . -type f \( -name 'core*' -o -name '*.core' \)); do
+	for core in $(find . -type f \( -name 'core\.?[0-9]*' -o -name '*.core' \)); do
 		exe=$(eu-readelf -n "$core" | grep psargs | sed "s/.*psargs: \([^ \'\" ]*\).*/\1/")
 		if [[ ! -f "$exe" ]]; then
 			exe=$(eu-readelf -n "$core" | grep -oP -m1 "$exe.+")
 		fi
 		echo "exe for $core is $exe"
 		if [[ ! -z "$exe" ]]; then
-			if hash gdb; then
+			if hash gdb &>/dev/null; then
 				gdb -batch -ex "thread apply all bt full" $exe $core
 			fi
 			cp $exe $output_dir
@@ -329,22 +351,9 @@ function waitforlisten() {
 
 	local rpc_addr="${2:-$DEFAULT_RPC_ADDR}"
 
-	if hash ip; then
-		local have_ip_cmd=true
-	else
-		local have_ip_cmd=false
-	fi
-
-	if hash ss; then
-		local have_ss_cmd=true
-	else
-		local have_ss_cmd=false
-	fi
-
 	echo "Waiting for process to start up and listen on UNIX domain socket $rpc_addr..."
 	# turn off trace for this loop
-	local shell_restore_x="$( [[ "$-" =~ x ]] && echo 'set -x' )"
-	set +x
+	xtrace_disable
 	local ret=0
 	local i
 	for (( i = 40; i != 0; i-- )); do
@@ -356,35 +365,14 @@ function waitforlisten() {
 			break
 		fi
 
-		# FIXME: don't know how to fix this for FreeBSD
-		if $have_ip_cmd; then
-			namespace=$(ip netns identify $1)
-			if [ -n "$namespace" ]; then
-				ns_cmd="ip netns exec $namespace"
-			fi
+		if $rootdir/scripts/rpc.py -t 1 -s "$rpc_addr" rpc_get_methods &>/dev/null; then
+			break
 		fi
 
-		if $have_ss_cmd; then
-			if $ns_cmd ss -ln | egrep -q "\s+$rpc_addr\s+"; then
-				break
-			fi
-		elif [[ "$(uname -s)" == "Linux" ]]; then
-			# For Linux, if system doesn't have ss, just assume it has netstat
-			if $ns_cmd netstat -an | grep -iw LISTENING | egrep -q "\s+$rpc_addr\$"; then
-				break
-			fi
-		else
-			# On FreeBSD netstat output 'State' column is missing for Unix sockets.
-			# To workaround this issue just try to use provided address.
-			# XXX: This solution could be used for other distros.
-			if $rootdir/scripts/rpc.py -t 1 -s "$rpc_addr" get_rpc_methods &>/dev/null; then
-				break
-			fi
-		fi
 		sleep 0.5
 	done
 
-	$shell_restore_x
+	xtrace_restore
 	if (( i == 0 )); then
 		echo "ERROR: timeout while waiting for process (pid: $1) to start listening on '$rpc_addr'"
 		ret=1
@@ -411,12 +399,27 @@ function waitfornbd() {
 	#  need to check the size of the output file instead.
 	for ((i=1; i<=20; i++)); do
 		dd if=/dev/$nbd_name of=/tmp/nbdtest bs=4096 count=1 iflag=direct
-		size=`stat -c %s /tmp/nbdtest`
+		size=$(stat -c %s /tmp/nbdtest)
 		rm -f /tmp/nbdtest
 		if [ "$size" != "0" ]; then
 			return 0
 		else
 			sleep 0.1
+		fi
+	done
+
+	return 1
+}
+
+function waitforbdev() {
+	local bdev_name=$1
+	local i
+
+	for ((i=1; i<=20; i++)); do
+		if ! $rpc_py get_bdevs | jq -r '.[] .name' | grep -qw $bdev_name; then
+			sleep 0.1
+		else
+			return 0
 		fi
 	done
 
@@ -489,6 +492,7 @@ function rbd_setup() {
 function rbd_cleanup() {
 	if hash ceph; then
 		$rootdir/scripts/ceph/stop.sh || true
+		rm -f /var/tmp/ceph_raw.img
 	fi
 }
 
@@ -503,13 +507,11 @@ function start_stub() {
 	while ! [ -e /var/run/spdk_stub0 ]; do
 		sleep 1s
 	done
-	# dump process memory map contents to help debug random ASLR failures
-	pmap -pX $stubpid || pmap -x $stubpid || true
 	echo done.
 }
 
 function kill_stub() {
-	kill $stubpid
+	kill $1 $stubpid
 	wait $stubpid
 	rm -f /var/run/spdk_stub0
 	# Re-enable ASLR now that we are done with multi-process testing
@@ -519,28 +521,26 @@ function kill_stub() {
 }
 
 function run_test() {
-	local shell_restore_x="$( [[ "$-" =~ x ]] && echo 'set -x' )"
-	set +x
+	xtrace_disable
 	local test_type="$(echo $1 | tr 'a-z' 'A-Z')"
 	shift
 	echo "************************************"
 	echo "START TEST $test_type $@"
 	echo "************************************"
-	$shell_restore_x
+	xtrace_restore
 	time "$@"
-	set +x
+	xtrace_disable
 	echo "************************************"
 	echo "END TEST $test_type $@"
 	echo "************************************"
-	$shell_restore_x
+	xtrace_restore
 }
 
 function print_backtrace() {
 	# if errexit is not enabled, don't print a backtrace
 	[[ "$-" =~ e ]] || return 0
 
-	local shell_options="$-"
-	set +x
+	xtrace_disable
 	echo "========== Backtrace start: =========="
 	echo ""
 	for i in $(seq 1 $((${#FUNCNAME[@]} - 1))); do
@@ -555,7 +555,7 @@ function print_backtrace() {
 	done
 	echo ""
 	echo "========== Backtrace end =========="
-	[[ "$shell_options" =~ x ]] && set -x
+	xtrace_restore
 	return 0
 }
 
@@ -594,9 +594,9 @@ function part_dev_by_gpt () {
 			parted -s $nbd_path mklabel gpt mkpart first '0%' '50%' mkpart second '50%' '100%'
 
 			# change the GUID to SPDK GUID value
-			SPDK_GPT_GUID=`grep SPDK_GPT_PART_TYPE_GUID $rootdir/lib/bdev/gpt/gpt.h \
+			SPDK_GPT_GUID=$(grep SPDK_GPT_PART_TYPE_GUID $rootdir/lib/bdev/gpt/gpt.h \
 				| awk -F "(" '{ print $2}' | sed 's/)//g' \
-				| awk -F ", " '{ print $1 "-" $2 "-" $3 "-" $4 "-" $5}' | sed 's/0x//g'`
+				| awk -F ", " '{ print $1 "-" $2 "-" $3 "-" $4 "-" $5}' | sed 's/0x//g')
 			sgdisk -t 1:$SPDK_GPT_GUID $nbd_path
 			sgdisk -t 2:$SPDK_GPT_GUID $nbd_path
 		elif [ "$operation" = reset ]; then
@@ -678,6 +678,22 @@ function waitforblk_disconnect()
 	return 0
 }
 
+function waitforfile()
+{
+	local i=0
+	while [ ! -e $1 ]; do
+		[ $i -lt 200 ] || break
+		i=$[$i+1]
+		sleep 0.1
+	done
+
+	if [ ! -e $1 ]; then
+		return 1
+	fi
+
+	return 0
+}
+
 function fio_config_gen()
 {
 	local config_file=$1
@@ -734,6 +750,30 @@ function fio_config_add_job()
 	echo "filename=$filename" >> $config_file
 }
 
+function fio_bdev()
+{
+	# Setup fio binary cmd line
+	local fio_dir="/usr/src/fio"
+	local bdev_plugin="$rootdir/examples/bdev/fio_plugin/fio_plugin"
+
+	# Preload AddressSanitizer library to fio if fio_plugin was compiled with it
+	local asan_lib=$(ldd $bdev_plugin | grep libasan | awk '{print $3}')
+
+	LD_PRELOAD=""$asan_lib" "$bdev_plugin"" "$fio_dir"/fio "$@"
+}
+
+function fio_nvme()
+{
+	# Setup fio binary cmd line
+	local fio_dir="/usr/src/fio"
+	local nvme_plugin="$rootdir/examples/nvme/fio_plugin/fio_plugin"
+
+	# Preload AddressSanitizer library to fio if fio_plugin was compiled with it
+	asan_lib=$(ldd $nvme_plugin | grep libasan | awk '{print $3}')
+
+	LD_PRELOAD=""$asan_lib" "$nvme_plugin"" "$fio_dir"/fio "$@"
+}
+
 function get_lvs_free_mb()
 {
 	local lvs_uuid=$1
@@ -769,11 +809,12 @@ function autotest_cleanup()
 			modprobe -r uio_pci_generic
 		fi
 	fi
+	rm -rf "$asan_suppression_file"
 }
 
 function freebsd_update_contigmem_mod()
 {
-	if [ `uname` = FreeBSD ]; then
+	if [ $(uname) = FreeBSD ]; then
 		kldunload contigmem.ko || true
 		if [ ! -z "$WITH_DPDK_DIR" ]; then
 			echo "Warning: SPDK only works on FreeBSD with patches that only exist in SPDK's dpdk submodule"
@@ -788,3 +829,12 @@ function freebsd_update_contigmem_mod()
 
 set -o errtrace
 trap "trap - ERR; print_backtrace >&2" ERR
+
+PS4=' \t	\$ '
+if $SPDK_AUTOTEST_X; then
+	# explicitly enable xtraces
+	set -x
+	xtrace_enable
+else
+	xtrace_restore
+fi

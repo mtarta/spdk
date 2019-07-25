@@ -158,6 +158,16 @@ int spdk_sock_set_recvlowat(struct spdk_sock *sock, int nbytes);
 int spdk_sock_set_recvbuf(struct spdk_sock *sock, int sz);
 
 /**
+ * Set priority for the given socket.
+ *
+ * \param sock Socket to set the priority.
+ * \param priority Priority given by the user.
+ *
+ * \return 0 on success, -1 on failure.
+ */
+int spdk_sock_set_priority(struct spdk_sock *sock, int priority);
+
+/**
  * Set send buffer size for the given socket.
  *
  * \param sock Socket to set buffer size for.
@@ -195,11 +205,21 @@ bool spdk_sock_is_ipv4(struct spdk_sock *sock);
 typedef void (*spdk_sock_cb)(void *arg, struct spdk_sock_group *group, struct spdk_sock *sock);
 
 /**
- * Create a new socket group.
+ * Create a new socket group with user provided pointer
  *
+ * \param ctx the context provided by user.
  * \return a pointer to the created group on success, or NULL on failure.
  */
-struct spdk_sock_group *spdk_sock_group_create(void);
+struct spdk_sock_group *spdk_sock_group_create(void *ctx);
+
+/**
+ * Get the ctx of the sock group
+ *
+ * \param sock_group Socket group.
+ * \return a pointer which is ctx of the sock_group.
+ */
+void *spdk_sock_group_get_ctx(struct spdk_sock_group *sock_group);
+
 
 /**
  * Add a socket to the group.
@@ -251,6 +271,16 @@ int spdk_sock_group_poll_count(struct spdk_sock_group *group, int max_events);
  * \return 0 on success, -1 on failure.
  */
 int spdk_sock_group_close(struct spdk_sock_group **group);
+
+/**
+ * Get the optimal sock group for this sock.
+ *
+ * \param sock The socket
+ * \param group Returns the optimal sock group. If there is no optimal sock group, returns NULL.
+ *
+ * \return 0 on success. Negated errno on failure.
+ */
+int spdk_sock_get_optimal_sock_group(struct spdk_sock *sock, struct spdk_sock_group **group);
 
 #ifdef __cplusplus
 }

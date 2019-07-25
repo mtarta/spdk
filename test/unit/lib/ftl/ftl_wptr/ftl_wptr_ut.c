@@ -55,10 +55,11 @@ static struct spdk_ftl_punit_range g_range = {
 };
 
 #if defined(DEBUG)
-DEFINE_STUB(ftl_band_validate_md, bool, (struct ftl_band *band, const uint64_t *lba_map), true);
+DEFINE_STUB(ftl_band_validate_md, bool, (struct ftl_band *band), true);
 #endif
-DEFINE_STUB(ftl_io_dec_req, size_t, (struct ftl_io *io), 0);
-DEFINE_STUB(ftl_io_inc_req, size_t, (struct ftl_io *io), 0);
+DEFINE_STUB_V(ftl_io_dec_req, (struct ftl_io *io));
+DEFINE_STUB_V(ftl_io_inc_req, (struct ftl_io *io));
+DEFINE_STUB_V(ftl_io_fail, (struct ftl_io *io, int status));
 DEFINE_STUB_V(ftl_trace_completion, (struct spdk_ftl_dev *dev, const struct ftl_io *io,
 				     enum ftl_trace_completion completion));
 DEFINE_STUB_V(ftl_reloc_add, (struct ftl_reloc *reloc, struct ftl_band *band, size_t offset,
@@ -75,9 +76,11 @@ DEFINE_STUB(spdk_nvme_ocssd_ns_cmd_vector_reset, int, (struct spdk_nvme_ns *ns,
 		struct spdk_nvme_qpair *qpair, uint64_t *lba_list, uint32_t num_lbas,
 		struct spdk_ocssd_chunk_information_entry *chunk_info,
 		spdk_nvme_cmd_cb cb_fn, void *cb_arg), 0);
+DEFINE_STUB(spdk_bdev_desc_get_bdev, struct spdk_bdev *, (struct spdk_bdev_desc *dsc), NULL);
+DEFINE_STUB(spdk_bdev_get_num_blocks, uint64_t, (const struct spdk_bdev *bdev), 0);
 
 struct ftl_io *
-ftl_io_erase_init(struct ftl_band *band, size_t lbk_cnt, spdk_ftl_fn cb)
+ftl_io_erase_init(struct ftl_band *band, size_t lbk_cnt, ftl_io_fn cb)
 {
 	struct ftl_io *io;
 
@@ -86,16 +89,22 @@ ftl_io_erase_init(struct ftl_band *band, size_t lbk_cnt, spdk_ftl_fn cb)
 
 	io->dev = band->dev;
 	io->band = band;
-	io->cb.fn = cb;
+	io->cb_fn = cb;
 	io->lbk_cnt = 1;
 
 	return io;
 }
 
 void
+ftl_io_advance(struct ftl_io *io, size_t lbk_cnt)
+{
+	io->pos += lbk_cnt;
+}
+
+void
 ftl_io_complete(struct ftl_io *io)
 {
-	io->cb.fn(io, 0);
+	io->cb_fn(io, NULL, 0);
 	free(io);
 }
 
@@ -123,6 +132,7 @@ cleanup_wptr_test(struct spdk_ftl_dev *dev)
 	size_t i;
 
 	for (i = 0; i < ftl_dev_num_bands(dev); ++i) {
+		dev->bands[i].lba_map.segments = NULL;
 		test_free_ftl_band(&dev->bands[i]);
 	}
 
@@ -150,6 +160,7 @@ test_wptr(void)
 		ftl_band_set_state(band, FTL_BAND_STATE_OPENING);
 		ftl_band_set_state(band, FTL_BAND_STATE_OPEN);
 		io.band = band;
+		io.dev = dev;
 
 		for (lbk = 0, offset = 0; lbk < ftl_dev_lbks_in_chunk(dev) / xfer_size; ++lbk) {
 			for (chunk = 0; chunk < band->num_chunks; ++chunk) {
@@ -167,7 +178,7 @@ test_wptr(void)
 
 		/* Call the metadata completion cb to force band state change */
 		/* and removal of the actual wptr */
-		ftl_md_write_cb(&io, 0);
+		ftl_md_write_cb(&io, NULL, 0);
 		CU_ASSERT_EQUAL(band->state, FTL_BAND_STATE_CLOSED);
 		CU_ASSERT_TRUE(LIST_EMPTY(&dev->wptr_list));
 

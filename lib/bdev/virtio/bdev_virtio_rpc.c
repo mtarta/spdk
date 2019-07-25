@@ -64,10 +64,6 @@ spdk_rpc_remove_virtio_bdev_cb(void *ctx, int errnum)
 	}
 
 	w = spdk_jsonrpc_begin_result(request);
-	if (w == NULL) {
-		return;
-	}
-
 	spdk_json_write_bool(w, true);
 	spdk_jsonrpc_end_result(request, w);
 }
@@ -77,13 +73,14 @@ spdk_rpc_remove_virtio_bdev(struct spdk_jsonrpc_request *request,
 			    const struct spdk_json_val *params)
 {
 	struct rpc_remove_virtio_dev req = {NULL};
-	int rc;
+	int rc = 0;
 
 	if (spdk_json_decode_object(params, rpc_remove_virtio_dev,
 				    SPDK_COUNTOF(rpc_remove_virtio_dev),
 				    &req)) {
-		rc = -EINVAL;
-		goto invalid;
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
+						 "spdk_json_decode_object failed");
+		goto cleanup;
 	}
 
 	rc = bdev_virtio_blk_dev_remove(req.name, spdk_rpc_remove_virtio_bdev_cb, request);
@@ -92,16 +89,10 @@ spdk_rpc_remove_virtio_bdev(struct spdk_jsonrpc_request *request,
 	}
 
 	if (rc != 0) {
-		goto invalid;
+		spdk_jsonrpc_send_error_response(request, rc, spdk_strerror(-rc));
 	}
 
-	free(req.name);
-
-	return;
-
-invalid:
-	spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
-					 spdk_strerror(-rc));
+cleanup:
 	free(req.name);
 }
 SPDK_RPC_REGISTER("remove_virtio_bdev", spdk_rpc_remove_virtio_bdev, SPDK_RPC_RUNTIME);
@@ -119,10 +110,6 @@ spdk_rpc_get_virtio_scsi_devs(struct spdk_jsonrpc_request *request,
 	}
 
 	w = spdk_jsonrpc_begin_result(request);
-	if (w == NULL) {
-		return;
-	}
-
 	bdev_virtio_scsi_dev_list(w);
 	spdk_jsonrpc_end_result(request, w);
 }
@@ -172,23 +159,21 @@ spdk_rpc_create_virtio_dev_cb(void *ctx, int result, struct spdk_bdev **bdevs, s
 	}
 
 	w = spdk_jsonrpc_begin_result(req->request);
-	if (w) {
-		spdk_json_write_array_begin(w);
+	spdk_json_write_array_begin(w);
 
-		for (i = 0; i < cnt; i++) {
-			spdk_json_write_string(w, spdk_bdev_get_name(bdevs[i]));
-		}
-
-		spdk_json_write_array_end(w);
-		spdk_jsonrpc_end_result(req->request, w);
+	for (i = 0; i < cnt; i++) {
+		spdk_json_write_string(w, spdk_bdev_get_name(bdevs[i]));
 	}
+
+	spdk_json_write_array_end(w);
+	spdk_jsonrpc_end_result(req->request, w);
 
 	free_rpc_construct_virtio_dev(ctx);
 }
 
 static void
-spdk_rpc_create_virtio_dev(struct spdk_jsonrpc_request *request,
-			   const struct spdk_json_val *params)
+spdk_rpc_construct_virtio_dev(struct spdk_jsonrpc_request *request,
+			      const struct spdk_json_val *params)
 {
 	struct rpc_construct_virtio_dev *req;
 	struct spdk_bdev *bdev;
@@ -199,30 +184,30 @@ spdk_rpc_create_virtio_dev(struct spdk_jsonrpc_request *request,
 	req = calloc(1, sizeof(*req));
 	if (!req) {
 		SPDK_ERRLOG("calloc() failed\n");
-		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS, spdk_strerror(ENOMEM));
+		spdk_jsonrpc_send_error_response(request, -ENOMEM, spdk_strerror(ENOMEM));
 		return;
 	}
 
 	if (spdk_json_decode_object(params, rpc_construct_virtio_dev,
 				    SPDK_COUNTOF(rpc_construct_virtio_dev),
 				    req)) {
-		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS, spdk_strerror(EINVAL));
-		goto invalid;
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
+						 "spdk_json_decode_object failed");
+		goto cleanup;
 	}
 
 	if (strcmp(req->trtype, "pci") == 0) {
 		if (req->vq_count != 0 || req->vq_size != 0) {
 			SPDK_ERRLOG("VQ count or size is not allowed for PCI transport type\n");
-			spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+			spdk_jsonrpc_send_error_response(request, EINVAL,
 							 "vq_count or vq_size is not allowed for PCI transport type.");
-			goto invalid;
+			goto cleanup;
 		}
 
 		if (spdk_pci_addr_parse(&pci_addr, req->traddr) != 0) {
 			SPDK_ERRLOG("Invalid PCI address '%s'\n", req->traddr);
-			spdk_jsonrpc_send_error_response_fmt(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
-							     "Invalid PCI address '%s'", req->traddr);
-			goto invalid;
+			spdk_jsonrpc_send_error_response_fmt(request, EINVAL, "Invalid PCI address '%s'", req->traddr);
+			goto cleanup;
 		}
 
 		pci = true;
@@ -232,9 +217,8 @@ spdk_rpc_create_virtio_dev(struct spdk_jsonrpc_request *request,
 		pci = false;
 	} else {
 		SPDK_ERRLOG("Invalid trtype '%s'\n", req->trtype);
-		spdk_jsonrpc_send_error_response_fmt(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
-						     "Invalid trtype '%s'", req->trtype);
-		goto invalid;
+		spdk_jsonrpc_send_error_response_fmt(request, EINVAL, "Invalid trtype '%s'", req->trtype);
+		goto cleanup;
 	}
 
 	req->request = request;
@@ -262,13 +246,13 @@ spdk_rpc_create_virtio_dev(struct spdk_jsonrpc_request *request,
 		}
 	} else {
 		SPDK_ERRLOG("Invalid dev_type '%s'\n", req->dev_type);
-		spdk_jsonrpc_send_error_response_fmt(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
-						     "Invalid dev_type '%s'", req->dev_type);
-		goto invalid;
+		spdk_jsonrpc_send_error_response_fmt(request, EINVAL, "Invalid dev_type '%s'", req->dev_type);
+		goto cleanup;
 	}
 
 	return;
-invalid:
+
+cleanup:
 	free_rpc_construct_virtio_dev(req);
 }
-SPDK_RPC_REGISTER("construct_virtio_dev", spdk_rpc_create_virtio_dev, SPDK_RPC_RUNTIME);
+SPDK_RPC_REGISTER("construct_virtio_dev", spdk_rpc_construct_virtio_dev, SPDK_RPC_RUNTIME);

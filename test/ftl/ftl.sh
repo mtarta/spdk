@@ -1,12 +1,10 @@
 #!/usr/bin/env bash
 
-set -e
-
 testdir=$(readlink -f $(dirname $0))
 rootdir=$(readlink -f $testdir/../..)
-rpc_py=$rootdir/scripts/rpc.py
-
 source $rootdir/test/common/autotest_common.sh
+
+rpc_py=$rootdir/scripts/rpc.py
 
 function at_ftl_exit() {
 	# restore original driver
@@ -41,20 +39,32 @@ timing_enter restore
 run_test suite $testdir/restore.sh $device
 timing_exit restore
 
+timing_enter dirty_shutdown
+run_test suite $testdir/dirty_shutdown.sh $device
+timing_exit dirty_shutdown
+
+timing_enter json
+run_test suite $testdir/json.sh $device
+timing_exit json
+
 if [ $SPDK_TEST_FTL_EXTENDED -eq 1 ]; then
-	$rootdir/test/app/bdev_svc/bdev_svc &
-	bdev_svc_pid=$!
+	timing_enter fio_basic
+	run_test suite $testdir/fio.sh $device basic
+	timing_exit fio_basic
 
-	trap "killprocess $bdev_svc_pid; exit 1" SIGINT SIGTERM EXIT
+	$rootdir/app/spdk_tgt/spdk_tgt &
+	svc_pid=$!
 
-	waitforlisten $bdev_svc_pid
+	trap "killprocess $svc_pid; exit 1" SIGINT SIGTERM EXIT
+
+	waitforlisten $svc_pid
 	uuid=$($rpc_py construct_ftl_bdev -b nvme0 -a $device -l 0-3 | jq -r '.uuid')
-	killprocess $bdev_svc_pid
+	killprocess $svc_pid
 
 	trap - SIGINT SIGTERM EXIT
 
 	timing_enter fio_extended
-	run_test suite $testdir/fio.sh extended $device $uuid
+	run_test suite $testdir/fio.sh $device extended $uuid
 	timing_exit fio_extended
 fi
 

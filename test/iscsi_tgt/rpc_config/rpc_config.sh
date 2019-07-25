@@ -5,9 +5,12 @@ rootdir=$(readlink -f $testdir/../../..)
 source $rootdir/test/common/autotest_common.sh
 source $rootdir/test/iscsi_tgt/common.sh
 
+# $1 = test type posix or vpp.
+# $2 = "iso" - triggers isolation mode (setting up required environment).
+iscsitestinit $2 $1
+
 timing_enter rpc_config
 
-# $1 = test type (posix/vpp)
 if [ "$1" == "posix" ] || [ "$1" == "vpp" ]; then
 	TEST_TYPE=$1
 else
@@ -29,9 +32,24 @@ echo "Process pid: $pid"
 trap "killprocess $pid; exit 1" SIGINT SIGTERM EXIT
 
 waitforlisten $pid
+$rpc_py wait_subsystem_init &
+rpc_wait_pid=$!
 $rpc_py set_iscsi_options -o 30 -a 16
+
+# RPC wait_subsystem_init should be blocked, so its process must be existed
+ps $rpc_wait_pid
+
 $rpc_py start_subsystem_init
 echo "iscsi_tgt is listening. Running tests..."
+
+# RPC wait_subsystem_init should be already returned, so its process must be non-existed
+! ps $rpc_wait_pid
+
+# RPC wait_subsystem_init will directly returned after subsystem initialized.
+$rpc_py wait_subsystem_init &
+rpc_wait_pid=$!
+sleep 1
+! ps $rpc_wait_pid
 
 timing_exit start_iscsi_tgt
 
@@ -43,4 +61,7 @@ trap - SIGINT SIGTERM EXIT
 
 iscsicleanup
 killprocess $pid
+
+iscsitestfini $2 $1
+
 timing_exit rpc_config

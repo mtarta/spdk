@@ -102,6 +102,12 @@ DEFINE_STUB(spdk_bdev_is_dif_head_of_md, bool,
 DEFINE_STUB(spdk_bdev_is_dif_check_enabled, bool,
 	    (const struct spdk_bdev *bdev, enum spdk_dif_check_type check_type), false);
 
+DEFINE_STUB(spdk_scsi_pr_out, int, (struct spdk_scsi_task *task,
+				    uint8_t *cdb, uint8_t *data, uint16_t data_len), 0);
+
+DEFINE_STUB(spdk_scsi_pr_in, int, (struct spdk_scsi_task *task, uint8_t *cdb,
+				   uint8_t *data, uint16_t data_len), 0);
+
 void
 spdk_scsi_lun_complete_task(struct spdk_scsi_lun *lun, struct spdk_scsi_task *task)
 {
@@ -110,6 +116,8 @@ spdk_scsi_lun_complete_task(struct spdk_scsi_lun *lun, struct spdk_scsi_task *ta
 
 DEFINE_STUB_V(spdk_scsi_lun_complete_reset_task,
 	      (struct spdk_scsi_lun *lun, struct spdk_scsi_task *task));
+
+DEFINE_STUB(spdk_scsi_lun_id_int_to_fmt, uint64_t, (int lun_id), 0);
 
 static void
 ut_put_task(struct spdk_scsi_task *task)
@@ -264,9 +272,10 @@ int
 spdk_dif_ctx_init(struct spdk_dif_ctx *ctx, uint32_t block_size, uint32_t md_size,
 		  bool md_interleave, bool dif_loc, enum spdk_dif_type dif_type, uint32_t dif_flags,
 		  uint32_t init_ref_tag, uint16_t apptag_mask, uint16_t app_tag,
-		  uint16_t guard_seed)
+		  uint32_t data_offset, uint16_t guard_seed)
 {
 	ctx->init_ref_tag = init_ref_tag;
+	ctx->ref_tag_offset = data_offset / 512;
 	return 0;
 }
 
@@ -591,7 +600,7 @@ scsi_name_padding_test(void)
 	/* case 1 */
 	memset(name, '\0', sizeof(name));
 	memset(name, 'x', 251);
-	written = spdk_bdev_scsi_pad_scsi_name(buf, name);
+	written = bdev_scsi_pad_scsi_name(buf, name);
 
 	CU_ASSERT(written == 252);
 	CU_ASSERT(buf[250] == 'x');
@@ -600,7 +609,7 @@ scsi_name_padding_test(void)
 	/* case 2:  */
 	memset(name, '\0', sizeof(name));
 	memset(name, 'x', 252);
-	written = spdk_bdev_scsi_pad_scsi_name(buf, name);
+	written = bdev_scsi_pad_scsi_name(buf, name);
 
 	CU_ASSERT(written == 256);
 	CU_ASSERT(buf[251] == 'x');
@@ -611,7 +620,7 @@ scsi_name_padding_test(void)
 	/* case 3 */
 	memset(name, '\0', sizeof(name));
 	memset(name, 'x', 255);
-	written = spdk_bdev_scsi_pad_scsi_name(buf, name);
+	written = bdev_scsi_pad_scsi_name(buf, name);
 
 	CU_ASSERT(written == 256);
 	CU_ASSERT(buf[254] == 'x');
@@ -635,7 +644,7 @@ task_complete_test(void)
 	task.lun = &lun;
 
 	bdev_io.internal.status = SPDK_BDEV_IO_STATUS_SUCCESS;
-	spdk_bdev_scsi_task_complete_cmd(&bdev_io, bdev_io.internal.status, &task);
+	bdev_scsi_task_complete_cmd(&bdev_io, bdev_io.internal.status, &task);
 	CU_ASSERT_EQUAL(task.status, SPDK_SCSI_STATUS_GOOD);
 	CU_ASSERT(g_scsi_cb_called == 1);
 	g_scsi_cb_called = 0;
@@ -645,7 +654,7 @@ task_complete_test(void)
 	bdev_io.internal.error.scsi.sk = SPDK_SCSI_SENSE_HARDWARE_ERROR;
 	bdev_io.internal.error.scsi.asc = SPDK_SCSI_ASC_WARNING;
 	bdev_io.internal.error.scsi.ascq = SPDK_SCSI_ASCQ_POWER_LOSS_EXPECTED;
-	spdk_bdev_scsi_task_complete_cmd(&bdev_io, bdev_io.internal.status, &task);
+	bdev_scsi_task_complete_cmd(&bdev_io, bdev_io.internal.status, &task);
 	CU_ASSERT_EQUAL(task.status, SPDK_SCSI_STATUS_CHECK_CONDITION);
 	CU_ASSERT_EQUAL(task.sense_data[2] & 0xf, SPDK_SCSI_SENSE_HARDWARE_ERROR);
 	CU_ASSERT_EQUAL(task.sense_data[12], SPDK_SCSI_ASC_WARNING);
@@ -654,7 +663,7 @@ task_complete_test(void)
 	g_scsi_cb_called = 0;
 
 	bdev_io.internal.status = SPDK_BDEV_IO_STATUS_FAILED;
-	spdk_bdev_scsi_task_complete_cmd(&bdev_io, bdev_io.internal.status, &task);
+	bdev_scsi_task_complete_cmd(&bdev_io, bdev_io.internal.status, &task);
 	CU_ASSERT_EQUAL(task.status, SPDK_SCSI_STATUS_CHECK_CONDITION);
 	CU_ASSERT_EQUAL(task.sense_data[2] & 0xf, SPDK_SCSI_SENSE_ABORTED_COMMAND);
 	CU_ASSERT_EQUAL(task.sense_data[12], SPDK_SCSI_ASC_NO_ADDITIONAL_SENSE);
@@ -944,6 +953,8 @@ _xfer_test(bool bdev_io_pool_full)
 	CU_ASSERT(task.status == SPDK_SCSI_STATUS_GOOD);
 	CU_ASSERT(g_scsi_cb_called == 1);
 	g_scsi_cb_called = 0;
+	SPDK_CU_ASSERT_FATAL(TAILQ_EMPTY(&g_bdev_io_queue));
+
 	ut_put_task(&task);
 }
 
@@ -960,34 +971,34 @@ get_dif_ctx_test(void)
 	struct spdk_bdev bdev = {};
 	struct spdk_dif_ctx dif_ctx = {};
 	uint8_t cdb[16];
-	uint32_t offset;
+	uint32_t data_offset;
 	bool ret;
 
 	cdb[0] = SPDK_SBC_READ_6;
 	cdb[1] = 0x12;
 	cdb[2] = 0x34;
 	cdb[3] = 0x50;
-	offset = 0x6 * 512;
+	data_offset = 0x6 * 512;
 
-	ret = spdk_scsi_bdev_get_dif_ctx(&bdev, cdb, offset, &dif_ctx);
+	ret = spdk_scsi_bdev_get_dif_ctx(&bdev, cdb, data_offset, &dif_ctx);
 	CU_ASSERT(ret == true);
-	CU_ASSERT(dif_ctx.init_ref_tag == 0x123456);
+	CU_ASSERT(dif_ctx.init_ref_tag + dif_ctx.ref_tag_offset == 0x123456);
 
 	cdb[0] = SPDK_SBC_WRITE_12;
 	to_be32(&cdb[2], 0x12345670);
-	offset = 0x8 * 512;
+	data_offset = 0x8 * 512;
 
-	ret = spdk_scsi_bdev_get_dif_ctx(&bdev, cdb, offset, &dif_ctx);
+	ret = spdk_scsi_bdev_get_dif_ctx(&bdev, cdb, data_offset, &dif_ctx);
 	CU_ASSERT(ret == true);
-	CU_ASSERT(dif_ctx.init_ref_tag == 0x12345678);
+	CU_ASSERT(dif_ctx.init_ref_tag + dif_ctx.ref_tag_offset == 0x12345678);
 
 	cdb[0] = SPDK_SBC_WRITE_16;
 	to_be64(&cdb[2], 0x0000000012345670);
-	offset = 0x8 * 512;
+	data_offset = 0x8 * 512;
 
-	ret = spdk_scsi_bdev_get_dif_ctx(&bdev, cdb, offset, &dif_ctx);
+	ret = spdk_scsi_bdev_get_dif_ctx(&bdev, cdb, data_offset, &dif_ctx);
 	CU_ASSERT(ret == true);
-	CU_ASSERT(dif_ctx.init_ref_tag == 0x12345678);
+	CU_ASSERT(dif_ctx.init_ref_tag + dif_ctx.ref_tag_offset == 0x12345678);
 }
 
 int

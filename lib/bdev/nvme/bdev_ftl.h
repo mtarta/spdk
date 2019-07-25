@@ -58,10 +58,14 @@ struct ftl_bdev_init_opts {
 	struct spdk_ftl_punit_range		range;
 	/* Bdev's name */
 	const char				*name;
+	/* Write buffer bdev's name */
+	const char				*cache_bdev;
 	/* Bdev's mode */
 	uint32_t				mode;
 	/* UUID if device is restored from SSD */
 	struct spdk_uuid			uuid;
+	/* FTL library configuration */
+	struct spdk_ftl_conf			ftl_conf;
 };
 
 typedef void (*ftl_bdev_init_fn)(const struct ftl_bdev_info *, void *, int);

@@ -27,7 +27,7 @@ mkdir ${base_dir}
 cp ${script_dir}/ceph.conf $ceph_conf
 
 if [ ! -e $image ]; then
-	fallocate -l 10G $image
+        fallocate -l 4G $image
 fi
 
 mknod ${dev_backend} b 7 200 || true
@@ -39,9 +39,9 @@ SGDISK="sgdisk"
 echo "Partitioning ${dev}"
 ${PARTED} ${dev} mktable gpt
 sleep 2
-${PARTED} ${dev} mkpart primary    0%    5GiB
-${PARTED} ${dev} mkpart primary   5GiB  100%
 
+${PARTED} ${dev} mkpart primary    0%    2GiB
+${PARTED} ${dev} mkpart primary   2GiB  100%
 
 partno=0
 echo "Setting name on ${dev}"
@@ -80,7 +80,7 @@ cp $ceph_conf /etc/ceph/ceph.conf
 
 cp ${base_dir}/keyring /etc/ceph/keyring
 
-ceph-run sh -c "ulimit -n 16384 && ulimit -c unlimited && exec ceph-mon -c ${ceph_conf} -i a --keyring=${base_dir}/keyring --pid-file=${base_dir}/pid/root@`hostname`.pid --mon-data=${mon_dir}" || true
+ceph-run sh -c "ulimit -n 16384 && ulimit -c unlimited && exec ceph-mon -c ${ceph_conf} -i a --keyring=${base_dir}/keyring --pid-file=${base_dir}/pid/root@$(hostname).pid --mon-data=${mon_dir}" || true
 
 # create osd
 
@@ -88,10 +88,10 @@ i=0
 
 mkdir -p ${mnt_dir}
 
-uuid=`uuidgen`
+uuid=$(uuidgen)
 ceph -c ${ceph_conf} osd create ${uuid} $i
 ceph-osd -c ${ceph_conf} -i $i --mkfs --mkkey --osd-uuid ${uuid}
-ceph -c ${ceph_conf} osd crush add osd.${i} 1.0 host=`hostname` root=default
+ceph -c ${ceph_conf} osd crush add osd.${i} 1.0 host=$(hostname) root=default
 ceph -c ${ceph_conf} -i ${mnt_dir}/osd-device-${i}-data/keyring auth add osd.${i} osd "allow *" mon "allow profile osd" mgr "allow"
 
 # start osd

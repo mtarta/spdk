@@ -5,16 +5,20 @@ rootdir=$(readlink -f $testdir/../../..)
 source $rootdir/test/common/autotest_common.sh
 source $rootdir/test/iscsi_tgt/common.sh
 
+# $1 = "iso" - triggers isolation mode (setting up required environment).
+# $2 = test type posix or vpp. defaults to posix.
+iscsitestinit $1 $2
+
 function node_login_fio_logout() {
 	for arg in "$@"; do
 		iscsiadm -m node -p $TARGET_IP:$ISCSI_PORT -o update -n node.conn[0].iscsi.$arg
 	done
 	iscsiadm -m node --login -p $TARGET_IP:$ISCSI_PORT
-	sleep 1
-	$fio_py 512 1 write 2
-	$fio_py 512 1 read 2
+	waitforiscsidevices 1
+	$fio_py -p iscsi -i 512 -d 1 -t write -r 2
+	$fio_py -p iscsi -i 512 -d 1 -t read -r 2
 	iscsiadm -m node --logout -p $TARGET_IP:$ISCSI_PORT
-	sleep 1
+	waitforiscsidevices 0
 }
 
 function iscsi_header_digest_test() {
@@ -67,7 +71,7 @@ $ISCSI_APP -m $ISCSI_TEST_CORE_MASK --wait-for-rpc &
 pid=$!
 echo "Process pid: $pid"
 
-trap "killprocess $pid; exit 1" SIGINT SIGTERM EXIT
+trap "killprocess $pid; iscsitestfini $1 $2; exit 1" SIGINT SIGTERM EXIT
 
 waitforlisten $pid
 $rpc_py set_iscsi_options -o 30 -a 16
@@ -88,10 +92,10 @@ sleep 1
 
 iscsiadm -m discovery -t sendtargets -p $TARGET_IP:$ISCSI_PORT
 
-# iscsiadm installed by some Fedora releases loses DataDigest parameter.
+# iscsiadm installed by some Fedora releases loses the ability to set DataDigest parameter.
 # Check and avoid setting DataDigest.
-DataDigestAbility=$(iscsiadm -m node -p $TARGET_IP:$ISCSI_PORT | grep DataDigest || true)
-if [ "$DataDigestAbility"x = x ]; then
+DataDigestAbility=$(iscsiadm -m node -p $TARGET_IP:$ISCSI_PORT -o update -n node.conn[0].iscsi.DataDigest -v None 2>&1 || true)
+if [ "$DataDigestAbility"x != x ]; then
 	iscsi_header_digest_test
 else
 	iscsi_header_data_digest_test
@@ -101,4 +105,5 @@ trap - SIGINT SIGTERM EXIT
 
 iscsicleanup
 killprocess $pid
+iscsitestfini $1 $2
 timing_exit digests

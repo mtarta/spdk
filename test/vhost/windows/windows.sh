@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
-set -e
 
 testdir=$(readlink -f $(dirname $0))
-rootdir=$(readlink -f $(dirname $0))/../../..
-vhost_common_dir=$(readlink -e "$(dirname $0)/../common")
-source "$vhost_common_dir/common.sh"
+rootdir=$(readlink -f $testdir/../../..)
+source $rootdir/test/common/autotest_common.sh
+source $rootdir/test/vhost/common.sh
 
 rpc_py="$rootdir/scripts/rpc.py -s $(get_vhost_dir)/rpc.sock"
 ctrl_type="spdk_vhost_scsi"
@@ -85,11 +84,11 @@ vm_kill_all
 # Violating this rule doesn't cause any issues for SPDK vhost,
 # but triggers an assert, so we can only run Windows VMs with non-debug SPDK builds.
 notice "running SPDK vhost"
-spdk_vhost_run
+vhost_run
 notice "..."
 
 # Prepare bdevs for later vhost controllers use
-# Nvme bdev is automatically constructed during spdk_vhost_run
+# Nvme bdev is automatically constructed during vhost_run
 # by using scripts/gen_nvme.sh. No need to add it manually.
 # Using various sizes to better identify bdevs if no name in BLK
 # is available
@@ -133,6 +132,6 @@ notice "Shutting down Windows VM..."
 vm_kill $vm_num
 
 notice "Shutting down SPDK vhost app..."
-spdk_vhost_kill
+vhost_kill
 
 rm -f $aio_file

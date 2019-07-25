@@ -1,8 +1,8 @@
 /*-
  *   BSD LICENSE
  *
- *   Copyright (c) Intel Corporation.
- *   All rights reserved.
+ *   Copyright (c) Intel Corporation. All rights reserved.
+ *   Copyright (c) 2019 Mellanox Technologies LTD. All rights reserved.
  *
  *   Redistribution and use in source and binary forms, with or without
  *   modification, are permitted provided that the following conditions
@@ -103,7 +103,8 @@ nvmf_bdev_ctrlr_complete_cmd(struct spdk_bdev_io *bdev_io, bool success,
 }
 
 void
-spdk_nvmf_bdev_ctrlr_identify_ns(struct spdk_nvmf_ns *ns, struct spdk_nvme_ns_data *nsdata)
+spdk_nvmf_bdev_ctrlr_identify_ns(struct spdk_nvmf_ns *ns, struct spdk_nvme_ns_data *nsdata,
+				 bool dif_insert_or_strip)
 {
 	struct spdk_bdev *bdev = ns->bdev;
 	uint64_t num_blocks;
@@ -115,36 +116,43 @@ spdk_nvmf_bdev_ctrlr_identify_ns(struct spdk_nvmf_ns *ns, struct spdk_nvme_ns_da
 	nsdata->nuse = num_blocks;
 	nsdata->nlbaf = 0;
 	nsdata->flbas.format = 0;
-	nsdata->lbaf[0].ms = spdk_bdev_get_md_size(bdev);
-	nsdata->lbaf[0].lbads = spdk_u32log2(spdk_bdev_get_block_size(bdev));
-	if (nsdata->lbaf[0].ms != 0) {
-		nsdata->flbas.extended = 1;
-		nsdata->mc.extended = 1;
-		nsdata->mc.pointer = 0;
-		nsdata->dps.md_start = spdk_bdev_is_dif_head_of_md(bdev);
+	if (!dif_insert_or_strip) {
+		nsdata->lbaf[0].ms = spdk_bdev_get_md_size(bdev);
+		nsdata->lbaf[0].lbads = spdk_u32log2(spdk_bdev_get_block_size(bdev));
+		if (nsdata->lbaf[0].ms != 0) {
+			nsdata->flbas.extended = 1;
+			nsdata->mc.extended = 1;
+			nsdata->mc.pointer = 0;
+			nsdata->dps.md_start = spdk_bdev_is_dif_head_of_md(bdev);
 
-		switch (spdk_bdev_get_dif_type(bdev)) {
-		case SPDK_DIF_TYPE1:
-			nsdata->dpc.pit1 = 1;
-			nsdata->dps.pit = SPDK_NVME_FMT_NVM_PROTECTION_TYPE1;
-			break;
-		case SPDK_DIF_TYPE2:
-			nsdata->dpc.pit2 = 1;
-			nsdata->dps.pit = SPDK_NVME_FMT_NVM_PROTECTION_TYPE2;
-			break;
-		case SPDK_DIF_TYPE3:
-			nsdata->dpc.pit3 = 1;
-			nsdata->dps.pit = SPDK_NVME_FMT_NVM_PROTECTION_TYPE3;
-			break;
-		default:
-			SPDK_ERRLOG("Unknown DIF type: %d\n", spdk_bdev_get_dif_type(bdev));
-			assert(false);
-			break;
+			switch (spdk_bdev_get_dif_type(bdev)) {
+			case SPDK_DIF_TYPE1:
+				nsdata->dpc.pit1 = 1;
+				nsdata->dps.pit = SPDK_NVME_FMT_NVM_PROTECTION_TYPE1;
+				break;
+			case SPDK_DIF_TYPE2:
+				nsdata->dpc.pit2 = 1;
+				nsdata->dps.pit = SPDK_NVME_FMT_NVM_PROTECTION_TYPE2;
+				break;
+			case SPDK_DIF_TYPE3:
+				nsdata->dpc.pit3 = 1;
+				nsdata->dps.pit = SPDK_NVME_FMT_NVM_PROTECTION_TYPE3;
+				break;
+			default:
+				SPDK_DEBUGLOG(SPDK_LOG_NVMF, "Protection Disabled\n");
+				nsdata->dps.pit = SPDK_NVME_FMT_NVM_PROTECTION_DISABLE;
+				break;
+			}
 		}
+	} else {
+		nsdata->lbaf[0].ms = 0;
+		nsdata->lbaf[0].lbads = spdk_u32log2(spdk_bdev_get_data_block_size(bdev));
 	}
 	nsdata->noiob = spdk_bdev_get_optimal_io_boundary(bdev);
 	nsdata->nmic.can_share = 1;
-	nsdata->nsrescap.rescap.persist = 0; /* TODO: don't support for now */
+	if (ns->ptpl_file != NULL) {
+		nsdata->nsrescap.rescap.persist = 1;
+	}
 	nsdata->nsrescap.rescap.write_exclusive = 1;
 	nsdata->nsrescap.rescap.exclusive_access = 1;
 	nsdata->nsrescap.rescap.write_exclusive_reg_only = 1;
@@ -205,6 +213,7 @@ nvmf_bdev_ctrl_queue_io(struct spdk_nvmf_request *req, struct spdk_bdev *bdev,
 	if (rc != 0) {
 		assert(false);
 	}
+	req->qpair->group->stat.pending_bdev_io++;
 }
 
 int
@@ -366,6 +375,7 @@ struct nvmf_bdev_ctrlr_unmap {
 	struct spdk_bdev_desc		*desc;
 	struct spdk_bdev		*bdev;
 	struct spdk_io_channel		*ch;
+	uint32_t			range_index;
 };
 
 static void
@@ -439,13 +449,16 @@ nvmf_bdev_ctrlr_unmap(struct spdk_bdev *bdev, struct spdk_bdev_desc *desc,
 		unmap_ctx->req = req;
 		unmap_ctx->desc = desc;
 		unmap_ctx->ch = ch;
+		unmap_ctx->bdev = bdev;
+
+		response->status.sct = SPDK_NVME_SCT_GENERIC;
+		response->status.sc = SPDK_NVME_SC_SUCCESS;
+	} else {
+		unmap_ctx->count--;	/* dequeued */
 	}
 
-	response->status.sct = SPDK_NVME_SCT_GENERIC;
-	response->status.sc = SPDK_NVME_SC_SUCCESS;
-
 	dsm_range = (struct spdk_nvme_dsm_range *)req->data;
-	for (i = unmap_ctx->count; i < nr; i++) {
+	for (i = unmap_ctx->range_index; i < nr; i++) {
 		lba = dsm_range[i].starting_lba;
 		lba_count = dsm_range[i].length;
 
@@ -457,7 +470,7 @@ nvmf_bdev_ctrlr_unmap(struct spdk_bdev *bdev, struct spdk_bdev_desc *desc,
 			if (rc == -ENOMEM) {
 				nvmf_bdev_ctrl_queue_io(req, bdev, ch, nvmf_bdev_ctrlr_unmap_resubmit, unmap_ctx);
 				/* Unmap was not yet submitted to bdev */
-				unmap_ctx->count--;
+				/* unmap_ctx->count will be decremented when the request is dequeued */
 				return SPDK_NVMF_REQUEST_EXEC_STATUS_ASYNCHRONOUS;
 			}
 			response->status.sc = SPDK_NVME_SC_INTERNAL_DEVICE_ERROR;
@@ -466,6 +479,7 @@ nvmf_bdev_ctrlr_unmap(struct spdk_bdev *bdev, struct spdk_bdev_desc *desc,
 				* unmaps already sent to complete */
 			break;
 		}
+		unmap_ctx->range_index++;
 	}
 
 	if (unmap_ctx->count == 0) {
@@ -513,4 +527,38 @@ spdk_nvmf_bdev_ctrlr_nvme_passthru_io(struct spdk_bdev *bdev, struct spdk_bdev_d
 	}
 
 	return SPDK_NVMF_REQUEST_EXEC_STATUS_ASYNCHRONOUS;
+}
+
+bool
+spdk_nvmf_bdev_ctrlr_get_dif_ctx(struct spdk_bdev *bdev, struct spdk_nvme_cmd *cmd,
+				 struct spdk_dif_ctx *dif_ctx)
+{
+	uint32_t init_ref_tag, dif_check_flags = 0;
+	int rc;
+
+	if (spdk_bdev_get_md_size(bdev) == 0) {
+		return false;
+	}
+
+	/* Initial Reference Tag is the lower 32 bits of the start LBA. */
+	init_ref_tag = (uint32_t)from_le64(&cmd->cdw10);
+
+	if (spdk_bdev_is_dif_check_enabled(bdev, SPDK_DIF_CHECK_TYPE_REFTAG)) {
+		dif_check_flags |= SPDK_DIF_FLAGS_REFTAG_CHECK;
+	}
+
+	if (spdk_bdev_is_dif_check_enabled(bdev, SPDK_DIF_CHECK_TYPE_GUARD)) {
+		dif_check_flags |= SPDK_DIF_FLAGS_GUARD_CHECK;
+	}
+
+	rc = spdk_dif_ctx_init(dif_ctx,
+			       spdk_bdev_get_block_size(bdev),
+			       spdk_bdev_get_md_size(bdev),
+			       spdk_bdev_is_md_interleaved(bdev),
+			       spdk_bdev_is_dif_head_of_md(bdev),
+			       spdk_bdev_get_dif_type(bdev),
+			       dif_check_flags,
+			       init_ref_tag, 0, 0, 0, 0);
+
+	return (rc == 0) ? true : false;
 }

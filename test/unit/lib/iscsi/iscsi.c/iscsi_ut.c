@@ -42,7 +42,6 @@
 #include "iscsi/iscsi.c"
 
 #include "../common.c"
-#include "iscsi/acceptor.h"
 #include "iscsi/portal_grp.h"
 #include "scsi/scsi_internal.h"
 #include "common/lib/test_env.c"
@@ -53,12 +52,16 @@
 #define UT_TARGET_NAME2		"iqn.2017-11.spdk.io:t0002"
 #define UT_INITIATOR_NAME1	"iqn.2017-11.spdk.io:i0001"
 #define UT_INITIATOR_NAME2	"iqn.2017-11.spdk.io:i0002"
+#define UT_ISCSI_TSIH		256
+
+struct spdk_iscsi_tgt_node	g_tgt;
 
 struct spdk_iscsi_tgt_node *
 spdk_iscsi_find_tgt_node(const char *target_name)
 {
 	if (strcasecmp(target_name, UT_TARGET_NAME1) == 0) {
-		return (struct spdk_iscsi_tgt_node *)1;
+		g_tgt.dev = NULL;
+		return (struct spdk_iscsi_tgt_node *)&g_tgt;
 	} else {
 		return NULL;
 	}
@@ -81,9 +84,12 @@ DEFINE_STUB(spdk_iscsi_send_tgts, int,
 	     const char *tiqn, uint8_t *data, int alloc_len, int data_len),
 	    0);
 
+DEFINE_STUB(spdk_iscsi_tgt_node_is_destructed, bool,
+	    (struct spdk_iscsi_tgt_node *target), false);
+
 DEFINE_STUB_V(spdk_iscsi_portal_grp_close_all, (void));
 
-DEFINE_STUB_V(spdk_iscsi_conn_migration, (struct spdk_iscsi_conn *conn));
+DEFINE_STUB_V(spdk_iscsi_conn_schedule, (struct spdk_iscsi_conn *conn));
 
 DEFINE_STUB_V(spdk_iscsi_conn_free_pdu,
 	      (struct spdk_iscsi_conn *conn, struct spdk_iscsi_pdu *pdu));
@@ -111,6 +117,10 @@ spdk_scsi_dev_get_lun(struct spdk_scsi_dev *dev, int lun_id)
 	return dev->lun[lun_id];
 }
 
+DEFINE_STUB(spdk_scsi_lun_id_int_to_fmt, uint64_t, (int lun_id), 0);
+
+DEFINE_STUB(spdk_scsi_lun_id_fmt_to_int, int, (uint64_t lun_fmt), 0);
+
 static void
 op_login_check_target_test(void)
 {
@@ -123,25 +133,116 @@ op_login_check_target_test(void)
 	snprintf(conn.initiator_name, sizeof(conn.initiator_name),
 		 "%s", UT_INITIATOR_NAME1);
 
-	rc = spdk_iscsi_op_login_check_target(&conn, &rsp_pdu,
-					      UT_TARGET_NAME1, &target);
+	rc = iscsi_op_login_check_target(&conn, &rsp_pdu,
+					 UT_TARGET_NAME1, &target);
 	CU_ASSERT(rc == 0);
 
 	/* expect failure */
 	snprintf(conn.initiator_name, sizeof(conn.initiator_name),
 		 "%s", UT_INITIATOR_NAME1);
 
-	rc = spdk_iscsi_op_login_check_target(&conn, &rsp_pdu,
-					      UT_TARGET_NAME2, &target);
+	rc = iscsi_op_login_check_target(&conn, &rsp_pdu,
+					 UT_TARGET_NAME2, &target);
 	CU_ASSERT(rc != 0);
 
 	/* expect failure */
 	snprintf(conn.initiator_name, sizeof(conn.initiator_name),
 		 "%s", UT_INITIATOR_NAME2);
 
-	rc = spdk_iscsi_op_login_check_target(&conn, &rsp_pdu,
-					      UT_TARGET_NAME1, &target);
+	rc = iscsi_op_login_check_target(&conn, &rsp_pdu,
+					 UT_TARGET_NAME1, &target);
 	CU_ASSERT(rc != 0);
+}
+
+static void
+op_login_session_normal_test(void)
+{
+	struct spdk_iscsi_conn conn;
+	struct spdk_iscsi_portal portal;
+	struct spdk_iscsi_portal_grp group;
+	struct spdk_iscsi_pdu rsp_pdu = {};
+	struct iscsi_bhs_login_rsp *rsph;
+	struct spdk_iscsi_sess sess;
+	struct iscsi_param param;
+	struct spdk_iscsi_tgt_node *target;
+	int rc;
+
+	/* setup related data structures */
+	rsph = (struct iscsi_bhs_login_rsp *)&rsp_pdu.bhs;
+	rsph->tsih = 0;
+	memset(rsph->isid, 0, sizeof(rsph->isid));
+	conn.portal = &portal;
+	portal.group = &group;
+	conn.portal->group->tag = 0;
+	conn.params = NULL;
+	memset(&param, 0, sizeof(param));
+
+	/* expect failure: NULL params for target name */
+	rc = iscsi_op_login_session_normal(&conn, &rsp_pdu, UT_INITIATOR_NAME1,
+					   NULL, &target, 0);
+	CU_ASSERT(rc != 0);
+	CU_ASSERT(rsph->status_class == ISCSI_CLASS_INITIATOR_ERROR);
+	CU_ASSERT(rsph->status_detail == ISCSI_LOGIN_MISSING_PARMS);
+
+	/* expect failure: incorrect key for target name */
+	param.next = NULL;
+	rc = iscsi_op_login_session_normal(&conn, &rsp_pdu, UT_INITIATOR_NAME1,
+					   &param, &target, 0);
+	CU_ASSERT(rc != 0);
+	CU_ASSERT(rsph->status_class == ISCSI_CLASS_INITIATOR_ERROR);
+	CU_ASSERT(rsph->status_detail == ISCSI_LOGIN_MISSING_PARMS);
+
+	/* expect failure: NULL target name */
+	param.key = "TargetName";
+	param.val = NULL;
+	rc = iscsi_op_login_session_normal(&conn, &rsp_pdu, UT_INITIATOR_NAME1,
+					   &param, &target, 0);
+	CU_ASSERT(rc != 0);
+	CU_ASSERT(rsph->status_class == ISCSI_CLASS_INITIATOR_ERROR);
+	CU_ASSERT(rsph->status_detail == ISCSI_LOGIN_MISSING_PARMS);
+
+	/* expect failure: session not found */
+	param.key = "TargetName";
+	param.val = "iqn.2017-11.spdk.io:t0001";
+	snprintf(conn.initiator_name, sizeof(conn.initiator_name),
+		 "%s", UT_INITIATOR_NAME1);
+	rsph->tsih = 1; /* to append the session */
+	rc = iscsi_op_login_session_normal(&conn, &rsp_pdu, UT_INITIATOR_NAME1,
+					   &param, &target, 0);
+	CU_ASSERT(conn.target_port == NULL);
+	CU_ASSERT(rc != 0);
+	CU_ASSERT(rsph->status_class == ISCSI_CLASS_INITIATOR_ERROR);
+	CU_ASSERT(rsph->status_detail == ISCSI_LOGIN_CONN_ADD_FAIL);
+
+	/* expect failure: session found while tag is wrong */
+	g_spdk_iscsi.MaxSessions = UT_ISCSI_TSIH * 2;
+	g_spdk_iscsi.session = calloc(1, sizeof(void *) * g_spdk_iscsi.MaxSessions);
+	g_spdk_iscsi.session[UT_ISCSI_TSIH - 1] = &sess;
+	sess.tsih = UT_ISCSI_TSIH;
+	rsph->tsih = UT_ISCSI_TSIH >> 8; /* to append the session */
+	sess.tag = 1;
+	rc = iscsi_op_login_session_normal(&conn, &rsp_pdu, UT_INITIATOR_NAME1,
+					   &param, &target, 0);
+	CU_ASSERT(conn.target_port == NULL);
+	CU_ASSERT(rc != 0);
+	CU_ASSERT(rsph->status_class == ISCSI_CLASS_INITIATOR_ERROR);
+	CU_ASSERT(rsph->status_detail == ISCSI_LOGIN_CONN_ADD_FAIL);
+
+	/* expect suceess: drop the session */
+	rsph->tsih = 0; /* to create the session */
+	g_spdk_iscsi.AllowDuplicateIsid = false;
+	rc = iscsi_op_login_session_normal(&conn, &rsp_pdu, UT_INITIATOR_NAME1,
+					   &param, &target, 0);
+	CU_ASSERT(rc == 0);
+
+	/* expect suceess: create the session */
+	rsph->tsih = 0; /* to create the session */
+	g_spdk_iscsi.AllowDuplicateIsid = true;
+	rc = iscsi_op_login_session_normal(&conn, &rsp_pdu, UT_INITIATOR_NAME1,
+					   &param, &target, 0);
+	CU_ASSERT(rc == 0);
+
+	free(g_spdk_iscsi.session);
 }
 
 static void
@@ -558,9 +659,9 @@ add_transfer_task_test(void)
 	/* The following tests if the task is queued because R2T tasks are full. */
 	conn.pending_r2t = DEFAULT_MAXR2T;
 
-	rc = spdk_add_transfer_task(&conn, &task);
+	rc = add_transfer_task(&conn, &task);
 
-	CU_ASSERT(rc == SPDK_SUCCESS);
+	CU_ASSERT(rc == 0);
 	CU_ASSERT(TAILQ_FIRST(&conn.queued_r2t_tasks) == &task);
 
 	TAILQ_REMOVE(&conn.queued_r2t_tasks, &task, link);
@@ -569,9 +670,9 @@ add_transfer_task_test(void)
 	/* The following tests if multiple R2Ts are issued. */
 	conn.pending_r2t = 0;
 
-	rc = spdk_add_transfer_task(&conn, &task);
+	rc = add_transfer_task(&conn, &task);
 
-	CU_ASSERT(rc == SPDK_SUCCESS);
+	CU_ASSERT(rc == 0);
 	CU_ASSERT(TAILQ_FIRST(&conn.active_r2t_tasks) == &task);
 
 	TAILQ_REMOVE(&conn.active_r2t_tasks, &task, link);
@@ -637,8 +738,8 @@ get_transfer_task_test(void)
 	task1.scsi.transfer_len = SPDK_ISCSI_MAX_RECV_DATA_SEGMENT_LENGTH;
 	spdk_iscsi_task_set_pdu(&task1, pdu1);
 
-	rc = spdk_add_transfer_task(&conn, &task1);
-	CU_ASSERT(rc == SPDK_SUCCESS);
+	rc = add_transfer_task(&conn, &task1);
+	CU_ASSERT(rc == 0);
 
 	pdu2 = spdk_get_pdu();
 	SPDK_CU_ASSERT_FATAL(pdu2 != NULL);
@@ -647,13 +748,13 @@ get_transfer_task_test(void)
 	task2.scsi.transfer_len = SPDK_ISCSI_MAX_RECV_DATA_SEGMENT_LENGTH;
 	spdk_iscsi_task_set_pdu(&task2, pdu2);
 
-	rc = spdk_add_transfer_task(&conn, &task2);
-	CU_ASSERT(rc == SPDK_SUCCESS);
+	rc = add_transfer_task(&conn, &task2);
+	CU_ASSERT(rc == 0);
 
-	task = spdk_get_transfer_task(&conn, 1);
+	task = get_transfer_task(&conn, 1);
 	CU_ASSERT(task == &task1);
 
-	task = spdk_get_transfer_task(&conn, 2);
+	task = get_transfer_task(&conn, 2);
 	CU_ASSERT(task == &task2);
 
 	while (!TAILQ_EMPTY(&conn.active_r2t_tasks)) {
@@ -703,8 +804,8 @@ del_transfer_task_test(void)
 	spdk_iscsi_task_set_pdu(&task1, pdu1);
 	task1.tag = 11;
 
-	rc = spdk_add_transfer_task(&conn, &task1);
-	CU_ASSERT(rc == SPDK_SUCCESS);
+	rc = add_transfer_task(&conn, &task1);
+	CU_ASSERT(rc == 0);
 
 	pdu2 = spdk_get_pdu();
 	SPDK_CU_ASSERT_FATAL(pdu2 != NULL);
@@ -714,8 +815,8 @@ del_transfer_task_test(void)
 	spdk_iscsi_task_set_pdu(&task2, pdu2);
 	task2.tag = 12;
 
-	rc = spdk_add_transfer_task(&conn, &task2);
-	CU_ASSERT(rc == SPDK_SUCCESS);
+	rc = add_transfer_task(&conn, &task2);
+	CU_ASSERT(rc == 0);
 
 	pdu3 = spdk_get_pdu();
 	SPDK_CU_ASSERT_FATAL(pdu3 != NULL);
@@ -725,8 +826,8 @@ del_transfer_task_test(void)
 	spdk_iscsi_task_set_pdu(&task3, pdu3);
 	task3.tag = 13;
 
-	rc = spdk_add_transfer_task(&conn, &task3);
-	CU_ASSERT(rc == SPDK_SUCCESS);
+	rc = add_transfer_task(&conn, &task3);
+	CU_ASSERT(rc == 0);
 
 	pdu4 = spdk_get_pdu();
 	SPDK_CU_ASSERT_FATAL(pdu4 != NULL);
@@ -736,8 +837,8 @@ del_transfer_task_test(void)
 	spdk_iscsi_task_set_pdu(&task4, pdu4);
 	task4.tag = 14;
 
-	rc = spdk_add_transfer_task(&conn, &task4);
-	CU_ASSERT(rc == SPDK_SUCCESS);
+	rc = add_transfer_task(&conn, &task4);
+	CU_ASSERT(rc == 0);
 
 	pdu5 = spdk_get_pdu();
 	SPDK_CU_ASSERT_FATAL(pdu5 != NULL);
@@ -747,30 +848,30 @@ del_transfer_task_test(void)
 	spdk_iscsi_task_set_pdu(&task5, pdu5);
 	task5.tag = 15;
 
-	rc = spdk_add_transfer_task(&conn, &task5);
-	CU_ASSERT(rc == SPDK_SUCCESS);
+	rc = add_transfer_task(&conn, &task5);
+	CU_ASSERT(rc == 0);
 
-	CU_ASSERT(spdk_get_transfer_task(&conn, 1) == &task1);
-	CU_ASSERT(spdk_get_transfer_task(&conn, 5) == NULL);
+	CU_ASSERT(get_transfer_task(&conn, 1) == &task1);
+	CU_ASSERT(get_transfer_task(&conn, 5) == NULL);
 	spdk_del_transfer_task(&conn, 11);
-	CU_ASSERT(spdk_get_transfer_task(&conn, 1) == NULL);
-	CU_ASSERT(spdk_get_transfer_task(&conn, 5) == &task5);
+	CU_ASSERT(get_transfer_task(&conn, 1) == NULL);
+	CU_ASSERT(get_transfer_task(&conn, 5) == &task5);
 
-	CU_ASSERT(spdk_get_transfer_task(&conn, 2) == &task2);
+	CU_ASSERT(get_transfer_task(&conn, 2) == &task2);
 	spdk_del_transfer_task(&conn, 12);
-	CU_ASSERT(spdk_get_transfer_task(&conn, 2) == NULL);
+	CU_ASSERT(get_transfer_task(&conn, 2) == NULL);
 
-	CU_ASSERT(spdk_get_transfer_task(&conn, 3) == &task3);
+	CU_ASSERT(get_transfer_task(&conn, 3) == &task3);
 	spdk_del_transfer_task(&conn, 13);
-	CU_ASSERT(spdk_get_transfer_task(&conn, 3) == NULL);
+	CU_ASSERT(get_transfer_task(&conn, 3) == NULL);
 
-	CU_ASSERT(spdk_get_transfer_task(&conn, 4) == &task4);
+	CU_ASSERT(get_transfer_task(&conn, 4) == &task4);
 	spdk_del_transfer_task(&conn, 14);
-	CU_ASSERT(spdk_get_transfer_task(&conn, 4) == NULL);
+	CU_ASSERT(get_transfer_task(&conn, 4) == NULL);
 
-	CU_ASSERT(spdk_get_transfer_task(&conn, 5) == &task5);
+	CU_ASSERT(get_transfer_task(&conn, 5) == &task5);
 	spdk_del_transfer_task(&conn, 15);
-	CU_ASSERT(spdk_get_transfer_task(&conn, 5) == NULL);
+	CU_ASSERT(get_transfer_task(&conn, 5) == NULL);
 
 	while (!TAILQ_EMPTY(&conn.active_r2t_tasks)) {
 		task = TAILQ_FIRST(&conn.active_r2t_tasks);
@@ -828,8 +929,8 @@ clear_all_transfer_tasks_test(void)
 	task1->scsi.lun = &lun1;
 	spdk_iscsi_task_set_pdu(task1, pdu1);
 
-	rc = spdk_add_transfer_task(&conn, task1);
-	CU_ASSERT(rc == SPDK_SUCCESS);
+	rc = add_transfer_task(&conn, task1);
+	CU_ASSERT(rc == 0);
 
 	mgmt_pdu1 = spdk_get_pdu();
 	SPDK_CU_ASSERT_FATAL(mgmt_pdu1 != NULL);
@@ -849,8 +950,8 @@ clear_all_transfer_tasks_test(void)
 	task2->scsi.lun = &lun1;
 	spdk_iscsi_task_set_pdu(task2, pdu2);
 
-	rc = spdk_add_transfer_task(&conn, task2);
-	CU_ASSERT(rc == SPDK_SUCCESS);
+	rc = add_transfer_task(&conn, task2);
+	CU_ASSERT(rc == 0);
 
 	task3 = spdk_iscsi_task_get(&conn, NULL, NULL);
 	SPDK_CU_ASSERT_FATAL(task3 != NULL);
@@ -864,8 +965,8 @@ clear_all_transfer_tasks_test(void)
 	task3->scsi.lun = &lun1;
 	spdk_iscsi_task_set_pdu(task3, pdu3);
 
-	rc = spdk_add_transfer_task(&conn, task3);
-	CU_ASSERT(rc == SPDK_SUCCESS);
+	rc = add_transfer_task(&conn, task3);
+	CU_ASSERT(rc == 0);
 
 	task4 = spdk_iscsi_task_get(&conn, NULL, NULL);
 	SPDK_CU_ASSERT_FATAL(task4 != NULL);
@@ -879,8 +980,8 @@ clear_all_transfer_tasks_test(void)
 	task4->scsi.lun = &lun2;
 	spdk_iscsi_task_set_pdu(task4, pdu4);
 
-	rc = spdk_add_transfer_task(&conn, task4);
-	CU_ASSERT(rc == SPDK_SUCCESS);
+	rc = add_transfer_task(&conn, task4);
+	CU_ASSERT(rc == 0);
 
 	task5 = spdk_iscsi_task_get(&conn, NULL, NULL);
 	SPDK_CU_ASSERT_FATAL(task5 != NULL);
@@ -894,8 +995,8 @@ clear_all_transfer_tasks_test(void)
 	task5->scsi.lun = &lun2;
 	spdk_iscsi_task_set_pdu(task5, pdu5);
 
-	rc = spdk_add_transfer_task(&conn, task5);
-	CU_ASSERT(rc == SPDK_SUCCESS);
+	rc = add_transfer_task(&conn, task5);
+	CU_ASSERT(rc == 0);
 
 	mgmt_pdu2 = spdk_get_pdu();
 	SPDK_CU_ASSERT_FATAL(mgmt_pdu2 != NULL);
@@ -915,46 +1016,46 @@ clear_all_transfer_tasks_test(void)
 	task6->scsi.lun = &lun2;
 	spdk_iscsi_task_set_pdu(task6, pdu6);
 
-	rc = spdk_add_transfer_task(&conn, task6);
-	CU_ASSERT(rc == SPDK_SUCCESS);
+	rc = add_transfer_task(&conn, task6);
+	CU_ASSERT(rc == 0);
 
 	CU_ASSERT(conn.ttt == 4);
 
-	CU_ASSERT(spdk_get_transfer_task(&conn, 1) == task1);
-	CU_ASSERT(spdk_get_transfer_task(&conn, 2) == task2);
-	CU_ASSERT(spdk_get_transfer_task(&conn, 3) == task3);
-	CU_ASSERT(spdk_get_transfer_task(&conn, 4) == task4);
-	CU_ASSERT(spdk_get_transfer_task(&conn, 5) == NULL);
+	CU_ASSERT(get_transfer_task(&conn, 1) == task1);
+	CU_ASSERT(get_transfer_task(&conn, 2) == task2);
+	CU_ASSERT(get_transfer_task(&conn, 3) == task3);
+	CU_ASSERT(get_transfer_task(&conn, 4) == task4);
+	CU_ASSERT(get_transfer_task(&conn, 5) == NULL);
 
 	spdk_clear_all_transfer_task(&conn, &lun1, mgmt_pdu1);
 
 	CU_ASSERT(!TAILQ_EMPTY(&conn.queued_r2t_tasks));
-	CU_ASSERT(spdk_get_transfer_task(&conn, 1) == NULL);
-	CU_ASSERT(spdk_get_transfer_task(&conn, 2) == task2);
-	CU_ASSERT(spdk_get_transfer_task(&conn, 3) == task3);
-	CU_ASSERT(spdk_get_transfer_task(&conn, 4) == task4);
-	CU_ASSERT(spdk_get_transfer_task(&conn, 5) == task5);
-	CU_ASSERT(spdk_get_transfer_task(&conn, 6) == NULL);
+	CU_ASSERT(get_transfer_task(&conn, 1) == NULL);
+	CU_ASSERT(get_transfer_task(&conn, 2) == task2);
+	CU_ASSERT(get_transfer_task(&conn, 3) == task3);
+	CU_ASSERT(get_transfer_task(&conn, 4) == task4);
+	CU_ASSERT(get_transfer_task(&conn, 5) == task5);
+	CU_ASSERT(get_transfer_task(&conn, 6) == NULL);
 
 	spdk_clear_all_transfer_task(&conn, &lun1, NULL);
 
 	CU_ASSERT(TAILQ_EMPTY(&conn.queued_r2t_tasks));
-	CU_ASSERT(spdk_get_transfer_task(&conn, 1) == NULL);
-	CU_ASSERT(spdk_get_transfer_task(&conn, 2) == NULL);
-	CU_ASSERT(spdk_get_transfer_task(&conn, 3) == NULL);
-	CU_ASSERT(spdk_get_transfer_task(&conn, 4) == task4);
-	CU_ASSERT(spdk_get_transfer_task(&conn, 5) == task5);
-	CU_ASSERT(spdk_get_transfer_task(&conn, 6) == task6);
+	CU_ASSERT(get_transfer_task(&conn, 1) == NULL);
+	CU_ASSERT(get_transfer_task(&conn, 2) == NULL);
+	CU_ASSERT(get_transfer_task(&conn, 3) == NULL);
+	CU_ASSERT(get_transfer_task(&conn, 4) == task4);
+	CU_ASSERT(get_transfer_task(&conn, 5) == task5);
+	CU_ASSERT(get_transfer_task(&conn, 6) == task6);
 
 	spdk_clear_all_transfer_task(&conn, &lun2, mgmt_pdu2);
 
-	CU_ASSERT(spdk_get_transfer_task(&conn, 4) == NULL);
-	CU_ASSERT(spdk_get_transfer_task(&conn, 5) == NULL);
-	CU_ASSERT(spdk_get_transfer_task(&conn, 6) == task6);
+	CU_ASSERT(get_transfer_task(&conn, 4) == NULL);
+	CU_ASSERT(get_transfer_task(&conn, 5) == NULL);
+	CU_ASSERT(get_transfer_task(&conn, 6) == task6);
 
 	spdk_clear_all_transfer_task(&conn, NULL, NULL);
 
-	CU_ASSERT(spdk_get_transfer_task(&conn, 6) == NULL);
+	CU_ASSERT(get_transfer_task(&conn, 6) == NULL);
 
 	CU_ASSERT(TAILQ_EMPTY(&conn.active_r2t_tasks));
 	while (!TAILQ_EMPTY(&g_write_pdu_list)) {
@@ -989,14 +1090,14 @@ abort_queued_datain_task_test(void)
 	/* Slot of data in tasks are full */
 	conn.data_in_cnt = MAX_LARGE_DATAIN_PER_CONNECTION;
 
-	rc = _spdk_iscsi_conn_abort_queued_datain_task(&conn, task);
+	rc = _iscsi_conn_abort_queued_datain_task(&conn, task);
 	CU_ASSERT(rc != 0);
 
 	/* Only one slot remains and no subtasks are submitted yet. */
 	conn.data_in_cnt--;
 	task->current_datain_offset = 0;
 
-	rc = _spdk_iscsi_conn_abort_queued_datain_task(&conn, task);
+	rc = _iscsi_conn_abort_queued_datain_task(&conn, task);
 	CU_ASSERT(rc == 0);
 	CU_ASSERT(TAILQ_EMPTY(&conn.queued_datain_tasks));
 
@@ -1008,7 +1109,7 @@ abort_queued_datain_task_test(void)
 	task->scsi.transfer_len = SPDK_BDEV_LARGE_BUF_MAX_SIZE * 3;
 	task->current_datain_offset = SPDK_BDEV_LARGE_BUF_MAX_SIZE;
 
-	rc = _spdk_iscsi_conn_abort_queued_datain_task(&conn, task);
+	rc = _iscsi_conn_abort_queued_datain_task(&conn, task);
 	CU_ASSERT(rc != 0);
 	CU_ASSERT(task->current_datain_offset == SPDK_BDEV_LARGE_BUF_MAX_SIZE * 2);
 	CU_ASSERT(conn.data_in_cnt == MAX_LARGE_DATAIN_PER_CONNECTION);
@@ -1016,7 +1117,7 @@ abort_queued_datain_task_test(void)
 	/* Additional one slot becomes vacant. */
 	conn.data_in_cnt--;
 
-	rc = _spdk_iscsi_conn_abort_queued_datain_task(&conn, task);
+	rc = _iscsi_conn_abort_queued_datain_task(&conn, task);
 	CU_ASSERT(rc == 0);
 	CU_ASSERT(TAILQ_EMPTY(&conn.queued_datain_tasks));
 
@@ -1043,13 +1144,13 @@ abort_queued_datain_task_test(void)
 
 	conn.data_in_cnt--;
 
-	rc = spdk_iscsi_conn_abort_queued_datain_task(&conn, 1);
+	rc = iscsi_conn_abort_queued_datain_task(&conn, 1);
 	CU_ASSERT(rc == 0);
 
-	rc = spdk_iscsi_conn_abort_queued_datain_task(&conn, 2);
+	rc = iscsi_conn_abort_queued_datain_task(&conn, 2);
 	CU_ASSERT(rc == 0);
 
-	rc = spdk_iscsi_conn_abort_queued_datain_task(&conn, 3);
+	rc = iscsi_conn_abort_queued_datain_task(&conn, 3);
 	CU_ASSERT(rc == 0);
 
 	CU_ASSERT(TAILQ_EMPTY(&conn.queued_datain_tasks));
@@ -1170,7 +1271,7 @@ abort_queued_datain_tasks_test(void)
 	spdk_iscsi_task_set_pdu(task6, pdu6);
 	TAILQ_INSERT_TAIL(&conn.queued_datain_tasks, task6, link);
 
-	rc = spdk_iscsi_conn_abort_queued_datain_tasks(&conn, &lun1, mgmt_pdu1);
+	rc = iscsi_conn_abort_queued_datain_tasks(&conn, &lun1, mgmt_pdu1);
 	CU_ASSERT(rc == 0);
 	CU_ASSERT(!datain_task_is_queued(&conn, task1));
 	CU_ASSERT(datain_task_is_queued(&conn, task2));
@@ -1179,7 +1280,7 @@ abort_queued_datain_tasks_test(void)
 	CU_ASSERT(datain_task_is_queued(&conn, task5));
 	CU_ASSERT(datain_task_is_queued(&conn, task6));
 
-	rc = spdk_iscsi_conn_abort_queued_datain_tasks(&conn, &lun2, mgmt_pdu2);
+	rc = iscsi_conn_abort_queued_datain_tasks(&conn, &lun2, mgmt_pdu2);
 	CU_ASSERT(rc == 0);
 	CU_ASSERT(!datain_task_is_queued(&conn, task2));
 	CU_ASSERT(datain_task_is_queued(&conn, task3));
@@ -1339,6 +1440,81 @@ build_iovs_test(void)
 	free(data);
 }
 
+static void
+build_iovs_with_md_test(void)
+{
+	struct spdk_iscsi_conn conn = {};
+	struct spdk_iscsi_pdu pdu = {};
+	struct iovec iovs[6] = {};
+	uint8_t *data;
+	uint32_t mapped_length = 0;
+	int rc;
+
+	conn.header_digest = true;
+	conn.data_digest = true;
+
+	DSET24(&pdu.bhs.data_segment_len, 4096 * 2);
+	data = calloc(1, (4096 + 128) * 2);
+	SPDK_CU_ASSERT_FATAL(data != NULL);
+	pdu.data = data;
+	pdu.data_buf_len = (4096 + 128) * 2;
+
+	pdu.bhs.total_ahs_len = 0;
+	pdu.bhs.opcode = ISCSI_OP_SCSI;
+
+	rc = spdk_dif_ctx_init(&pdu.dif_ctx, 4096 + 128, 128, true, false, SPDK_DIF_TYPE1,
+			       0, 0, 0, 0, 0, 0);
+	CU_ASSERT(rc == 0);
+
+	pdu.dif_insert_or_strip = true;
+
+	pdu.writev_offset = 0;
+	rc = spdk_iscsi_build_iovs(&conn, iovs, 6, &pdu, &mapped_length);
+	CU_ASSERT(rc == 5);
+	CU_ASSERT(iovs[0].iov_base == (void *)&pdu.bhs);
+	CU_ASSERT(iovs[0].iov_len == ISCSI_BHS_LEN);
+	CU_ASSERT(iovs[1].iov_base == (void *)pdu.header_digest);
+	CU_ASSERT(iovs[1].iov_len == ISCSI_DIGEST_LEN);
+	CU_ASSERT(iovs[2].iov_base == (void *)pdu.data);
+	CU_ASSERT(iovs[2].iov_len == 4096);
+	CU_ASSERT(iovs[3].iov_base == (void *)(pdu.data + 4096 + 128));
+	CU_ASSERT(iovs[3].iov_len == 4096);
+	CU_ASSERT(iovs[4].iov_base == (void *)pdu.data_digest);
+	CU_ASSERT(iovs[4].iov_len == ISCSI_DIGEST_LEN);
+	CU_ASSERT(mapped_length == ISCSI_BHS_LEN + ISCSI_DIGEST_LEN + 4096 * 2 + ISCSI_DIGEST_LEN);
+
+	pdu.writev_offset = ISCSI_BHS_LEN + ISCSI_DIGEST_LEN + 2048;
+	rc = spdk_iscsi_build_iovs(&conn, iovs, 6, &pdu, &mapped_length);
+	CU_ASSERT(rc == 3);
+	CU_ASSERT(iovs[0].iov_base == (void *)(pdu.data + 2048));
+	CU_ASSERT(iovs[0].iov_len == 2048);
+	CU_ASSERT(iovs[1].iov_base == (void *)(pdu.data + 4096 + 128));
+	CU_ASSERT(iovs[1].iov_len == 4096);
+	CU_ASSERT(iovs[2].iov_base == (void *)pdu.data_digest);
+	CU_ASSERT(iovs[2].iov_len == ISCSI_DIGEST_LEN);
+	CU_ASSERT(mapped_length == 2048 + 4096 + ISCSI_DIGEST_LEN);
+
+	pdu.writev_offset = ISCSI_BHS_LEN + ISCSI_DIGEST_LEN + 4096 * 2;
+	rc = spdk_iscsi_build_iovs(&conn, iovs, 6, &pdu, &mapped_length);
+	CU_ASSERT(rc == 1);
+	CU_ASSERT(iovs[0].iov_base == (void *)pdu.data_digest);
+	CU_ASSERT(iovs[0].iov_len == ISCSI_DIGEST_LEN);
+	CU_ASSERT(mapped_length == ISCSI_DIGEST_LEN);
+
+	pdu.writev_offset = 0;
+	rc = spdk_iscsi_build_iovs(&conn, iovs, 3, &pdu, &mapped_length);
+	CU_ASSERT(rc == 3);
+	CU_ASSERT(iovs[0].iov_base == (void *)&pdu.bhs);
+	CU_ASSERT(iovs[0].iov_len == ISCSI_BHS_LEN);
+	CU_ASSERT(iovs[1].iov_base == (void *)pdu.header_digest);
+	CU_ASSERT(iovs[1].iov_len == ISCSI_DIGEST_LEN);
+	CU_ASSERT(iovs[2].iov_base == (void *)pdu.data);
+	CU_ASSERT(iovs[2].iov_len == 4096);
+	CU_ASSERT(mapped_length == ISCSI_BHS_LEN + ISCSI_DIGEST_LEN + 4096);
+
+	free(data);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -1357,6 +1533,7 @@ main(int argc, char **argv)
 
 	if (
 		CU_add_test(suite, "login check target test", op_login_check_target_test) == NULL
+		|| CU_add_test(suite, "login_session_normal_test", op_login_session_normal_test) == NULL
 		|| CU_add_test(suite, "maxburstlength test", maxburstlength_test) == NULL
 		|| CU_add_test(suite, "underflow for read transfer test",
 			       underflow_for_read_transfer_test) == NULL
@@ -1376,6 +1553,7 @@ main(int argc, char **argv)
 		|| CU_add_test(suite, "abort_queued_datain_tasks_test",
 			       abort_queued_datain_tasks_test) == NULL
 		|| CU_add_test(suite, "build_iovs_test", build_iovs_test) == NULL
+		|| CU_add_test(suite, "build_iovs_with_md_test", build_iovs_with_md_test) == NULL
 	) {
 		CU_cleanup_registry();
 		return CU_get_error();

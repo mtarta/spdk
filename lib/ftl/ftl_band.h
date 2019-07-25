@@ -38,10 +38,15 @@
 #include "spdk/bit_array.h"
 #include "spdk/queue.h"
 
+#include "ftl_io.h"
 #include "ftl_ppa.h"
+#include "ftl_io.h"
+
+/* Number of LBAs that could be stored in a single block */
+#define FTL_NUM_LBA_IN_BLOCK	(FTL_BLOCK_SIZE / sizeof(uint64_t))
 
 struct spdk_ftl_dev;
-struct ftl_cb;
+struct ftl_lba_map_request;
 
 enum ftl_chunk_state {
 	FTL_CHUNK_STATE_FREE,
@@ -54,6 +59,12 @@ enum ftl_chunk_state {
 struct ftl_chunk {
 	/* Block state */
 	enum ftl_chunk_state			state;
+
+	/* Indicates that there is inflight write */
+	bool					busy;
+
+	/* Current logical block's offset */
+	uint64_t				write_offset;
 
 	/* First PPA */
 	struct ftl_ppa				start_ppa;
@@ -81,13 +92,13 @@ enum ftl_md_status {
 	FTL_MD_INVALID_SIZE
 };
 
-struct ftl_md {
-	/* Sequence number */
-	uint64_t				seq;
+enum ftl_lba_map_seg_state {
+	FTL_LBA_MAP_SEG_CLEAR,
+	FTL_LBA_MAP_SEG_PENDING,
+	FTL_LBA_MAP_SEG_CACHED
+};
 
-	/* Number of defrag cycles */
-	uint64_t				wr_cnt;
-
+struct ftl_lba_map {
 	/* LBA/vld map lock */
 	pthread_spinlock_t			lock;
 
@@ -98,10 +109,18 @@ struct ftl_md {
 	size_t					ref_cnt;
 
 	/* Bitmap of valid LBAs */
-	struct spdk_bit_array			*vld_map;
+	struct spdk_bit_array			*vld;
 
-	/* LBA map (only valid for open bands) */
-	uint64_t				*lba_map;
+	/* LBA map (only valid for open/relocating bands) */
+	uint64_t				*map;
+
+	/* LBA map segment state map (clear, pending, cached) */
+	uint8_t					*segments;
+
+	LIST_HEAD(, ftl_lba_map_request)	request_list;
+
+	/* Metadata DMA buffer (only valid for open/relocating bands) */
+	void					*dma_buf;
 };
 
 enum ftl_band_state {
@@ -113,6 +132,22 @@ enum ftl_band_state {
 	FTL_BAND_STATE_CLOSING,
 	FTL_BAND_STATE_CLOSED,
 	FTL_BAND_STATE_MAX
+};
+
+struct ftl_lba_map_request {
+	/*  Completion callback */
+	ftl_io_fn				cb;
+
+	/*  Completion callback context */
+	void					*cb_ctx;
+
+	/* Bit array of requested segments */
+	struct spdk_bit_array			*segments;
+
+	/* Number of pending segments to read */
+	size_t					num_pending;
+
+	LIST_ENTRY(ftl_lba_map_request)		list_entry;
 };
 
 struct ftl_band {
@@ -128,8 +163,8 @@ struct ftl_band {
 	/* List of operational chunks */
 	CIRCLEQ_HEAD(, ftl_chunk)		chunks;
 
-	/* Band's metadata */
-	struct ftl_md				md;
+	/* LBA map */
+	struct ftl_lba_map			lba_map;
 
 	/* Band's state */
 	enum ftl_band_state			state;
@@ -144,8 +179,21 @@ struct ftl_band {
 	/* the band should be defragged immediately */
 	int					high_prio;
 
+	/* Sequence number */
+	uint64_t				seq;
+
+	/* Number of defrag cycles */
+	uint64_t				wr_cnt;
+
 	/* End metadata start ppa */
 	struct ftl_ppa				tail_md_ppa;
+
+	/* Bitmap of all bands that have its data moved onto this band */
+	struct spdk_bit_array			*reloc_bitmap;
+	/* Number of open bands containing data moved from this band */
+	size_t					num_reloc_bands;
+	/* Number of blocks currently being moved from this band */
+	size_t					num_reloc_blocks;
 
 	/* Free/shut bands' lists */
 	LIST_ENTRY(ftl_band)			list_entry;
@@ -158,43 +206,44 @@ uint64_t	ftl_band_lbkoff_from_ppa(struct ftl_band *band, struct ftl_ppa ppa);
 struct ftl_ppa ftl_band_ppa_from_lbkoff(struct ftl_band *band, uint64_t lbkoff);
 void		ftl_band_set_state(struct ftl_band *band, enum ftl_band_state state);
 size_t		ftl_band_age(const struct ftl_band *band);
-void		ftl_band_acquire_md(struct ftl_band *band);
-int		ftl_band_alloc_md(struct ftl_band *band);
-void		ftl_band_release_md(struct ftl_band *band);
+void		ftl_band_acquire_lba_map(struct ftl_band *band);
+int		ftl_band_alloc_lba_map(struct ftl_band *band);
+void		ftl_band_clear_lba_map(struct ftl_band *band);
+void		ftl_band_release_lba_map(struct ftl_band *band);
+int		ftl_band_read_lba_map(struct ftl_band *band,
+				      size_t offset, size_t lba_cnt,
+				      ftl_io_fn cb_fn, void *cb_ctx);
 struct ftl_ppa ftl_band_next_xfer_ppa(struct ftl_band *band, struct ftl_ppa ppa,
 				      size_t num_lbks);
 struct ftl_ppa ftl_band_next_ppa(struct ftl_band *band, struct ftl_ppa ppa,
 				 size_t offset);
 size_t		ftl_band_num_usable_lbks(const struct ftl_band *band);
+size_t		ftl_band_user_lbks_left(const struct ftl_band *band, size_t offset);
 size_t		ftl_band_user_lbks(const struct ftl_band *band);
 void		ftl_band_set_addr(struct ftl_band *band, uint64_t lba,
 				  struct ftl_ppa ppa);
 struct ftl_band *ftl_band_from_ppa(struct spdk_ftl_dev *dev, struct ftl_ppa ppa);
 struct ftl_chunk *ftl_band_chunk_from_ppa(struct ftl_band *band, struct ftl_ppa);
-void		ftl_band_md_clear(struct ftl_md *md);
-int		ftl_band_read_tail_md(struct ftl_band *band, struct ftl_md *md,
-				      void *data, struct ftl_ppa,
-				      const struct ftl_cb *cb);
-int		ftl_band_read_head_md(struct ftl_band *band, struct ftl_md *md,
-				      void *data, const struct ftl_cb *cb);
-int		ftl_band_read_lba_map(struct ftl_band *band, struct ftl_md *md,
-				      void *data, const struct ftl_cb *cb);
-int		ftl_band_write_tail_md(struct ftl_band *band, void *data, spdk_ftl_fn cb);
-int		ftl_band_write_head_md(struct ftl_band *band, void *data, spdk_ftl_fn cb);
+void		ftl_band_md_clear(struct ftl_band *band);
+int		ftl_band_read_tail_md(struct ftl_band *band, struct ftl_ppa,
+				      ftl_io_fn cb_fn, void *cb_ctx);
+int		ftl_band_read_head_md(struct ftl_band *band, ftl_io_fn cb_fn, void *cb_ctx);
+int		ftl_band_write_tail_md(struct ftl_band *band, ftl_io_fn cb);
+int		ftl_band_write_head_md(struct ftl_band *band, ftl_io_fn cb);
 struct ftl_ppa ftl_band_tail_md_ppa(struct ftl_band *band);
 struct ftl_ppa ftl_band_head_md_ppa(struct ftl_band *band);
 void		ftl_band_write_failed(struct ftl_band *band);
-void		ftl_band_clear_md(struct ftl_band *band);
 int		ftl_band_full(struct ftl_band *band, size_t offset);
 int		ftl_band_erase(struct ftl_band *band);
 int		ftl_band_write_prep(struct ftl_band *band);
 struct ftl_chunk *ftl_band_next_operational_chunk(struct ftl_band *band,
 		struct ftl_chunk *chunk);
+size_t		ftl_lba_map_pool_elem_size(struct spdk_ftl_dev *dev);
 
 static inline int
 ftl_band_empty(const struct ftl_band *band)
 {
-	return band->md.num_vld == 0;
+	return band->lba_map.num_vld == 0;
 }
 
 static inline struct ftl_chunk *
@@ -220,15 +269,15 @@ ftl_band_state_changing(struct ftl_band *band)
 static inline int
 ftl_band_lbkoff_valid(struct ftl_band *band, size_t lbkoff)
 {
-	struct ftl_md *md = &band->md;
+	struct ftl_lba_map *lba_map = &band->lba_map;
 
-	pthread_spin_lock(&md->lock);
-	if (spdk_bit_array_get(md->vld_map, lbkoff)) {
-		pthread_spin_unlock(&md->lock);
+	pthread_spin_lock(&lba_map->lock);
+	if (spdk_bit_array_get(lba_map->vld, lbkoff)) {
+		pthread_spin_unlock(&lba_map->lock);
 		return 1;
 	}
 
-	pthread_spin_unlock(&md->lock);
+	pthread_spin_unlock(&lba_map->lock);
 	return 0;
 }
 
@@ -247,7 +296,9 @@ ftl_band_chunk_is_first(struct ftl_band *band, struct ftl_chunk *chunk)
 static inline int
 ftl_chunk_is_writable(const struct ftl_chunk *chunk)
 {
-	return chunk->state == FTL_CHUNK_STATE_OPEN || chunk->state == FTL_CHUNK_STATE_FREE;
+	return (chunk->state == FTL_CHUNK_STATE_OPEN ||
+		chunk->state == FTL_CHUNK_STATE_FREE) &&
+	       !chunk->busy;
 }
 
 #endif /* FTL_BAND_H */

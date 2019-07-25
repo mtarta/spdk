@@ -40,6 +40,7 @@
 
 #include "spdk/stdinc.h"
 
+#include "spdk/cpuset.h"
 #include "spdk/queue.h"
 
 #ifdef __cplusplus
@@ -57,7 +58,7 @@ struct spdk_poller;
  *
  * \param thread The new spdk_thread.
  */
-typedef void (*spdk_new_thread_fn)(struct spdk_thread *thread);
+typedef int (*spdk_new_thread_fn)(struct spdk_thread *thread);
 
 /**
  * A function that will be called on the target thread.
@@ -196,14 +197,25 @@ void spdk_thread_lib_fini(void);
  * \param name Human-readable name for the thread; can be retrieved with spdk_thread_get_name().
  * The string is copied, so the pointed-to data only needs to be valid during the
  * spdk_thread_create() call. May be NULL to specify no name.
+ * \param cpumask Optional mask of CPU cores on which to schedule this thread. This is only
+ * a suggestion to the scheduler. The value is copied, so cpumask may be released when
+ * this function returns. May be NULL if no mask is required.
  *
  * \return a pointer to the allocated thread on success or NULL on failure..
  */
-struct spdk_thread *spdk_thread_create(const char *name);
+struct spdk_thread *spdk_thread_create(const char *name, struct spdk_cpuset *cpumask);
 
 /**
- * Release any resources related to the given thread and destroy it. Execution
- * continues on the current system thread after returning.
+ * Force the current system thread to act as if executing the given SPDK thread.
+ *
+ * \param thread The thread to set.
+ */
+void spdk_set_thread(struct spdk_thread *thread);
+
+/**
+ * Mark the thread as exited, failing all future spdk_thread_poll() calls. May
+ * only be called within an spdk poller or message.
+ *
  *
  * \param thread The thread to destroy.
  *
@@ -211,6 +223,15 @@ struct spdk_thread *spdk_thread_create(const char *name);
  * spdk_put_io_channel() prior to calling this function.
  */
 void spdk_thread_exit(struct spdk_thread *thread);
+
+/**
+ * Destroy a thread, releasing all of its resources. May only be called
+ * on a thread previously marked as exited.
+ *
+ * \param thread The thread to destroy.
+ *
+ */
+void spdk_thread_destroy(struct spdk_thread *thread);
 
 /**
  * Return a pointer to this thread's context.
@@ -221,6 +242,15 @@ void spdk_thread_exit(struct spdk_thread *thread);
  * no per-thread context.
  */
 void *spdk_thread_get_ctx(struct spdk_thread *thread);
+
+/**
+ * Get the thread's cpumask.
+ *
+ * \param thread The thread to get the cpumask for.
+ *
+ * \return cpuset pointer
+ */
+struct spdk_cpuset *spdk_thread_get_cpumask(struct spdk_thread *thread);
 
 /**
  * Return the thread object associated with the context handle previously
@@ -242,7 +272,7 @@ struct spdk_thread *spdk_thread_get_from_ctx(void *ctx);
  * \param now The current time, in ticks. Optional. If 0 is passed, this
  *            function may call spdk_get_ticks() to get the current time.
  *
- * \return 1 if work was done. 0 if no work was done. -1 if unknown.
+ * \return 1 if work was done. 0 if no work was done. -1 if thread has exited.
  */
 int spdk_thread_poll(struct spdk_thread *thread, uint32_t max_msgs, uint64_t now);
 
@@ -315,7 +345,6 @@ const char *spdk_thread_get_name(const struct spdk_thread *thread);
 struct spdk_thread_stats {
 	uint64_t busy_tsc;
 	uint64_t idle_tsc;
-	uint64_t unknown_tsc;
 };
 
 /**

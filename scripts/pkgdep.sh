@@ -42,7 +42,7 @@ if [ -s /etc/redhat-release ]; then
 
 	# Includes Fedora, CentOS 7, RHEL 7
 	# Add EPEL repository for CUnit-devel and libunwind-devel
-	if echo "$ID $VERSION_ID" | egrep -q 'rhel 7|centos 7'; then
+	if echo "$ID $VERSION_ID" | grep -E -q 'rhel 7|centos 7'; then
 		if ! rpm --quiet -q epel-release; then
 			yum install https://dl.fedoraproject.org/pub/epel/epel-release-latest-7.noarch.rpm
 		fi
@@ -55,7 +55,7 @@ if [ -s /etc/redhat-release ]; then
 	fi
 
 	yum install -y gcc gcc-c++ make CUnit-devel libaio-devel openssl-devel \
-		git astyle python-pycodestyle lcov python clang-analyzer libuuid-devel \
+		git astyle python-pycodestyle lcov python libuuid-devel \
 		sg3_utils libiscsi-devel pciutils
 	# Additional (optional) dependencies for showing backtrace in logs
 	yum install -y libunwind-devel || true
@@ -68,11 +68,11 @@ if [ -s /etc/redhat-release ]; then
 	# Additional dependencies for building pmem based backends
 	yum install -y libpmemblk-devel || true
 	# Additional dependencies for SPDK CLI - not available in rhel and centos
-	if ! echo "$ID $VERSION_ID" | egrep -q 'rhel 7|centos 7'; then
+	if ! echo "$ID $VERSION_ID" | grep -E -q 'rhel 7|centos 7'; then
 		yum install -y python3-configshell python3-pexpect
 	fi
 	# Additional dependencies for ISA-L used in compression
-	yum install -y autoconf automake libtool
+	yum install -y autoconf automake libtool help2man
 elif [ -f /etc/debian_version ]; then
 	# Includes Ubuntu, Debian
 	apt-get install -y gcc g++ make libcunit1-dev libaio-dev libssl-dev \
@@ -91,7 +91,9 @@ elif [ -f /etc/debian_version ]; then
 	apt-get install -y python3-configshell-fb python3-pexpect || echo \
 		"Note: Some SPDK CLI dependencies could not be installed."
 	# Additional dependencies for ISA-L used in compression
-	apt-get install -y autoconf automake libtool
+	apt-get install -y autoconf automake libtool help2man
+	# Additional dependecies for nvmf performance test script
+	apt-get install -y python3-paramiko
 elif [ -f /etc/SuSE-release ] || [ -f /etc/SUSE-brand ]; then
 	zypper install -y gcc gcc-c++ make cunit-devel libaio-devel libopenssl-devel \
 		git-core lcov python-base python-pycodestyle libuuid-devel sg3_utils pciutils
@@ -106,14 +108,14 @@ elif [ -f /etc/SuSE-release ] || [ -f /etc/SUSE-brand ]; then
 	# Additional dependencies for building docs
 	zypper install -y doxygen mscgen graphviz
 	# Additional dependencies for ISA-L used in compression
-	zypper install -y autoconf automake libtool
+	zypper install -y autoconf automake libtool help2man
 elif [ $(uname -s) = "FreeBSD" ] ; then
 	pkg install -y gmake cunit openssl git devel/astyle bash py27-pycodestyle \
 		python misc/e2fsprogs-libuuid sysutils/sg3_utils nasm
 	# Additional dependencies for building docs
 	pkg install -y doxygen mscgen graphviz
 	# Additional dependencies for ISA-L used in compression
-	pkg install -y autoconf automake libtool
+	pkg install -y autoconf automake libtool help2man
 else
 	echo "pkgdep: unknown system type."
 	exit 1

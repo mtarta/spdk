@@ -62,9 +62,6 @@
 	memset(&(conn)->portal, 0, sizeof(*(conn)) -	\
 		offsetof(struct spdk_iscsi_conn, portal));
 
-static int g_connections_per_lcore;
-static uint32_t *g_num_connections;
-
 struct spdk_iscsi_conn *g_conns_array = MAP_FAILED;
 static int g_conns_array_fd = -1;
 static char g_shm_name[64];
@@ -73,12 +70,10 @@ static pthread_mutex_t g_conns_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static struct spdk_poller *g_shutdown_timer = NULL;
 
-static uint32_t spdk_iscsi_conn_allocate_reactor(const struct spdk_cpuset *cpumask);
-
-static void spdk_iscsi_conn_full_feature_migrate(void *arg1, void *arg2);
-static void spdk_iscsi_conn_stop(struct spdk_iscsi_conn *conn);
-static void spdk_iscsi_conn_sock_cb(void *arg, struct spdk_sock_group *group,
-				    struct spdk_sock *sock);
+static void iscsi_conn_full_feature_migrate(void *arg1, void *arg2);
+static void iscsi_conn_stop(struct spdk_iscsi_conn *conn);
+static void iscsi_conn_sock_cb(void *arg, struct spdk_sock_group *group,
+			       struct spdk_sock *sock);
 
 static struct spdk_iscsi_conn *
 allocate_conn(void)
@@ -110,19 +105,35 @@ free_conn(struct spdk_iscsi_conn *conn)
 }
 
 static struct spdk_iscsi_conn *
-spdk_find_iscsi_connection_by_id(int cid)
+find_iscsi_connection_by_id(int cid)
 {
-	if (g_conns_array[cid].is_valid == 1) {
+	if (g_conns_array != MAP_FAILED && g_conns_array[cid].is_valid == 1) {
 		return &g_conns_array[cid];
 	} else {
 		return NULL;
 	}
 }
 
+static void
+_iscsi_conns_cleanup(void)
+{
+	if (g_conns_array != MAP_FAILED) {
+		munmap(g_conns_array, sizeof(struct spdk_iscsi_conn) *
+		       MAX_ISCSI_CONNECTIONS);
+		g_conns_array = MAP_FAILED;
+	}
+
+	if (g_conns_array_fd >= 0) {
+		close(g_conns_array_fd);
+		g_conns_array_fd = -1;
+		shm_unlink(g_shm_name);
+	}
+}
+
 int spdk_initialize_iscsi_conns(void)
 {
 	size_t conns_size = sizeof(struct spdk_iscsi_conn) * MAX_ISCSI_CONNECTIONS;
-	uint32_t i, last_core;
+	uint32_t i;
 
 	SPDK_DEBUGLOG(SPDK_LOG_ISCSI, "spdk_iscsi_init\n");
 
@@ -151,108 +162,50 @@ int spdk_initialize_iscsi_conns(void)
 		g_conns_array[i].id = i;
 	}
 
-	last_core = spdk_env_get_last_core();
-	g_num_connections = calloc(last_core + 1, sizeof(uint32_t));
-	if (!g_num_connections) {
-		SPDK_ERRLOG("Could not allocate array size=%u for g_num_connections\n",
-			    last_core + 1);
-		goto err;
-	}
-
 	return 0;
 
 err:
-	if (g_conns_array != MAP_FAILED) {
-		munmap(g_conns_array, conns_size);
-		g_conns_array = MAP_FAILED;
-	}
-
-	if (g_conns_array_fd >= 0) {
-		close(g_conns_array_fd);
-		g_conns_array_fd = -1;
-		shm_unlink(g_shm_name);
-	}
+	_iscsi_conns_cleanup();
 
 	return -1;
 }
 
 static void
-spdk_iscsi_poll_group_add_conn_sock(struct spdk_iscsi_conn *conn)
+iscsi_poll_group_add_conn(struct spdk_iscsi_poll_group *pg, struct spdk_iscsi_conn *conn)
 {
-	struct spdk_iscsi_poll_group *poll_group;
 	int rc;
 
-	assert(conn->lcore == spdk_env_get_current_core());
-
-	poll_group = &g_spdk_iscsi.poll_group[conn->lcore];
-
-	rc = spdk_sock_group_add_sock(poll_group->sock_group, conn->sock, spdk_iscsi_conn_sock_cb, conn);
+	rc = spdk_sock_group_add_sock(pg->sock_group, conn->sock, iscsi_conn_sock_cb, conn);
 	if (rc < 0) {
 		SPDK_ERRLOG("Failed to add sock=%p of conn=%p\n", conn->sock, conn);
+		return;
 	}
+
+	conn->is_stopped = false;
+	STAILQ_INSERT_TAIL(&pg->connections, conn, link);
 }
 
 static void
-spdk_iscsi_poll_group_remove_conn_sock(struct spdk_iscsi_conn *conn)
+iscsi_poll_group_remove_conn(struct spdk_iscsi_poll_group *pg, struct spdk_iscsi_conn *conn)
 {
-	struct spdk_iscsi_poll_group *poll_group;
 	int rc;
 
-	assert(conn->lcore == spdk_env_get_current_core());
-
-	poll_group = &g_spdk_iscsi.poll_group[conn->lcore];
-
-	rc = spdk_sock_group_remove_sock(poll_group->sock_group, conn->sock);
+	rc = spdk_sock_group_remove_sock(pg->sock_group, conn->sock);
 	if (rc < 0) {
 		SPDK_ERRLOG("Failed to remove sock=%p of conn=%p\n", conn->sock, conn);
 	}
-}
 
-static void
-spdk_iscsi_poll_group_add_conn(struct spdk_iscsi_conn *conn)
-{
-	struct spdk_iscsi_poll_group *poll_group;
-
-	assert(conn->lcore == spdk_env_get_current_core());
-
-	poll_group = &g_spdk_iscsi.poll_group[conn->lcore];
-
-	conn->is_stopped = false;
-	STAILQ_INSERT_TAIL(&poll_group->connections, conn, link);
-	spdk_iscsi_poll_group_add_conn_sock(conn);
-}
-
-static void
-spdk_iscsi_poll_group_remove_conn(struct spdk_iscsi_conn *conn)
-{
-	struct spdk_iscsi_poll_group *poll_group;
-
-	assert(conn->lcore == spdk_env_get_current_core());
-
-	poll_group = &g_spdk_iscsi.poll_group[conn->lcore];
+	spdk_poller_unregister(&conn->flush_poller);
 
 	conn->is_stopped = true;
-	STAILQ_REMOVE(&poll_group->connections, conn, spdk_iscsi_conn, link);
+	STAILQ_REMOVE(&pg->connections, conn, spdk_iscsi_conn, link);
 }
 
-/**
- * \brief Create an iSCSI connection from the given parameters and schedule it
- *        on a reactor.
- *
- * \code
- *
- * # identify reactor where the new connections work item will be scheduled
- * reactor = spdk_iscsi_conn_allocate_reactor()
- * allocate spdk_iscsi_conn object
- * initialize spdk_iscsi_conn object
- * schedule iSCSI connection work item on reactor
- *
- * \endcode
- */
 int
 spdk_iscsi_conn_construct(struct spdk_iscsi_portal *portal,
 			  struct spdk_sock *sock)
 {
+	struct spdk_iscsi_poll_group *pg;
 	struct spdk_iscsi_conn *conn;
 	int bufsize, i, rc;
 
@@ -276,7 +229,7 @@ spdk_iscsi_conn_construct(struct spdk_iscsi_portal *portal,
 	conn->pg_tag = portal->group->tag;
 	conn->portal_host = strdup(portal->host);
 	conn->portal_port = strdup(portal->port);
-	conn->portal_cpumask = portal->cpumask;
+	conn->portal_cpumask = &portal->cpumask;
 	conn->sock = sock;
 
 	conn->state = ISCSI_CONN_STATE_INVALID;
@@ -345,9 +298,9 @@ spdk_iscsi_conn_construct(struct spdk_iscsi_portal *portal,
 	conn->pending_task_cnt = 0;
 
 	conn->lcore = spdk_env_get_current_core();
-	__sync_fetch_and_add(&g_num_connections[conn->lcore], 1);
+	pg = &g_spdk_iscsi.poll_group[conn->lcore];
 
-	spdk_iscsi_poll_group_add_conn(conn);
+	iscsi_poll_group_add_conn(pg, conn);
 	return 0;
 
 error_return:
@@ -368,6 +321,7 @@ spdk_iscsi_conn_free_pdu(struct spdk_iscsi_conn *conn, struct spdk_iscsi_pdu *pd
 					conn->data_in_cnt--;
 					spdk_iscsi_task_put(spdk_iscsi_task_get_primary(pdu->task));
 				}
+				spdk_iscsi_conn_handle_queued_datain_tasks(conn);
 			}
 		} else if (pdu->bhs.opcode == ISCSI_OP_SCSI_RSP &&
 			   pdu->task->scsi.status != SPDK_SCSI_STATUS_GOOD) {
@@ -380,7 +334,8 @@ spdk_iscsi_conn_free_pdu(struct spdk_iscsi_conn *conn, struct spdk_iscsi_pdu *pd
 	spdk_put_pdu(pdu);
 }
 
-static int spdk_iscsi_conn_free_tasks(struct spdk_iscsi_conn *conn)
+static int
+iscsi_conn_free_tasks(struct spdk_iscsi_conn *conn)
 {
 	struct spdk_iscsi_pdu *pdu, *tmp_pdu;
 	struct spdk_iscsi_task *iscsi_task, *tmp_iscsi_task;
@@ -413,7 +368,7 @@ static int spdk_iscsi_conn_free_tasks(struct spdk_iscsi_conn *conn)
 }
 
 static void
-_spdk_iscsi_conn_free(struct spdk_iscsi_conn *conn)
+_iscsi_conn_free(struct spdk_iscsi_conn *conn)
 {
 	if (conn == NULL) {
 		return;
@@ -431,7 +386,7 @@ _spdk_iscsi_conn_free(struct spdk_iscsi_conn *conn)
 }
 
 static void
-spdk_iscsi_conn_cleanup_backend(struct spdk_iscsi_conn *conn)
+iscsi_conn_cleanup_backend(struct spdk_iscsi_conn *conn)
 {
 	int rc;
 	struct spdk_iscsi_tgt_node *target;
@@ -451,7 +406,7 @@ spdk_iscsi_conn_cleanup_backend(struct spdk_iscsi_conn *conn)
 }
 
 static void
-spdk_iscsi_conn_free(struct spdk_iscsi_conn *conn)
+iscsi_conn_free(struct spdk_iscsi_conn *conn)
 {
 	struct spdk_iscsi_sess *sess;
 	int idx;
@@ -496,53 +451,57 @@ spdk_iscsi_conn_free(struct spdk_iscsi_conn *conn)
 
 end:
 	SPDK_DEBUGLOG(SPDK_LOG_ISCSI, "cleanup free conn\n");
-	_spdk_iscsi_conn_free(conn);
+	_iscsi_conn_free(conn);
 
 	pthread_mutex_unlock(&g_conns_mutex);
 }
 
 static int
-_spdk_iscsi_conn_check_shutdown(void *arg)
+_iscsi_conn_check_shutdown(void *arg)
 {
 	struct spdk_iscsi_conn *conn = arg;
 	int rc;
 
-	rc = spdk_iscsi_conn_free_tasks(conn);
+	rc = iscsi_conn_free_tasks(conn);
 	if (rc < 0) {
 		return 1;
 	}
 
 	spdk_poller_unregister(&conn->shutdown_timer);
 
-	spdk_iscsi_conn_stop(conn);
-	spdk_iscsi_conn_free(conn);
+	iscsi_conn_stop(conn);
+	iscsi_conn_free(conn);
 
 	return 1;
 }
 
 static void
-_spdk_iscsi_conn_destruct(struct spdk_iscsi_conn *conn)
+_iscsi_conn_destruct(struct spdk_iscsi_conn *conn)
 {
+	struct spdk_iscsi_poll_group *pg;
 	int rc;
 
 	spdk_clear_all_transfer_task(conn, NULL, NULL);
-	spdk_iscsi_poll_group_remove_conn_sock(conn);
+
+	assert(conn->lcore == spdk_env_get_current_core());
+	pg = &g_spdk_iscsi.poll_group[conn->lcore];
+
+	iscsi_poll_group_remove_conn(pg, conn);
 	spdk_sock_close(&conn->sock);
 	spdk_poller_unregister(&conn->logout_timer);
-	spdk_poller_unregister(&conn->flush_poller);
 
-	rc = spdk_iscsi_conn_free_tasks(conn);
+	rc = iscsi_conn_free_tasks(conn);
 	if (rc < 0) {
 		/* The connection cannot be freed yet. Check back later. */
-		conn->shutdown_timer = spdk_poller_register(_spdk_iscsi_conn_check_shutdown, conn, 1000);
+		conn->shutdown_timer = spdk_poller_register(_iscsi_conn_check_shutdown, conn, 1000);
 	} else {
-		spdk_iscsi_conn_stop(conn);
-		spdk_iscsi_conn_free(conn);
+		iscsi_conn_stop(conn);
+		iscsi_conn_free(conn);
 	}
 }
 
 static int
-_spdk_iscsi_conn_check_pending_tasks(void *arg)
+_iscsi_conn_check_pending_tasks(void *arg)
 {
 	struct spdk_iscsi_conn *conn = arg;
 
@@ -552,7 +511,7 @@ _spdk_iscsi_conn_check_pending_tasks(void *arg)
 
 	spdk_poller_unregister(&conn->shutdown_timer);
 
-	_spdk_iscsi_conn_destruct(conn);
+	_iscsi_conn_destruct(conn);
 
 	return 1;
 }
@@ -568,18 +527,18 @@ spdk_iscsi_conn_destruct(struct spdk_iscsi_conn *conn)
 	conn->state = ISCSI_CONN_STATE_EXITED;
 
 	if (conn->sess != NULL && conn->pending_task_cnt > 0) {
-		spdk_iscsi_conn_cleanup_backend(conn);
+		iscsi_conn_cleanup_backend(conn);
 	}
 
 	if (conn->dev != NULL && spdk_scsi_dev_has_pending_tasks(conn->dev)) {
-		conn->shutdown_timer = spdk_poller_register(_spdk_iscsi_conn_check_pending_tasks, conn, 1000);
+		conn->shutdown_timer = spdk_poller_register(_iscsi_conn_check_pending_tasks, conn, 1000);
 	} else {
-		_spdk_iscsi_conn_destruct(conn);
+		_iscsi_conn_destruct(conn);
 	}
 }
 
-static int
-spdk_iscsi_get_active_conns(void)
+int
+spdk_iscsi_get_active_conns(struct spdk_iscsi_tgt_node *target)
 {
 	struct spdk_iscsi_conn *conn;
 	int num = 0;
@@ -587,8 +546,11 @@ spdk_iscsi_get_active_conns(void)
 
 	pthread_mutex_lock(&g_conns_mutex);
 	for (i = 0; i < MAX_ISCSI_CONNECTIONS; i++) {
-		conn = spdk_find_iscsi_connection_by_id(i);
+		conn = find_iscsi_connection_by_id(i);
 		if (conn == NULL) {
+			continue;
+		}
+		if (target != NULL && conn->target != target) {
 			continue;
 		}
 		num++;
@@ -598,46 +560,30 @@ spdk_iscsi_get_active_conns(void)
 }
 
 static void
-spdk_iscsi_conns_cleanup(void)
+iscsi_conn_check_shutdown_cb(void *arg1)
 {
-	free(g_num_connections);
-	munmap(g_conns_array, sizeof(struct spdk_iscsi_conn) *
-	       MAX_ISCSI_CONNECTIONS);
-	shm_unlink(g_shm_name);
-	if (g_conns_array_fd >= 0) {
-		close(g_conns_array_fd);
-		g_conns_array_fd = -1;
-	}
-}
-
-static void
-spdk_iscsi_conn_check_shutdown_cb(void *arg1, void *arg2)
-{
-	spdk_iscsi_conns_cleanup();
+	_iscsi_conns_cleanup();
 	spdk_shutdown_iscsi_conns_done();
 }
 
 static int
-spdk_iscsi_conn_check_shutdown(void *arg)
+iscsi_conn_check_shutdown(void *arg)
 {
-	struct spdk_event *event;
-
-	if (spdk_iscsi_get_active_conns() != 0) {
+	if (spdk_iscsi_get_active_conns(NULL) != 0) {
 		return 1;
 	}
 
 	spdk_poller_unregister(&g_shutdown_timer);
-	event = spdk_event_allocate(spdk_env_get_current_core(),
-				    spdk_iscsi_conn_check_shutdown_cb, NULL, NULL);
-	spdk_event_call(event);
+
+	spdk_thread_send_msg(spdk_get_thread(), iscsi_conn_check_shutdown_cb, NULL);
 
 	return 1;
 }
 
 static void
-spdk_iscsi_conn_close_lun(struct spdk_iscsi_conn *conn, int lun_id)
+iscsi_conn_close_lun(struct spdk_iscsi_conn *conn, int lun_id)
 {
-	struct spdk_scsi_desc *desc;
+	struct spdk_scsi_lun_desc *desc;
 
 	desc = conn->open_lun_descs[lun_id];
 	if (desc != NULL) {
@@ -648,12 +594,12 @@ spdk_iscsi_conn_close_lun(struct spdk_iscsi_conn *conn, int lun_id)
 }
 
 static void
-spdk_iscsi_conn_close_luns(struct spdk_iscsi_conn *conn)
+iscsi_conn_close_luns(struct spdk_iscsi_conn *conn)
 {
 	int i;
 
 	for (i = 0; i < SPDK_SCSI_DEV_MAX_LUN; i++) {
-		spdk_iscsi_conn_close_lun(conn, i);
+		iscsi_conn_close_lun(conn, i);
 	}
 }
 
@@ -673,7 +619,13 @@ _iscsi_conn_remove_lun(void *arg1, void *arg2)
 
 	spdk_clear_all_transfer_task(conn, lun, NULL);
 	TAILQ_FOREACH_SAFE(pdu, &conn->write_pdu_list, tailq, tmp_pdu) {
-		if (pdu->task && (lun == pdu->task->scsi.lun)) {
+		/* If the pdu's LUN matches the LUN that was removed, free this
+		 * PDU immediately.  If the pdu's LUN is NULL, then we know
+		 * the datain handling code already detected the hot removal,
+		 * so we can free that PDU as well.
+		 */
+		if (pdu->task &&
+		    (lun == pdu->task->scsi.lun || NULL == pdu->task->scsi.lun)) {
 			TAILQ_REMOVE(&conn->write_pdu_list, pdu, tailq);
 			spdk_iscsi_conn_free_pdu(conn, pdu);
 		}
@@ -694,11 +646,11 @@ _iscsi_conn_remove_lun(void *arg1, void *arg2)
 		}
 	}
 
-	spdk_iscsi_conn_close_lun(conn, lun_id);
+	iscsi_conn_close_lun(conn, lun_id);
 }
 
 static void
-spdk_iscsi_conn_remove_lun(struct spdk_scsi_lun *lun, void *remove_ctx)
+iscsi_conn_remove_lun(struct spdk_scsi_lun *lun, void *remove_ctx)
 {
 	struct spdk_iscsi_conn *conn = remove_ctx;
 	struct spdk_event *event;
@@ -709,11 +661,11 @@ spdk_iscsi_conn_remove_lun(struct spdk_scsi_lun *lun, void *remove_ctx)
 }
 
 static void
-spdk_iscsi_conn_open_luns(struct spdk_iscsi_conn *conn)
+iscsi_conn_open_luns(struct spdk_iscsi_conn *conn)
 {
 	int i, rc;
 	struct spdk_scsi_lun *lun;
-	struct spdk_scsi_desc *desc;
+	struct spdk_scsi_lun_desc *desc;
 
 	for (i = 0; i < SPDK_SCSI_DEV_MAX_LUN; i++) {
 		lun = spdk_scsi_dev_get_lun(conn->dev, i);
@@ -721,7 +673,7 @@ spdk_iscsi_conn_open_luns(struct spdk_iscsi_conn *conn)
 			continue;
 		}
 
-		rc = spdk_scsi_lun_open(lun, spdk_iscsi_conn_remove_lun, conn, &desc);
+		rc = spdk_scsi_lun_open(lun, iscsi_conn_remove_lun, conn, &desc);
 		if (rc != 0) {
 			goto error;
 		}
@@ -738,18 +690,20 @@ spdk_iscsi_conn_open_luns(struct spdk_iscsi_conn *conn)
 	return;
 
 error:
-	spdk_iscsi_conn_close_luns(conn);
+	iscsi_conn_close_luns(conn);
 }
 
 /**
  *  This function will stop executing the specified connection.
  */
 static void
-spdk_iscsi_conn_stop(struct spdk_iscsi_conn *conn)
+iscsi_conn_stop(struct spdk_iscsi_conn *conn)
 {
 	struct spdk_iscsi_tgt_node *target;
 
-	if (conn->state == ISCSI_CONN_STATE_EXITED && conn->sess != NULL &&
+	assert(conn->state == ISCSI_CONN_STATE_EXITED);
+
+	if (conn->sess != NULL &&
 	    conn->sess->session_type == SESSION_TYPE_NORMAL &&
 	    conn->full_feature) {
 		target = conn->sess->target;
@@ -757,16 +711,14 @@ spdk_iscsi_conn_stop(struct spdk_iscsi_conn *conn)
 		target->num_active_conns--;
 		pthread_mutex_unlock(&target->mutex);
 
-		spdk_iscsi_conn_close_luns(conn);
+		iscsi_conn_close_luns(conn);
 	}
 
 	assert(conn->lcore == spdk_env_get_current_core());
-
-	__sync_fetch_and_sub(&g_num_connections[conn->lcore], 1);
-	spdk_iscsi_poll_group_remove_conn(conn);
 }
 
-void spdk_shutdown_iscsi_conns(void)
+void
+spdk_iscsi_conns_start_exit(struct spdk_iscsi_tgt_node *target)
 {
 	struct spdk_iscsi_conn	*conn;
 	int			i;
@@ -774,8 +726,12 @@ void spdk_shutdown_iscsi_conns(void)
 	pthread_mutex_lock(&g_conns_mutex);
 
 	for (i = 0; i < MAX_ISCSI_CONNECTIONS; i++) {
-		conn = spdk_find_iscsi_connection_by_id(i);
+		conn = find_iscsi_connection_by_id(i);
 		if (conn == NULL) {
+			continue;
+		}
+
+		if (target != NULL && conn->target != target) {
 			continue;
 		}
 
@@ -788,8 +744,14 @@ void spdk_shutdown_iscsi_conns(void)
 	}
 
 	pthread_mutex_unlock(&g_conns_mutex);
-	g_shutdown_timer = spdk_poller_register(spdk_iscsi_conn_check_shutdown, NULL,
-						1000);
+}
+
+void
+spdk_shutdown_iscsi_conns(void)
+{
+	spdk_iscsi_conns_start_exit(NULL);
+
+	g_shutdown_timer = spdk_poller_register(iscsi_conn_check_shutdown, NULL, 1000);
 }
 
 int
@@ -805,7 +767,7 @@ spdk_iscsi_drop_conns(struct spdk_iscsi_conn *conn, const char *conn_match,
 	num = 0;
 	pthread_mutex_lock(&g_conns_mutex);
 	for (i = 0; i < MAX_ISCSI_CONNECTIONS; i++) {
-		xconn = spdk_find_iscsi_connection_by_id(i);
+		xconn = find_iscsi_connection_by_id(i);
 
 		if (xconn == NULL) {
 			continue;
@@ -962,8 +924,8 @@ spdk_iscsi_task_mgmt_cpl(struct spdk_scsi_task *scsi_task)
 }
 
 static void
-spdk_iscsi_task_copy_to_rsp_scsi_status(struct spdk_iscsi_task *primary,
-					struct spdk_scsi_task *task)
+iscsi_task_copy_to_rsp_scsi_status(struct spdk_iscsi_task *primary,
+				   struct spdk_scsi_task *task)
 {
 	memcpy(primary->rsp_sense_data, task->sense_data, task->sense_data_len);
 	primary->rsp_sense_data_len = task->sense_data_len;
@@ -971,8 +933,8 @@ spdk_iscsi_task_copy_to_rsp_scsi_status(struct spdk_iscsi_task *primary,
 }
 
 static void
-spdk_iscsi_task_copy_from_rsp_scsi_status(struct spdk_scsi_task *task,
-		struct spdk_iscsi_task *primary)
+iscsi_task_copy_from_rsp_scsi_status(struct spdk_scsi_task *task,
+				     struct spdk_iscsi_task *primary)
 {
 	memcpy(task->sense_data, primary->rsp_sense_data,
 	       primary->rsp_sense_data_len);
@@ -1018,10 +980,10 @@ process_read_task_completion(struct spdk_iscsi_conn *conn,
 			TAILQ_FOREACH(tmp, &primary->subtask_list, subtask_link) {
 				spdk_scsi_task_copy_status(&tmp->scsi, &task->scsi);
 			}
-			spdk_iscsi_task_copy_to_rsp_scsi_status(primary, &task->scsi);
+			iscsi_task_copy_to_rsp_scsi_status(primary, &task->scsi);
 		}
 	} else if (primary->rsp_scsi_status != SPDK_SCSI_STATUS_GOOD) {
-		spdk_iscsi_task_copy_from_rsp_scsi_status(&task->scsi, primary);
+		iscsi_task_copy_from_rsp_scsi_status(&task->scsi, primary);
 	}
 
 	if ((task != primary) &&
@@ -1045,8 +1007,6 @@ process_read_task_completion(struct spdk_iscsi_conn *conn,
 		spdk_iscsi_task_put(task);
 	}
 	process_completed_read_subtask_list(conn, primary);
-
-	spdk_iscsi_conn_handle_queued_datain_tasks(conn);
 }
 
 void
@@ -1079,13 +1039,13 @@ spdk_iscsi_task_cpl(struct spdk_scsi_task *scsi_task)
 				primary->scsi.data_transferred += task->scsi.data_transferred;
 			}
 		} else if (primary->rsp_scsi_status == SPDK_SCSI_STATUS_GOOD) {
-			spdk_iscsi_task_copy_to_rsp_scsi_status(primary, &task->scsi);
+			iscsi_task_copy_to_rsp_scsi_status(primary, &task->scsi);
 		}
 
 		if (primary->bytes_completed == primary->scsi.transfer_len) {
 			spdk_del_transfer_task(conn, primary->tag);
 			if (primary->rsp_scsi_status != SPDK_SCSI_STATUS_GOOD) {
-				spdk_iscsi_task_copy_from_rsp_scsi_status(&primary->scsi, primary);
+				iscsi_task_copy_from_rsp_scsi_status(&primary->scsi, primary);
 			}
 			spdk_iscsi_task_response(conn, primary);
 			/*
@@ -1109,8 +1069,8 @@ spdk_iscsi_task_cpl(struct spdk_scsi_task *scsi_task)
 }
 
 static int
-spdk_iscsi_get_pdu_length(struct spdk_iscsi_pdu *pdu, int header_digest,
-			  int data_digest)
+iscsi_get_pdu_length(struct spdk_iscsi_pdu *pdu, int header_digest,
+		     int data_digest)
 {
 	int data_len, enable_digest, total;
 
@@ -1188,7 +1148,7 @@ spdk_iscsi_conn_handle_nop(struct spdk_iscsi_conn *conn)
  * should be closed.
  */
 static int
-spdk_iscsi_conn_flush_pdus_internal(struct spdk_iscsi_conn *conn)
+iscsi_conn_flush_pdus_internal(struct spdk_iscsi_conn *conn)
 {
 	const int num_iovs = 32;
 	struct iovec iovs[num_iovs];
@@ -1244,9 +1204,8 @@ spdk_iscsi_conn_flush_pdus_internal(struct spdk_iscsi_conn *conn)
 	 *  time only the unwritten portion will be sent to writev().
 	 */
 	while (bytes > 0) {
-		pdu_length = spdk_iscsi_get_pdu_length(pdu,
-						       conn->header_digest,
-						       conn->data_digest);
+		pdu_length = iscsi_get_pdu_length(pdu, conn->header_digest,
+						  conn->data_digest);
 		pdu_length -= pdu->writev_offset;
 
 		if (bytes >= pdu_length) {
@@ -1289,17 +1248,17 @@ spdk_iscsi_conn_flush_pdus_internal(struct spdk_iscsi_conn *conn)
  * function will spin until all PDUs have successfully been flushed.
  */
 static int
-spdk_iscsi_conn_flush_pdus(void *_conn)
+iscsi_conn_flush_pdus(void *_conn)
 {
 	struct spdk_iscsi_conn *conn = _conn;
 	int rc;
 
 	if (conn->state == ISCSI_CONN_STATE_RUNNING) {
-		rc = spdk_iscsi_conn_flush_pdus_internal(conn);
+		rc = iscsi_conn_flush_pdus_internal(conn);
 		if (rc == 0 && conn->flush_poller != NULL) {
 			spdk_poller_unregister(&conn->flush_poller);
 		} else if (rc == 1 && conn->flush_poller == NULL) {
-			conn->flush_poller = spdk_poller_register(spdk_iscsi_conn_flush_pdus,
+			conn->flush_poller = spdk_poller_register(iscsi_conn_flush_pdus,
 					     conn, 50);
 		}
 	} else {
@@ -1310,7 +1269,7 @@ spdk_iscsi_conn_flush_pdus(void *_conn)
 		 * closing the connection.
 		 */
 		do {
-			rc = spdk_iscsi_conn_flush_pdus_internal(conn);
+			rc = iscsi_conn_flush_pdus_internal(conn);
 		} while (rc == 1);
 	}
 
@@ -1327,7 +1286,7 @@ spdk_iscsi_conn_flush_pdus(void *_conn)
 }
 
 static int
-spdk_iscsi_dif_verify(struct spdk_iscsi_pdu *pdu, struct spdk_dif_ctx *dif_ctx)
+iscsi_dif_verify(struct spdk_iscsi_pdu *pdu, struct spdk_dif_ctx *dif_ctx)
 {
 	struct iovec iov;
 	struct spdk_dif_error err_blk = {};
@@ -1354,7 +1313,7 @@ spdk_iscsi_conn_write_pdu(struct spdk_iscsi_conn *conn, struct spdk_iscsi_pdu *p
 	int rc;
 
 	if (spdk_unlikely(spdk_iscsi_get_dif_ctx(conn, pdu, &pdu->dif_ctx))) {
-		rc = spdk_iscsi_dif_verify(pdu, &pdu->dif_ctx);
+		rc = iscsi_dif_verify(pdu, &pdu->dif_ctx);
 		if (rc != 0) {
 			spdk_iscsi_conn_free_pdu(conn, pdu);
 			conn->state = ISCSI_CONN_STATE_EXITING;
@@ -1378,13 +1337,13 @@ spdk_iscsi_conn_write_pdu(struct spdk_iscsi_conn *conn, struct spdk_iscsi_pdu *p
 	}
 
 	TAILQ_INSERT_TAIL(&conn->write_pdu_list, pdu, tailq);
-	spdk_iscsi_conn_flush_pdus(conn);
+	iscsi_conn_flush_pdus(conn);
 }
 
 #define GET_PDU_LOOP_COUNT	16
 
 static int
-spdk_iscsi_conn_handle_incoming_pdus(struct spdk_iscsi_conn *conn)
+iscsi_conn_handle_incoming_pdus(struct spdk_iscsi_conn *conn)
 {
 	struct spdk_iscsi_pdu *pdu;
 	int i, rc;
@@ -1394,8 +1353,9 @@ spdk_iscsi_conn_handle_incoming_pdus(struct spdk_iscsi_conn *conn)
 		rc = spdk_iscsi_read_pdu(conn, &pdu);
 		if (rc == 0) {
 			break;
-		} else if (rc == SPDK_ISCSI_CONNECTION_FATAL) {
-			return rc;
+		} else if (rc < 0) {
+			SPDK_DEBUGLOG(SPDK_LOG_ISCSI, "Failed to read pdu, error=%d\n", rc);
+			return SPDK_ISCSI_CONNECTION_FATAL;
 		}
 
 		if (conn->state == ISCSI_CONN_STATE_LOGGED_OUT) {
@@ -1406,11 +1366,11 @@ spdk_iscsi_conn_handle_incoming_pdus(struct spdk_iscsi_conn *conn)
 
 		rc = spdk_iscsi_execute(conn, pdu);
 		spdk_put_pdu(pdu);
-		if (rc != 0) {
+		if (rc < 0) {
 			SPDK_ERRLOG("spdk_iscsi_execute() fatal error on %s(%s)\n",
 				    conn->target_port != NULL ? spdk_scsi_port_get_name(conn->target_port) : "NULL",
 				    conn->initiator_port != NULL ? spdk_scsi_port_get_name(conn->initiator_port) : "NULL");
-			return rc;
+			return SPDK_ISCSI_CONNECTION_FATAL;
 		}
 
 		spdk_trace_record(TRACE_ISCSI_TASK_EXECUTED, 0, 0, (uintptr_t)pdu, 0);
@@ -1423,7 +1383,7 @@ spdk_iscsi_conn_handle_incoming_pdus(struct spdk_iscsi_conn *conn)
 }
 
 static void
-spdk_iscsi_conn_sock_cb(void *arg, struct spdk_sock_group *group, struct spdk_sock *sock)
+iscsi_conn_sock_cb(void *arg, struct spdk_sock_group *group, struct spdk_sock *sock)
 {
 	struct spdk_iscsi_conn *conn = arg;
 	int rc;
@@ -1436,113 +1396,97 @@ spdk_iscsi_conn_sock_cb(void *arg, struct spdk_sock_group *group, struct spdk_so
 	}
 
 	/* Handle incoming PDUs */
-	rc = spdk_iscsi_conn_handle_incoming_pdus(conn);
+	rc = iscsi_conn_handle_incoming_pdus(conn);
 	if (rc < 0) {
 		conn->state = ISCSI_CONN_STATE_EXITING;
-		spdk_iscsi_conn_flush_pdus(conn);
+		iscsi_conn_flush_pdus(conn);
 	}
 }
 
 static void
-spdk_iscsi_conn_full_feature_migrate(void *arg1, void *arg2)
+iscsi_conn_full_feature_migrate(void *arg1, void *arg2)
 {
 	struct spdk_iscsi_conn *conn = arg1;
+	struct spdk_iscsi_poll_group *pg;
 
 	if (conn->sess->session_type == SESSION_TYPE_NORMAL) {
-		spdk_iscsi_conn_open_luns(conn);
+		iscsi_conn_open_luns(conn);
 	}
 
 	/* The poller has been unregistered, so now we can re-register it on the new core. */
 	conn->lcore = spdk_env_get_current_core();
-	spdk_iscsi_poll_group_add_conn(conn);
+	pg = &g_spdk_iscsi.poll_group[conn->lcore];
+	iscsi_poll_group_add_conn(pg, conn);
 }
 
-void
-spdk_iscsi_conn_migration(struct spdk_iscsi_conn *conn)
-{
-	int				lcore;
-	struct spdk_event		*event;
-	struct spdk_iscsi_tgt_node *target;
+static uint32_t g_next_core = SPDK_ENV_LCORE_ID_ANY;
 
-	lcore = spdk_iscsi_conn_allocate_reactor(conn->portal->cpumask);
-	if (conn->sess->session_type == SESSION_TYPE_NORMAL) {
-		target = conn->sess->target;
-		pthread_mutex_lock(&target->mutex);
-		target->num_active_conns++;
-		if (target->num_active_conns == 1) {
-			/**
-			 * This is the only active connection for this target node.
-			 *  Save the lcore in the target node so it can be used for
-			 *  any other connections to this target node.
-			 */
-			target->lcore = lcore;
-		} else {
-			/**
-			 * There are other active connections for this target node.
-			 *  Ignore the lcore specified by the allocator and use the
-			 *  the target node's lcore to ensure this connection runs on
-			 *  the same lcore as other connections for this target node.
-			 */
-			lcore = target->lcore;
-		}
-		pthread_mutex_unlock(&target->mutex);
+void
+spdk_iscsi_conn_schedule(struct spdk_iscsi_conn *conn)
+{
+	struct spdk_iscsi_poll_group	*pg;
+	struct spdk_event		*event;
+	struct spdk_iscsi_tgt_node	*target;
+	uint32_t			i;
+	uint32_t			lcore;
+
+	lcore = SPDK_ENV_LCORE_ID_ANY;
+
+	if (conn->sess->session_type != SESSION_TYPE_NORMAL) {
+		/* Leave all non-normal sessions on the acceptor
+		 * thread. */
+		return;
 	}
 
-	spdk_iscsi_poll_group_remove_conn_sock(conn);
-	spdk_poller_unregister(&conn->flush_poller);
-	spdk_iscsi_conn_stop(conn);
+	for (i = 0; i < spdk_env_get_core_count(); i++) {
+		if (g_next_core > spdk_env_get_last_core()) {
+			g_next_core = spdk_env_get_first_core();
+		}
 
-	__sync_fetch_and_add(&g_num_connections[lcore], 1);
-	conn->last_nopin = spdk_get_ticks();
-	event = spdk_event_allocate(lcore, spdk_iscsi_conn_full_feature_migrate,
-				    conn, NULL);
-	spdk_event_call(event);
-}
+		lcore = g_next_core;
+		g_next_core = spdk_env_get_next_core(g_next_core);
 
-void
-spdk_iscsi_conn_set_min_per_core(int count)
-{
-	g_connections_per_lcore = count;
-}
-
-int
-spdk_iscsi_conn_get_min_per_core(void)
-{
-	return g_connections_per_lcore;
-}
-
-static uint32_t
-spdk_iscsi_conn_allocate_reactor(const struct spdk_cpuset *cpumask)
-{
-	uint32_t i, selected_core;
-	int32_t num_pollers, min_pollers;
-
-	min_pollers = INT_MAX;
-	selected_core = spdk_env_get_first_core();
-
-	SPDK_ENV_FOREACH_CORE(i) {
-		if (!spdk_cpuset_get_cpu(cpumask, i)) {
+		if (!spdk_cpuset_get_cpu(&conn->portal->cpumask, lcore)) {
 			continue;
 		}
 
-		/* This core is running. Check how many pollers it already has. */
-		num_pollers = g_num_connections[i];
-
-		if ((num_pollers > 0) && (num_pollers < g_connections_per_lcore)) {
-			/* Fewer than the maximum connections per core,
-			 * but at least 1. Use this core.
-			 */
-			return i;
-		} else if (num_pollers < min_pollers) {
-			/* Track the core that has the minimum number of pollers
-			 * to be used if no cores meet our criteria
-			 */
-			selected_core = i;
-			min_pollers = num_pollers;
-		}
+		break;
 	}
 
-	return selected_core;
+	if (i >= spdk_env_get_core_count()) {
+		SPDK_ERRLOG("Unable to schedule connection on allowed CPU core. Scheduling on first core instead.\n");
+		lcore = spdk_env_get_first_core();
+	}
+
+	target = conn->sess->target;
+	pthread_mutex_lock(&target->mutex);
+	target->num_active_conns++;
+	if (target->num_active_conns == 1) {
+		/**
+		 * This is the only active connection for this target node.
+		 *  Save the lcore in the target node so it can be used for
+		 *  any other connections to this target node.
+		 */
+		target->lcore = lcore;
+	} else {
+		/**
+		 * There are other active connections for this target node.
+		 *  Ignore the lcore specified by the allocator and use the
+		 *  the target node's lcore to ensure this connection runs on
+		 *  the same lcore as other connections for this target node.
+		 */
+		lcore = target->lcore;
+	}
+	pthread_mutex_unlock(&target->mutex);
+
+	assert(conn->lcore == spdk_env_get_current_core());
+	pg = &g_spdk_iscsi.poll_group[conn->lcore];
+	iscsi_poll_group_remove_conn(pg, conn);
+
+	conn->last_nopin = spdk_get_ticks();
+	event = spdk_event_allocate(lcore, iscsi_conn_full_feature_migrate,
+				    conn, NULL);
+	spdk_event_call(event);
 }
 
 static int
@@ -1566,21 +1510,20 @@ SPDK_TRACE_REGISTER_FN(iscsi_conn_trace, "iscsi_conn", TRACE_GROUP_ISCSI)
 {
 	spdk_trace_register_owner(OWNER_ISCSI_CONN, 'c');
 	spdk_trace_register_object(OBJECT_ISCSI_PDU, 'p');
-	spdk_trace_register_description("ISCSI_READ_FROM_SOCKET_DONE", "",
-					TRACE_ISCSI_READ_FROM_SOCKET_DONE,
+	spdk_trace_register_description("ISCSI_READ_DONE", TRACE_ISCSI_READ_FROM_SOCKET_DONE,
 					OWNER_ISCSI_CONN, OBJECT_NONE, 0, 0, "");
-	spdk_trace_register_description("ISCSI_FLUSH_WRITEBUF_START", "", TRACE_ISCSI_FLUSH_WRITEBUF_START,
+	spdk_trace_register_description("ISCSI_WRITE_START", TRACE_ISCSI_FLUSH_WRITEBUF_START,
 					OWNER_ISCSI_CONN, OBJECT_NONE, 0, 0, "iovec: ");
-	spdk_trace_register_description("ISCSI_FLUSH_WRITEBUF_DONE", "", TRACE_ISCSI_FLUSH_WRITEBUF_DONE,
+	spdk_trace_register_description("ISCSI_WRITE_DONE", TRACE_ISCSI_FLUSH_WRITEBUF_DONE,
 					OWNER_ISCSI_CONN, OBJECT_NONE, 0, 0, "");
-	spdk_trace_register_description("ISCSI_READ_PDU", "", TRACE_ISCSI_READ_PDU,
+	spdk_trace_register_description("ISCSI_READ_PDU", TRACE_ISCSI_READ_PDU,
 					OWNER_ISCSI_CONN, OBJECT_ISCSI_PDU, 1, 0, "opc:   ");
-	spdk_trace_register_description("ISCSI_TASK_DONE", "", TRACE_ISCSI_TASK_DONE,
+	spdk_trace_register_description("ISCSI_TASK_DONE", TRACE_ISCSI_TASK_DONE,
 					OWNER_ISCSI_CONN, OBJECT_SCSI_TASK, 0, 0, "");
-	spdk_trace_register_description("ISCSI_TASK_QUEUE", "", TRACE_ISCSI_TASK_QUEUE,
+	spdk_trace_register_description("ISCSI_TASK_QUEUE", TRACE_ISCSI_TASK_QUEUE,
 					OWNER_ISCSI_CONN, OBJECT_SCSI_TASK, 1, 1, "pdu:   ");
-	spdk_trace_register_description("ISCSI_TASK_EXECUTED", "", TRACE_ISCSI_TASK_EXECUTED,
+	spdk_trace_register_description("ISCSI_TASK_EXECUTED", TRACE_ISCSI_TASK_EXECUTED,
 					OWNER_ISCSI_CONN, OBJECT_ISCSI_PDU, 0, 0, "");
-	spdk_trace_register_description("ISCSI_PDU_COMPLETED", "", TRACE_ISCSI_PDU_COMPLETED,
+	spdk_trace_register_description("ISCSI_PDU_COMPLETED", TRACE_ISCSI_PDU_COMPLETED,
 					OWNER_ISCSI_CONN, OBJECT_ISCSI_PDU, 0, 0, "");
 }

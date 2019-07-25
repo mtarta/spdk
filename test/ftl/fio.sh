@@ -1,11 +1,7 @@
 #!/usr/bin/env bash
 
-set -e
-
 testdir=$(readlink -f $(dirname $0))
 rootdir=$(readlink -f $testdir/../..)
-plugindir=$rootdir/examples/bdev/fio_plugin
-
 source $rootdir/test/common/autotest_common.sh
 
 declare -A suite
@@ -37,7 +33,7 @@ fi
 
 for test in ${tests[@]}; do
 	timing_enter $test
-	LD_PRELOAD=$plugindir/fio_plugin /usr/src/fio/fio $testdir/config/fio/$test.fio
+	fio_bdev $testdir/config/fio/$test.fio
 	timing_exit $test
 done
 

@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
-set -e
+
+testdir=$(readlink -f $(dirname $0))
+rootdir=$(readlink -f $testdir/../../..)
+source $rootdir/test/common/autotest_common.sh
+source $rootdir/test/vhost/common.sh
 
 vm_count=1
 vm_memory=2048
-vm_image="/home/sys_sgsw/vhost_vm_image.qcow2"
 vm_sar_enable=false
 vm_sar_delay="0"
 vm_sar_interval="1"
@@ -13,13 +16,14 @@ max_disks=""
 ctrl_type="spdk_vhost_scsi"
 use_split=false
 kernel_cpus=""
-lvol_precondition=false
+run_precondition=false
 lvol_stores=()
 lvol_bdevs=()
 used_vms=""
 wwpn_prefix="naa.5001405bc6498"
 
 fio_bin="--fio-bin=/home/sys_sgsw/fio_ubuntu"
+fio_iterations=1
 precond_fio_bin="/usr/src/fio/fio"
 
 function usage()
@@ -33,6 +37,7 @@ function usage()
 	echo "                            Binary will be copied to VM, static compilation"
 	echo "                            of binary is recommended."
 	echo "    --fio-job=PATH          Fio config to use for test."
+	echo "    --fio-iterations=INT    Number of times to run specified workload."
 	echo "    --vm-count=INT          Total number of virtual machines to launch in this test;"
 	echo "                            Each VM will get one bdev (lvol or split vbdev)"
 	echo "                            to run FIO test."
@@ -40,7 +45,7 @@ function usage()
 	echo "    --vm-memory=INT         Amount of RAM memory (in MB) to pass to a single VM."
 	echo "                            Default: 2048 MB"
 	echo "    --vm-image=PATH         OS image to use for running the VMs."
-	echo "                            Default: /home/sys_sgsw/vhost_vm_image.qcow2"
+	echo "                            Default: \$HOME/vhost_vm_image.qcow2"
 	echo "    --vm-sar-enable         Measure CPU utilization on VM using sar."
 	echo "    --vm-sar-delay=INT      Wait for X seconds before sarting SAR measurement on VMs. Default: 0."
 	echo "    --vm-sar-interval=INT   Interval (seconds) argument for SAR. Default: 1s."
@@ -55,7 +60,7 @@ function usage()
 	echo "                            Default: spdk_vhost_scsi"
 	echo "    --use-split             Use split vbdevs instead of Logical Volumes"
 	echo "    --limit-kernel-vhost=INT  Limit kernel vhost to run only on a number of CPU cores."
-	echo "    --lvol-precondition     Precondition lvols after creating. Default: true."
+	echo "    --run-precondition      Precondition lvols after creating. Default: true."
 	echo "    --precond-fio-bin       FIO binary used for SPDK fio plugin precondition. Default: /usr/src/fio/fio."
 	echo "    --custom-cpu-cfg=PATH   Custom CPU config for test."
 	echo "                            Default: spdk/test/vhost/common/autotest.config"
@@ -108,9 +113,10 @@ while getopts 'xh-:' optchar; do
 			help) usage $0 ;;
 			fio-bin=*) fio_bin="--fio-bin=${OPTARG#*=}" ;;
 			fio-job=*) fio_job="${OPTARG#*=}" ;;
+			fio-iterations=*) fio_iterations="${OPTARG#*=}" ;;
 			vm-count=*) vm_count="${OPTARG#*=}" ;;
 			vm-memory=*) vm_memory="${OPTARG#*=}" ;;
-			vm-image=*) vm_image="${OPTARG#*=}" ;;
+			vm-image=*) VM_IMAGE="${OPTARG#*=}" ;;
 			vm-sar-enable) vm_sar_enable=true ;;
 			vm-sar-delay=*) vm_sar_delay="${OPTARG#*=}" ;;
 			vm-sar-interval=*) vm_sar_interval="${OPTARG#*=}" ;;
@@ -119,7 +125,7 @@ while getopts 'xh-:' optchar; do
 			max-disks=*) max_disks="${OPTARG#*=}" ;;
 			ctrl-type=*) ctrl_type="${OPTARG#*=}" ;;
 			use-split) use_split=true ;;
-			lvol-precondition) lvol_precondition=true ;;
+			run-precondition) run_precondition=true ;;
 			precond-fio-bin=*) precond_fio_bin="${OPTARG#*=}" ;;
 			limit-kernel-vhost=*) kernel_cpus="${OPTARG#*=}" ;;
 			custom-cpu-cfg=*) custom_cpu_cfg="${OPTARG#*=}" ;;
@@ -133,11 +139,7 @@ while getopts 'xh-:' optchar; do
 	esac
 done
 
-. $(readlink -e "$(dirname $0)/../common/common.sh") || exit 1
-. $(readlink -e "$(dirname $0)/../../../scripts/common.sh") || exit 1
-BASE_DIR=$(readlink -f $(dirname ${BASH_SOURCE[0]}))
-COMMON_DIR="$(cd $(readlink -f $(dirname $0))/../common && pwd)"
-rpc_py="$SPDK_BUILD_DIR/scripts/rpc.py -s $(get_vhost_dir)/rpc.sock"
+rpc_py="$rootdir/scripts/rpc.py -s $(get_vhost_dir)/rpc.sock"
 
 if [[ -n $custom_cpu_cfg ]]; then
 	source $custom_cpu_cfg
@@ -145,7 +147,7 @@ fi
 
 if [[ -z $fio_job ]]; then
 	warning "No FIO job specified! Will use default from common directory."
-	fio_job="$COMMON_DIR/fio_jobs/default_integrity.job"
+	fio_job="$rootdir/test/vhost/common/fio_jobs/default_integrity.job"
 fi
 
 trap 'error_exit "${FUNCNAME}" "${LINENO}"' INT ERR
@@ -171,17 +173,33 @@ if [[ $vm_count -le $max_disks ]]; then
 	done
 else
 	#Calculate least minimum number of splits on each disks
-	for i in `seq 0 $((max_disks - 1))`; do
+	for i in $(seq 0 $((max_disks - 1))); do
 		splits+=( $((vm_count / max_disks)) )
 	done
 	# Split up the remainder
-	for i in `seq 0 $((vm_count % max_disks - 1))`; do
+	for i in $(seq 0 $((vm_count % max_disks - 1))); do
 		(( splits[i]++ ))
 	done
 fi
 notice "Preparing NVMe setup..."
 notice "Using $max_disks physical NVMe drives"
 notice "Nvme split list: ${splits[@]}"
+
+# ===== Precondition NVMes if specified =====
+if [[ $run_precondition == true ]]; then
+	# Using the same precondition routine possible for lvols thanks
+	# to --clear-method option. Lvols should not UNMAP on creation.
+    $rootdir/scripts/gen_nvme.sh > $rootdir/nvme.cfg
+    nvmes=$(cat $rootdir/nvme.cfg | grep -oP "Nvme\d+")
+    nvmes=($nvmes)
+    fio_filename=$(printf ":%sn1" "${nvmes[@]}")
+    fio_filename=${fio_filename:1}
+    $precond_fio_bin --name="precondition" \
+    --ioengine="${rootdir}/examples/bdev/fio_plugin/fio_plugin" \
+    --rw="write" --spdk_conf="${rootdir}/nvme.cfg" --thread="1" \
+    --group_reporting --direct="1" --size="100%" --loops="2" --bs="256k" \
+    --iodepth=32 --filename="${fio_filename}" || true
+fi
 
 # ===== Prepare NVMe splits & run vhost process =====
 if [[ "$ctrl_type" == "kernel_vhost" ]]; then
@@ -227,7 +245,7 @@ if [[ "$ctrl_type" == "kernel_vhost" ]]; then
 else
 	# Run vhost process and prepare split vbdevs or lvol bdevs
 	notice "running SPDK vhost"
-	spdk_vhost_run
+	vhost_run
 	notice "..."
 
 	if [[ $use_split == true ]]; then
@@ -245,12 +263,12 @@ else
 		notice "Using logical volumes"
 		trap 'cleanup_lvol_cfg; error_exit "${FUNCNAME}" "${LINENO}"' INT ERR
 		for (( i=0; i<$max_disks; i++ ));do
-			ls_guid=$($rpc_py construct_lvol_store Nvme${i}n1 lvs_$i)
+			ls_guid=$($rpc_py construct_lvol_store Nvme${i}n1 lvs_$i --clear-method none)
 			lvol_stores+=("$ls_guid")
 			for (( j=0; j<${splits[$i]}; j++)); do
 				free_mb=$(get_lvs_free_mb "$ls_guid")
 				size=$((free_mb / (${splits[$i]}-j) ))
-				lb_name=$($rpc_py construct_lvol_bdev -u $ls_guid lbd_$j $size)
+				lb_name=$($rpc_py construct_lvol_bdev -u $ls_guid lbd_$j $size --clear-method none)
 				lvol_bdevs+=("$lb_name")
 			done
 		done
@@ -258,27 +276,12 @@ else
 	fi
 fi
 
-if [[ ! "$ctrl_type" == "kernel_vhost" && $lvol_precondition == true && $use_split == false ]]; then
-	# Need to precondition lvols due to UNMAP done after creation
-	# of lvol_stores. Kill vhost for now and run fio_plugin over all lvol bdevs
-	spdk_vhost_kill
-	$SPDK_BUILD_DIR/scripts/gen_nvme.sh > $SPDK_BUILD_DIR/nvme.cfg
-	fio_filename=$(printf ":%s" "${bdevs[@]}")
-	fio_filename=${fio_filename:1}
-	$precond_fio_bin --name="lvol_precondition" \
-	--ioengine="${SPDK_BUILD_DIR}/examples/bdev/fio_plugin/fio_plugin" \
-	--rw="write" --spdk_conf="${SPDK_BUILD_DIR}/nvme.cfg" --thread="1" \
-	--group_reporting --direct="1" --size="100%" --loops="2" --bs="256k" \
-	--filename="${fio_filename}" || true
-	spdk_vhost_run
-fi
-
 # Prepare VMs and controllers
 for (( i=0; i<$vm_count; i++)); do
 	vm="vm_$i"
 
 	setup_cmd="vm_setup --disk-type=$ctrl_type --force=$i --memory=$vm_memory"
-	setup_cmd+=" --os=$vm_image"
+	setup_cmd+=" --os=$VM_IMAGE"
 
 	if [[ "$ctrl_type" == "spdk_vhost_scsi" ]]; then
 		$rpc_py construct_vhost_scsi_controller naa.0.$i
@@ -319,9 +322,9 @@ fi
 # Run FIO
 fio_disks=""
 for vm_num in $used_vms; do
-	vm_dir=$VM_BASE_DIR/$vm_num
+	vm_dir=$VM_DIR/$vm_num
 	host_name="VM-$vm_num"
-	vm_ssh $vm_num "hostname $host_name"
+	vm_exec $vm_num "hostname $host_name"
 	vm_start_fio_server $fio_bin $vm_num
 
 	if [[ "$ctrl_type" == "spdk_vhost_scsi" ]]; then
@@ -334,35 +337,42 @@ for vm_num in $used_vms; do
 
 	if [[ -n "$vm_throttle" ]]; then
 		block=$(printf '%s' $SCSI_DISK)
-		major_minor=$(vm_ssh "$vm_num" "cat /sys/block/$block/dev")
-		vm_ssh "$vm_num" "echo \"$major_minor $vm_throttle\" > /sys/fs/cgroup/blkio/blkio.throttle.read_iops_device"
-		vm_ssh "$vm_num" "echo \"$major_minor $vm_throttle\" > /sys/fs/cgroup/blkio/blkio.throttle.write_iops_device"
+		major_minor=$(vm_exec "$vm_num" "cat /sys/block/$block/dev")
+		vm_exec "$vm_num" "echo \"$major_minor $vm_throttle\" > /sys/fs/cgroup/blkio/blkio.throttle.read_iops_device"
+		vm_exec "$vm_num" "echo \"$major_minor $vm_throttle\" > /sys/fs/cgroup/blkio/blkio.throttle.write_iops_device"
 	fi
 
 	fio_disks+=" --vm=${vm_num}$(printf ':/dev/%s' $SCSI_DISK)"
 done
 
 # Run FIO traffic
-run_fio $fio_bin --job-file="$fio_job" --out="$TEST_DIR/fio_results" --json $fio_disks &
-fio_pid=$!
+fio_job_fname=$(basename $fio_job)
+fio_log_fname="${fio_job_fname%%.*}.log"
+for i in $(seq 1 $fio_iterations); do
+	echo "Running FIO iteration $i"
+	run_fio $fio_bin --job-file="$fio_job" --out="$VHOST_DIR/fio_results" --json $fio_disks &
+	fio_pid=$!
 
-if $vm_sar_enable; then
-	sleep $vm_sar_delay
-	mkdir -p $TEST_DIR/fio_results/sar_stats
-	pids=""
-	for vm_num in $used_vms; do
-		vm_ssh "$vm_num" "mkdir -p /root/sar; sar -P ALL $vm_sar_interval $vm_sar_count >> /root/sar/sar_stats_VM${vm_num}.txt" &
-		pids+=" $!"
-	done
-	for j in $pids; do
-		wait $j
-	done
-	for vm_num in $used_vms; do
-		vm_scp "$vm_num" "root@127.0.0.1:/root/sar/sar_stats_VM${vm_num}.txt" "$TEST_DIR/fio_results/sar_stats"
-	done
-fi
+	if $vm_sar_enable; then
+		sleep $vm_sar_delay
+		mkdir -p $VHOST_DIR/fio_results/sar_stats
+		pids=""
+		for vm_num in $used_vms; do
+			vm_exec "$vm_num" "mkdir -p /root/sar; sar -P ALL $vm_sar_interval $vm_sar_count >> /root/sar/sar_stats_VM${vm_num}_run${i}.txt" &
+			pids+=" $!"
+		done
+		for j in $pids; do
+			wait $j
+		done
+		for vm_num in $used_vms; do
+			vm_scp "$vm_num" "root@127.0.0.1:/root/sar/sar_stats_VM${vm_num}_run${i}.txt" "$VHOST_DIR/fio_results/sar_stats"
+		done
+	fi
 
-wait $fio_pid
+	wait $fio_pid
+	mv $VHOST_DIR/fio_results/$fio_log_fname $VHOST_DIR/fio_results/$fio_log_fname.$i
+	sleep 1
+done
 
 notice "Shutting down virtual machines..."
 vm_shutdown_all
@@ -376,7 +386,7 @@ else
 	else
 		cleanup_lvol_cfg
 	fi
-	spdk_vhost_kill
+	vhost_kill
 fi
 
 if [[ -n "$kernel_cpus" ]]; then

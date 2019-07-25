@@ -1,13 +1,8 @@
 #!/usr/bin/env bash
 
-set -e
-
 rootdir=$(readlink -f $(dirname $0)/../..)
-SPDK_AUTOTEST_X=false
 source "$rootdir/test/common/autotest_common.sh"
 source "$rootdir/test/nvmf/common.sh"
-
-set -x
 
 if [[ $SPDK_TEST_ISCSI -eq 1 ]]; then
 	source "$rootdir/test/iscsi_tgt/common.sh"
@@ -18,8 +13,6 @@ if [[ $SPDK_TEST_VHOST -ne 1 && $SPDK_TEST_VHOST_INIT -eq 1 ]]; then
 	echo "WARNING: Virtio initiator JSON_config test requires vhost target."
 	echo "         Setting SPDK_TEST_VHOST=1 for duration of current script."
 fi
-
-set -x
 
 if (( SPDK_TEST_BLOCKDEV + \
 		SPDK_TEST_ISCSI +
@@ -45,6 +38,66 @@ function initiator_rpc() {
 	$rootdir/scripts/rpc.py -s "${app_socket[initiator]}" "$@"
 }
 
+RE_UUID="[[:alnum:]-]+"
+last_event_id=0
+
+function tgt_check_notification_types() {
+	timing_enter $FUNCNAME
+
+	local ret=0
+	local enabled_types="
+		bdev_register
+		bdev_unregister
+	"
+
+	get_types=$(tgt_rpc get_notification_types | jq -r '.[]')
+	if [ "$(echo $enabled_types)" != "$(echo $get_types)" ]; then
+		echo "ERROR: expected types:" $enabled_types ", but got:" $get_types
+		ret=1
+	fi
+
+	timing_exit $FUNCNAME
+	return $ret
+}
+
+function tgt_check_notifications() {
+        local event_line event ev_type ev_ctx
+        local rc=""
+
+        while read event_line; do
+                # remove ID
+                event="${event_line%:*}"
+
+                ev_type=${event%:*}
+                ev_ctx=${event#*:}
+
+                ex_ev_type=${1%%:*}
+                ex_ev_ctx=${1#*:}
+
+                last_event_id=${event_line##*:}
+
+                # set rc=false in case of failure so all errors can be printed
+                if (( $# == 0 )); then
+                        echo "ERROR: got extra event: $event_line"
+                        rc=false
+                        continue
+                elif ! echo "$ev_type" | grep -E -q  "^${ex_ev_type}\$" || ! echo "$ev_ctx" | grep -E -q "^${ex_ev_ctx}\$"; then
+                        echo "ERROR: expected event '$1' but got '$event' (whole event line: $event_line)"
+                        rc=false
+                fi
+
+                shift
+        done < <(tgt_rpc get_notifications -i ${last_event_id} | jq -r '.[] | "\(.type):\(.ctx):\(.id)"')
+
+        $rc
+
+        if (( $# != 0 )); then
+                echo "ERROR: missing events:"
+                echo "$@"
+                return 1
+        fi
+}
+
 # $1 - target / initiator
 # $2..$n app parameters
 function json_config_test_start_app() {
@@ -53,7 +106,6 @@ function json_config_test_start_app() {
 
 	[[ ! -z "${#app_socket[$app]}" ]] # Check app type
 	[[ -z "${app_pid[$app]}" ]] # Assert if app is not running
-	set -x
 
 	local app_extra_params=""
 	if [[ $SPDK_TEST_VHOST -eq 1 || $SPDK_TEST_VHOST_INIT -eq 1 ]]; then
@@ -99,6 +151,8 @@ function json_config_test_shutdown_app() {
 function create_bdev_subsystem_config() {
 	timing_enter $FUNCNAME
 
+	local expected_notifications=()
+
 	if [[ $SPDK_TEST_BLOCKDEV -eq 1 ]]; then
 		local lvol_store_base_bdev=Nvme0n1
 		if ! tgt_rpc get_bdevs --name ${lvol_store_base_bdev} >/dev/null; then
@@ -114,6 +168,7 @@ function create_bdev_subsystem_config() {
 
 		tgt_rpc construct_split_vbdev $lvol_store_base_bdev 2
 		tgt_rpc construct_split_vbdev Malloc0 3
+		tgt_rpc construct_malloc_bdev 8 4096 --name Malloc3
 		tgt_rpc construct_passthru_bdev -b Malloc3 -p PTBdevFromMalloc3
 
 		tgt_rpc construct_null_bdev Null0 32 512
@@ -121,10 +176,25 @@ function create_bdev_subsystem_config() {
 		tgt_rpc construct_malloc_bdev 32 512 --name Malloc0
 		tgt_rpc construct_malloc_bdev 16 4096 --name Malloc1
 
+		expected_notifications+=(
+			bdev_register:${lvol_store_base_bdev}
+			bdev_register:${lvol_store_base_bdev}p0
+			bdev_register:${lvol_store_base_bdev}p1
+			bdev_register:Malloc3
+			bdev_register:PTBdevFromMalloc3
+			bdev_register:Null0
+			bdev_register:Malloc0p0
+			bdev_register:Malloc0p1
+			bdev_register:Malloc0p2
+			bdev_register:Malloc0
+			bdev_register:Malloc1
+		)
+
 		if [[ $(uname -s) = Linux ]]; then
 			# This AIO bdev must be large enough to be used as LVOL store
 			dd if=/dev/zero of=/tmp/sample_aio bs=1024 count=102400
 			tgt_rpc construct_aio_bdev /tmp/sample_aio aio_disk 1024
+			expected_notifications+=( bdev_register:aio_disk )
 		fi
 
 		# For LVOLs use split to check for proper order of initialization.
@@ -135,6 +205,13 @@ function create_bdev_subsystem_config() {
 		tgt_rpc construct_lvol_bdev -l lvs_test -t lvol1 32
 		tgt_rpc snapshot_lvol_bdev     lvs_test/lvol0 snapshot0
 		tgt_rpc clone_lvol_bdev        lvs_test/snapshot0 clone0
+
+		expected_notifications+=(
+			"bdev_register:$RE_UUID"
+			"bdev_register:$RE_UUID"
+			"bdev_register:$RE_UUID"
+			"bdev_register:$RE_UUID"
+		)
 	fi
 
 	if [[ $SPDK_TEST_CRYPTO -eq 1 ]]; then
@@ -145,7 +222,11 @@ function create_bdev_subsystem_config() {
 			local crypto_dirver=crypto_qat
 		fi
 
-		tgt_rpc construct_crypto_bdev -b MallocForCryptoBdev -c CryptoMallocBdev -d $crypto_dirver -k 0123456789123456
+		tgt_rpc construct_crypto_bdev MallocForCryptoBdev CryptoMallocBdev $crypto_dirver 0123456789123456
+		expected_notifications+=(
+			bdev_register:MallocForCryptoBdev
+			bdev_register:CryptoMallocBdev
+		)
 	fi
 
 	if [[ $SPDK_TEST_PMDK -eq 1 ]]; then
@@ -153,12 +234,16 @@ function create_bdev_subsystem_config() {
 		rm -f $pmem_pool_file
 		tgt_rpc create_pmem_pool $pmem_pool_file 128 4096
 		tgt_rpc construct_pmem_bdev -n pmem1 $pmem_pool_file
+		expected_notifications+=( bdev_register:pmem1 )
 	fi
 
 	if [[ $SPDK_TEST_RBD -eq 1 ]]; then
 		rbd_setup 127.0.0.1
 		tgt_rpc construct_rbd_bdev $RBD_POOL $RBD_NAME 4096
+		expected_notifications+=( bdev_register:Ceph0 )
 	fi
+
+	tgt_check_notifications "${expected_notifications[@]}"
 
 	timing_exit $FUNCNAME
 }
@@ -203,8 +288,9 @@ function create_vhost_subsystem_config() {
 
 	tgt_rpc construct_vhost_blk_controller    VhostBlkCtrlr0 MallocForVhost0p5
 
-	tgt_rpc construct_vhost_nvme_controller   VhostNvmeCtrlr0 16
-	tgt_rpc add_vhost_nvme_ns                 VhostNvmeCtrlr0 MallocForVhost0p6
+# FIXME: enable after vhost-nvme is properly implemented against the latest rte_vhost (DPDK 19.05+)
+#	tgt_rpc construct_vhost_nvme_controller   VhostNvmeCtrlr0 16
+#	tgt_rpc add_vhost_nvme_ns                 VhostNvmeCtrlr0 MallocForVhost0p6
 
 	timing_exit $FUNCNAME
 }
@@ -231,7 +317,7 @@ function create_nvmf_subsystem_config() {
 	tgt_rpc construct_malloc_bdev 8 512 --name MallocForNvmf0
 	tgt_rpc construct_malloc_bdev 4 1024 --name MallocForNvmf1
 
-	tgt_rpc nvmf_create_transport -t RDMA -u 8192 -p 4 -c 0
+	tgt_rpc nvmf_create_transport -t RDMA -u 8192 -c 0
 	tgt_rpc nvmf_subsystem_create       nqn.2016-06.io.spdk:cnode1 -a -s SPDK00000000000001
 	tgt_rpc nvmf_subsystem_add_ns       nqn.2016-06.io.spdk:cnode1 MallocForNvmf0
 	tgt_rpc nvmf_subsystem_add_ns       nqn.2016-06.io.spdk:cnode1 MallocForNvmf1
@@ -264,6 +350,8 @@ function json_config_test_init()
 		$rootdir/scripts/gen_nvme.sh --json
 		echo ']}'
 	) | tgt_rpc load_config
+
+	tgt_check_notification_types
 
 	if [[ $SPDK_TEST_BLOCKDEV -eq 1 ]]; then
 		create_bdev_subsystem_config
@@ -330,8 +418,21 @@ function json_config_clear() {
 	# Check if config is clean.
 	# Global params can't be cleared so need to filter them out.
 	local config_filter="$rootdir/test/json_config/config_filter.py"
-	$rootdir/scripts/rpc.py -s "${app_socket[$1]}" save_config | \
-		$config_filter -method delete_global_parameters | $config_filter -method check_empty
+
+	# RPC's used to cleanup configuration (e.g. to delete split and nvme bdevs)
+	# complete immediately and they don't wait for the unregister callback.
+	# It causes that configuration may not be fully cleaned at this moment and
+	# we should to wait a while. (See github issue #789)
+	count=100
+	while [ $count -gt 0 ] ; do
+		$rootdir/scripts/rpc.py -s "${app_socket[$1]}" save_config | $config_filter -method delete_global_parameters | $config_filter -method check_empty && break
+		count=$(( $count -1 ))
+		sleep 0.1
+	done
+
+	if [ $count -eq 0 ] ; then
+		return 1
+	fi
 }
 
 on_error_exit() {

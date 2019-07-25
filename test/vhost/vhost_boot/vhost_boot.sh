@@ -3,10 +3,11 @@ set -xe
 
 testdir=$(readlink -f $(dirname $0))
 rootdir=$(readlink -f $testdir/../../..)
-. $testdir/../common/common.sh
-. $rootdir/test/bdev/nbd_common.sh
+source $rootdir/test/common/autotest_common.sh
+source $rootdir/test/vhost/common.sh
+source $rootdir/test/bdev/nbd_common.sh
 
-rpc_py="python $SPDK_BUILD_DIR/scripts/rpc.py -s $(get_vhost_dir)/rpc.sock"
+rpc_py="$rootdir/scripts/rpc.py -s $(get_vhost_dir)/rpc.sock"
 vm_no="0"
 
 function err_clean
@@ -20,7 +21,7 @@ function err_clean
 	$rpc_py remove_vhost_controller naa.vhost_vm.$vm_no
 	$rpc_py destroy_lvol_bdev $lvb_u
 	$rpc_py destroy_lvol_store -u $lvs_u
-	spdk_vhost_kill
+	vhost_kill
 	exit 1
 }
 
@@ -55,13 +56,24 @@ if [[ -z $os_image ]]; then
 	exit 1
 fi
 
+vhosttestinit
+
 timing_enter vhost_boot
 trap 'err_clean "${FUNCNAME}" "${LINENO}"' ERR
 timing_enter start_vhost
-spdk_vhost_run
+vhost_run
 timing_exit start_vhost
 
 timing_enter create_lvol
+
+nvme_bdev=$($rpc_py get_bdevs -b Nvme0n1)
+nvme_bdev_bs=$(jq ".[] .block_size" <<< "$nvme_bdev")
+nvme_bdev_name=$(jq ".[] .name" <<< "$nvme_bdev")
+if [[ $nvme_bdev_bs != 512 ]]; then
+	echo "ERROR: Your device $nvme_bdev_name block size is $nvme_bdev_bs, but should be 512 bytes."
+	false
+fi
+
 lvs_u=$($rpc_py construct_lvol_store Nvme0n1 lvs0)
 lvb_u=$($rpc_py construct_lvol_bdev -u $lvs_u lvb0 20000)
 timing_exit create_lvol
@@ -70,7 +82,7 @@ timing_enter convert_vm_image
 modprobe nbd
 trap 'nbd_stop_disks $(get_vhost_dir)/rpc.sock /dev/nbd0; err_clean "${FUNCNAME}" "${LINENO}"' ERR
 nbd_start_disks "$(get_vhost_dir)/rpc.sock" $lvb_u /dev/nbd0
-$QEMU_PREFIX/bin/qemu-img convert $os_image -O raw /dev/nbd0
+qemu-img convert $os_image -O raw /dev/nbd0
 sync
 nbd_stop_disks $(get_vhost_dir)/rpc.sock /dev/nbd0
 sleep 1
@@ -85,18 +97,18 @@ timing_exit create_vhost_controller
 timing_enter setup_vm
 vm_setup --disk-type=spdk_vhost_scsi --force=$vm_no --disks="vhost_vm" --spdk-boot="vhost_vm"
 vm_run $vm_no
-vm_wait_for_boot 600 $vm_no
+vm_wait_for_boot 300 $vm_no
 timing_exit setup_vm
 
 timing_enter run_vm_cmd
-vm_ssh $vm_no "parted -s /dev/sda mkpart primary 10GB 100%; partprobe;  sleep 0.1;"
-vm_ssh $vm_no "mkfs.ext4 -F /dev/sda2; mkdir -p /mnt/sda2test; mount /dev/sda2 /mnt/sda2test;"
-vm_ssh $vm_no "fio --name=integrity --bsrange=4k-512k --iodepth=128 --numjobs=1 --direct=1 \
+vm_exec $vm_no "parted -s /dev/sda mkpart primary 10GB 100%; partprobe;  sleep 0.1;"
+vm_exec $vm_no "mkfs.ext4 -F /dev/sda2; mkdir -p /mnt/sda2test; mount /dev/sda2 /mnt/sda2test;"
+vm_exec $vm_no "fio --name=integrity --bsrange=4k-512k --iodepth=128 --numjobs=1 --direct=1 \
  --thread=1 --group_reporting=1 --rw=randrw --rwmixread=70 --filename=/mnt/sda2test/test_file \
  --verify=md5 --do_verify=1 --verify_backlog=1024 --fsync_on_close=1 --runtime=20 \
  --time_based=1 --size=1024m"
-vm_ssh $vm_no "umount /mnt/sda2test; rm -rf /mnt/sda2test"
-alignment_offset=$(vm_ssh $vm_no "cat /sys/block/sda/sda1/alignment_offset")
+vm_exec $vm_no "umount /mnt/sda2test; rm -rf /mnt/sda2test"
+alignment_offset=$(vm_exec $vm_no "cat /sys/block/sda/sda1/alignment_offset")
 echo "alignment_offset: $alignment_offset"
 timing_exit run_vm_cmd
 
@@ -107,7 +119,9 @@ $rpc_py remove_vhost_scsi_target naa.vhost_vm.$vm_no 0
 $rpc_py remove_vhost_controller naa.vhost_vm.$vm_no
 $rpc_py destroy_lvol_bdev $lvb_u
 $rpc_py destroy_lvol_store -u $lvs_u
-spdk_vhost_kill
+vhost_kill
 timing_exit clean_vhost
 
 timing_exit vhost_boot
+
+vhosttestfini

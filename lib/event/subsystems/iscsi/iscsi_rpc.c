@@ -66,8 +66,8 @@ static const struct spdk_json_object_decoder rpc_set_iscsi_opts_decoders[] = {
 };
 
 static void
-spdk_rpc_iscsi_set_opts(struct spdk_jsonrpc_request *request,
-			const struct spdk_json_val *params)
+spdk_rpc_set_iscsi_options(struct spdk_jsonrpc_request *request,
+			   const struct spdk_json_val *params)
 {
 	struct spdk_iscsi_opts *opts;
 	struct spdk_json_write_ctx *w;
@@ -109,11 +109,7 @@ spdk_rpc_iscsi_set_opts(struct spdk_jsonrpc_request *request,
 	}
 
 	w = spdk_jsonrpc_begin_result(request);
-	if (w == NULL) {
-		return;
-	}
-
 	spdk_json_write_bool(w, true);
 	spdk_jsonrpc_end_result(request, w);
 }
-SPDK_RPC_REGISTER("set_iscsi_options", spdk_rpc_iscsi_set_opts, SPDK_RPC_STARTUP)
+SPDK_RPC_REGISTER("set_iscsi_options", spdk_rpc_set_iscsi_options, SPDK_RPC_STARTUP)

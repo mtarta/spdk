@@ -40,14 +40,45 @@
 #include "thread/thread.c"
 #include "common/lib/ut_multithread.c"
 
+static int g_sched_rc = 0;
+
+static int
+_thread_schedule(struct spdk_thread *thread)
+{
+	return g_sched_rc;
+}
+
 static void
 thread_alloc(void)
 {
-	CU_ASSERT(TAILQ_EMPTY(&g_threads));
-	allocate_threads(1);
-	CU_ASSERT(!TAILQ_EMPTY(&g_threads));
-	free_threads();
-	CU_ASSERT(TAILQ_EMPTY(&g_threads));
+	struct spdk_thread *thread;
+
+	/* No schedule callback */
+	spdk_thread_lib_init(NULL, 0);
+	thread = spdk_thread_create(NULL, NULL);
+	SPDK_CU_ASSERT_FATAL(thread != NULL);
+	spdk_set_thread(thread);
+	spdk_thread_exit(thread);
+	spdk_thread_destroy(thread);
+	spdk_thread_lib_fini();
+
+	/* Schedule callback exists */
+	spdk_thread_lib_init(_thread_schedule, 0);
+
+	/* Scheduling succeeds */
+	g_sched_rc = 0;
+	thread = spdk_thread_create(NULL, NULL);
+	SPDK_CU_ASSERT_FATAL(thread != NULL);
+	spdk_set_thread(thread);
+	spdk_thread_exit(thread);
+	spdk_thread_destroy(thread);
+
+	/* Scheduling fails */
+	g_sched_rc = -1;
+	thread = spdk_thread_create(NULL, NULL);
+	SPDK_CU_ASSERT_FATAL(thread == NULL);
+
+	spdk_thread_lib_fini();
 }
 
 static void
@@ -344,17 +375,20 @@ thread_name(void)
 	struct spdk_thread *thread;
 	const char *name;
 
+	spdk_thread_lib_init(NULL, 0);
+
 	/* Create thread with no name, which automatically generates one */
-	thread = spdk_thread_create(NULL);
+	thread = spdk_thread_create(NULL, NULL);
 	spdk_set_thread(thread);
 	thread = spdk_get_thread();
 	SPDK_CU_ASSERT_FATAL(thread != NULL);
 	name = spdk_thread_get_name(thread);
 	CU_ASSERT(name != NULL);
 	spdk_thread_exit(thread);
+	spdk_thread_destroy(thread);
 
 	/* Create thread named "test_thread" */
-	thread = spdk_thread_create("test_thread");
+	thread = spdk_thread_create("test_thread", NULL);
 	spdk_set_thread(thread);
 	thread = spdk_get_thread();
 	SPDK_CU_ASSERT_FATAL(thread != NULL);
@@ -362,6 +396,9 @@ thread_name(void)
 	SPDK_CU_ASSERT_FATAL(name != NULL);
 	CU_ASSERT(strcmp(name, "test_thread") == 0);
 	spdk_thread_exit(thread);
+	spdk_thread_destroy(thread);
+
+	spdk_thread_lib_fini();
 }
 
 static uint64_t device1;

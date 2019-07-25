@@ -55,6 +55,7 @@ DEFINE_STUB(spdk_event_allocate, struct spdk_event *,
 	    (uint32_t lcore, spdk_event_fn fn, void *arg1, void *arg2), NULL);
 DEFINE_STUB(spdk_mem_register, int, (void *vaddr, size_t len), 0);
 DEFINE_STUB(spdk_mem_unregister, int, (void *vaddr, size_t len), 0);
+DEFINE_STUB(rte_vhost_vring_call, int, (int vid, uint16_t vring_idx), 0);
 
 static struct spdk_cpuset *g_app_core_mask;
 struct spdk_cpuset *spdk_app_get_core_mask(void)
@@ -83,9 +84,6 @@ spdk_app_parse_core_mask(const char *mask, struct spdk_cpuset *cpumask)
 	return 0;
 }
 
-DEFINE_STUB(spdk_env_get_first_core, uint32_t, (void), 0);
-DEFINE_STUB(spdk_env_get_next_core, uint32_t, (uint32_t prev_core), 0);
-DEFINE_STUB(spdk_env_get_current_core, uint32_t, (void), 0);
 DEFINE_STUB_V(spdk_event_call, (struct spdk_event *event));
 DEFINE_STUB(rte_vhost_get_mem_table, int, (int vid, struct rte_vhost_memory **mem), 0);
 DEFINE_STUB(rte_vhost_get_negotiated_features, int, (int vid, uint64_t *features), 0);
@@ -163,7 +161,7 @@ start_vdev(struct spdk_vhost_dev *vdev)
 	rc = posix_memalign((void **)&vsession, 64, sizeof(*vsession));
 	CU_ASSERT(rc == 0);
 	SPDK_CU_ASSERT_FATAL(vsession != NULL);
-	vsession->lcore = 0;
+	vsession->started = true;
 	vsession->vid = 0;
 	vsession->mem = mem;
 	TAILQ_INSERT_TAIL(&vdev->vsessions, vsession, tailq);
@@ -348,6 +346,65 @@ remove_controller_test(void)
 	cleanup_vdev(vdev);
 }
 
+static void
+vq_avail_ring_get_test(void)
+{
+	struct spdk_vhost_virtqueue vq;
+	uint16_t avail_mem[34];
+	uint16_t reqs[32];
+	uint16_t reqs_len, ret, i;
+
+	/* Basic example reap all requests */
+	vq.vring.avail = (struct vring_avail *)avail_mem;
+	vq.vring.size = 32;
+	vq.last_avail_idx = 24;
+	vq.vring.avail->idx = 29;
+	reqs_len = 6;
+
+	for (i = 0; i < 32; i++) {
+		vq.vring.avail->ring[i] = i;
+	}
+
+	ret = spdk_vhost_vq_avail_ring_get(&vq, reqs, reqs_len);
+	CU_ASSERT(ret == 5);
+	CU_ASSERT(vq.last_avail_idx == 29);
+	for (i = 0; i < ret; i++) {
+		CU_ASSERT(reqs[i] == vq.vring.avail->ring[i + 24]);
+	}
+
+	/* Basic example reap only some requests */
+	vq.last_avail_idx = 20;
+	vq.vring.avail->idx = 29;
+	reqs_len = 6;
+
+	ret = spdk_vhost_vq_avail_ring_get(&vq, reqs, reqs_len);
+	CU_ASSERT(ret == reqs_len);
+	CU_ASSERT(vq.last_avail_idx == 26);
+	for (i = 0; i < ret; i++) {
+		CU_ASSERT(reqs[i] == vq.vring.avail->ring[i + 20]);
+	}
+
+	/* Test invalid example */
+	vq.last_avail_idx = 20;
+	vq.vring.avail->idx = 156;
+	reqs_len = 6;
+
+	ret = spdk_vhost_vq_avail_ring_get(&vq, reqs, reqs_len);
+	CU_ASSERT(ret == 0);
+
+	/* Test overflow in the avail->idx variable. */
+	vq.last_avail_idx = 65535;
+	vq.vring.avail->idx = 4;
+	reqs_len = 6;
+	ret = spdk_vhost_vq_avail_ring_get(&vq, reqs, reqs_len);
+	CU_ASSERT(ret == 5);
+	CU_ASSERT(vq.last_avail_idx == 4);
+	CU_ASSERT(reqs[0] == vq.vring.avail->ring[31]);
+	for (i = 1; i < ret; i++) {
+		CU_ASSERT(reqs[i] == vq.vring.avail->ring[i - 1]);
+	}
+}
+
 int
 main(int argc, char **argv)
 {
@@ -368,7 +425,8 @@ main(int argc, char **argv)
 		CU_add_test(suite, "desc_to_iov", desc_to_iov_test) == NULL ||
 		CU_add_test(suite, "create_controller", create_controller_test) == NULL ||
 		CU_add_test(suite, "session_find_by_vid", session_find_by_vid_test) == NULL ||
-		CU_add_test(suite, "remove_controller", remove_controller_test) == NULL
+		CU_add_test(suite, "remove_controller", remove_controller_test) == NULL ||
+		CU_add_test(suite, "vq_avail_ring_get", vq_avail_ring_get_test) == NULL
 	) {
 		CU_cleanup_registry();
 		return CU_get_error();

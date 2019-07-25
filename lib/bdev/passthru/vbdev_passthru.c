@@ -216,16 +216,38 @@ pt_read_get_buf_cb(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io, boo
 	struct vbdev_passthru *pt_node = SPDK_CONTAINEROF(bdev_io->bdev, struct vbdev_passthru,
 					 pt_bdev);
 	struct pt_io_channel *pt_ch = spdk_io_channel_get_ctx(ch);
+	struct passthru_bdev_io *io_ctx = (struct passthru_bdev_io *)bdev_io->driver_ctx;
+	int rc;
 
 	if (!success) {
 		spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
 		return;
 	}
 
-	spdk_bdev_readv_blocks(pt_node->base_desc, pt_ch->base_ch, bdev_io->u.bdev.iovs,
-			       bdev_io->u.bdev.iovcnt, bdev_io->u.bdev.offset_blocks,
-			       bdev_io->u.bdev.num_blocks, _pt_complete_io,
-			       bdev_io);
+	if (bdev_io->u.bdev.md_buf == NULL) {
+		rc = spdk_bdev_readv_blocks(pt_node->base_desc, pt_ch->base_ch, bdev_io->u.bdev.iovs,
+					    bdev_io->u.bdev.iovcnt, bdev_io->u.bdev.offset_blocks,
+					    bdev_io->u.bdev.num_blocks, _pt_complete_io,
+					    bdev_io);
+	} else {
+		rc = spdk_bdev_readv_blocks_with_md(pt_node->base_desc, pt_ch->base_ch,
+						    bdev_io->u.bdev.iovs, bdev_io->u.bdev.iovcnt,
+						    bdev_io->u.bdev.md_buf,
+						    bdev_io->u.bdev.offset_blocks,
+						    bdev_io->u.bdev.num_blocks,
+						    _pt_complete_io, bdev_io);
+	}
+
+	if (rc != 0) {
+		if (rc == -ENOMEM) {
+			SPDK_ERRLOG("No memory, start to queue io for passthru.\n");
+			io_ctx->ch = ch;
+			vbdev_passthru_queue_io(bdev_io);
+		} else {
+			SPDK_ERRLOG("ERROR on bdev_io submission!\n");
+			spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
+		}
+	}
 }
 
 /* Called when someone above submits IO to this pt vbdev. We're simply passing it on here
@@ -252,10 +274,19 @@ vbdev_passthru_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *b
 				     bdev_io->u.bdev.num_blocks * bdev_io->bdev->blocklen);
 		break;
 	case SPDK_BDEV_IO_TYPE_WRITE:
-		rc = spdk_bdev_writev_blocks(pt_node->base_desc, pt_ch->base_ch, bdev_io->u.bdev.iovs,
-					     bdev_io->u.bdev.iovcnt, bdev_io->u.bdev.offset_blocks,
-					     bdev_io->u.bdev.num_blocks, _pt_complete_io,
-					     bdev_io);
+		if (bdev_io->u.bdev.md_buf == NULL) {
+			rc = spdk_bdev_writev_blocks(pt_node->base_desc, pt_ch->base_ch, bdev_io->u.bdev.iovs,
+						     bdev_io->u.bdev.iovcnt, bdev_io->u.bdev.offset_blocks,
+						     bdev_io->u.bdev.num_blocks, _pt_complete_io,
+						     bdev_io);
+		} else {
+			rc = spdk_bdev_writev_blocks_with_md(pt_node->base_desc, pt_ch->base_ch,
+							     bdev_io->u.bdev.iovs, bdev_io->u.bdev.iovcnt,
+							     bdev_io->u.bdev.md_buf,
+							     bdev_io->u.bdev.offset_blocks,
+							     bdev_io->u.bdev.num_blocks,
+							     _pt_complete_io, bdev_io);
+		}
 		break;
 	case SPDK_BDEV_IO_TYPE_WRITE_ZEROES:
 		rc = spdk_bdev_write_zeroes_blocks(pt_node->base_desc, pt_ch->base_ch,
@@ -593,6 +624,12 @@ vbdev_passthru_register(struct spdk_bdev *bdev)
 		pt_node->pt_bdev.blocklen = bdev->blocklen;
 		pt_node->pt_bdev.blockcnt = bdev->blockcnt;
 
+		pt_node->pt_bdev.md_interleave = bdev->md_interleave;
+		pt_node->pt_bdev.md_len = bdev->md_len;
+		pt_node->pt_bdev.dif_type = bdev->dif_type;
+		pt_node->pt_bdev.dif_is_head_of_md = bdev->dif_is_head_of_md;
+		pt_node->pt_bdev.dif_check_flags = bdev->dif_check_flags;
+
 		/* This is the context that is passed to us when the bdev
 		 * layer calls in so we'll save our pt_bdev node here.
 		 */
@@ -630,9 +667,10 @@ vbdev_passthru_register(struct spdk_bdev *bdev)
 		}
 		SPDK_NOTICELOG("bdev claimed\n");
 
-		rc = spdk_vbdev_register(&pt_node->pt_bdev, &bdev, 1);
+		rc = spdk_bdev_register(&pt_node->pt_bdev);
 		if (rc) {
 			SPDK_ERRLOG("could not register pt_bdev\n");
+			spdk_bdev_module_release_bdev(&pt_node->pt_bdev);
 			spdk_bdev_close(pt_node->base_desc);
 			TAILQ_REMOVE(&g_pt_nodes, pt_node, link);
 			spdk_io_device_unregister(pt_node, NULL);

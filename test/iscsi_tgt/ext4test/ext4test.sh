@@ -5,9 +5,9 @@ rootdir=$(readlink -f $testdir/../../..)
 source $rootdir/test/common/autotest_common.sh
 source $rootdir/test/iscsi_tgt/common.sh
 
-if [ ! -z $1 ]; then
-	DPDK_DIR=$(readlink -f $1)
-fi
+# $1 = "iso" - triggers isolation mode (setting up required environment).
+# $2 = test type posix or vpp. defaults to posix.
+iscsitestinit $1 $2
 
 timing_enter ext4test
 
@@ -20,7 +20,7 @@ $ISCSI_APP --wait-for-rpc &
 pid=$!
 echo "Process pid: $pid"
 
-trap "$rpc_py destruct_split_vbdev Name0n1 || true; killprocess $pid; exit 1" SIGINT SIGTERM EXIT
+trap "$rpc_py destruct_split_vbdev Name0n1 || true; killprocess $pid; iscsitestfini $1 $2; exit 1" SIGINT SIGTERM EXIT
 
 waitforlisten $pid
 $rpc_py set_iscsi_options -o 30 -a 4 -b $node_base
@@ -42,11 +42,10 @@ sleep 1
 
 iscsiadm -m discovery -t sendtargets -p $TARGET_IP:$ISCSI_PORT
 iscsiadm -m node --login -p $TARGET_IP:$ISCSI_PORT
+waitforiscsidevices 1
 
-trap 'for new_dir in `dir -d /mnt/*dir`; do umount $new_dir; rm -rf $new_dir; done; \
-	iscsicleanup; killprocess $pid; exit 1' SIGINT SIGTERM EXIT
-
-sleep 1
+trap 'for new_dir in $(dir -d /mnt/*dir); do umount $new_dir; rm -rf $new_dir; done; \
+	iscsicleanup; killprocess $pid; iscsitestfini $1 $2; exit 1' SIGINT SIGTERM EXIT
 
 echo "Test error injection"
 $rpc_py bdev_inject_error EE_Malloc0 'all' 'failure' -n 1000
@@ -54,6 +53,7 @@ $rpc_py bdev_inject_error EE_Malloc0 'all' 'failure' -n 1000
 dev=$(iscsiadm -m session -P 3 | grep "Attached scsi disk" | awk '{print $4}')
 
 set +e
+waitforfile /dev/$dev
 mkfs.ext4 -F /dev/$dev
 if [ $? -eq 0 ]; then
 	echo "mkfs successful - expected failure"
@@ -71,12 +71,18 @@ $rpc_py delete_target_node $node_base:Target0
 echo "Error injection test done"
 
 if [ -z "$NO_NVME" ]; then
-	$rpc_py construct_split_vbdev Nvme0n1 2 -s 10000
+	bdev_size=$(get_bdev_size Nvme0n1)
+	split_size=$((bdev_size/2))
+	if [ $split_size -gt 10000 ]; then
+		split_size=10000
+	fi
+	$rpc_py construct_split_vbdev Nvme0n1 2 -s $split_size
 	$rpc_py construct_target_node Target1 Target1_alias Nvme0n1p0:0 1:2 64 -d
 fi
 
 iscsiadm -m discovery -t sendtargets -p $TARGET_IP:$ISCSI_PORT
 iscsiadm -m node --login -p $TARGET_IP:$ISCSI_PORT
+waitforiscsidevices 1
 
 devs=$(iscsiadm -m session -P 3 | grep "Attached scsi disk" | awk '{print $4}')
 
@@ -125,5 +131,6 @@ if [ -z "$NO_NVME" ]; then
 fi
 
 killprocess $pid
+iscsitestfini $1 $2
 report_test_completion "nightly_iscsi_ext4test"
 timing_exit ext4test

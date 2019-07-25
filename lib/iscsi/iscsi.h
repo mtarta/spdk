@@ -42,8 +42,8 @@
 #include "spdk/event.h"
 #include "spdk/thread.h"
 
+#include "spdk/scsi.h"
 #include "iscsi/param.h"
-#include "iscsi/tgt_node.h"
 
 #include "spdk/assert.h"
 #include "spdk/dif.h"
@@ -75,7 +75,6 @@
 #define DEFAULT_TIMEOUT 60
 #define MAX_NOPININTERVAL 60
 #define DEFAULT_NOPININTERVAL 30
-#define DEFAULT_CONNECTIONS_PER_LCORE 4
 
 /*
  * SPDK iSCSI target currently only supports 64KB as the maximum data segment length
@@ -307,7 +306,7 @@ struct spdk_iscsi_opts {
 	bool ImmediateData;
 	uint32_t ErrorRecoveryLevel;
 	bool AllowDuplicateIsid;
-	uint32_t min_connections_per_core;
+	uint32_t min_connections_per_core; /* Deprecated */
 };
 
 struct spdk_iscsi_globals {
@@ -354,7 +353,6 @@ struct spdk_iscsi_globals {
 #define ISCSI_FULL_FEATURE_PHASE		3
 
 enum spdk_error_codes {
-	SPDK_SUCCESS		= 0,
 	SPDK_ISCSI_CONNECTION_FATAL	= -1,
 	SPDK_PDU_FATAL		= -2,
 };
@@ -408,7 +406,7 @@ void spdk_iscsi_send_nopin(struct spdk_iscsi_conn *conn);
 void spdk_iscsi_task_response(struct spdk_iscsi_conn *conn,
 			      struct spdk_iscsi_task *task);
 int spdk_iscsi_execute(struct spdk_iscsi_conn *conn, struct spdk_iscsi_pdu *pdu);
-int spdk_iscsi_build_iovs(struct spdk_iscsi_conn *conn, struct iovec *iovs, int num_iovs,
+int spdk_iscsi_build_iovs(struct spdk_iscsi_conn *conn, struct iovec *iovs, int iovcnt,
 			  struct spdk_iscsi_pdu *pdu, uint32_t *mapped_length);
 int spdk_iscsi_read_pdu(struct spdk_iscsi_conn *conn, struct spdk_iscsi_pdu **_pdu);
 bool spdk_iscsi_get_dif_ctx(struct spdk_iscsi_conn *conn, struct spdk_iscsi_pdu *pdu,

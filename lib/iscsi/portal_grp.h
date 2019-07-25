@@ -38,14 +38,17 @@
 #include "spdk/conf.h"
 #include "spdk/cpuset.h"
 
+#define MAX_PORTAL_ADDR	256
+#define MAX_PORTAL_PORT	32
+
 struct spdk_json_write_ctx;
 
 struct spdk_iscsi_portal {
 	struct spdk_iscsi_portal_grp	*group;
-	char				*host;
-	char				*port;
+	char				host[MAX_PORTAL_ADDR + 1];
+	char				port[MAX_PORTAL_PORT + 1];
 	struct spdk_sock		*sock;
-	struct spdk_cpuset		*cpumask;
+	struct spdk_cpuset		cpumask;
 	struct spdk_poller		*acceptor_poller;
 	TAILQ_ENTRY(spdk_iscsi_portal)	per_pg_tailq;
 	TAILQ_ENTRY(spdk_iscsi_portal)	g_tailq;
@@ -80,4 +83,5 @@ void spdk_iscsi_portal_grp_close_all(void);
 void spdk_iscsi_portal_grps_config_text(FILE *fp);
 void spdk_iscsi_portal_grps_info_json(struct spdk_json_write_ctx *w);
 void spdk_iscsi_portal_grps_config_json(struct spdk_json_write_ctx *w);
+
 #endif /* SPDK_PORTAL_GRP_H */

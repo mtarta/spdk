@@ -85,6 +85,12 @@ nvme_ctrlr_get_cmbsz(struct spdk_nvme_ctrlr *ctrlr, union spdk_nvme_cmbsz_regist
 					      &cmbsz->raw);
 }
 
+volatile struct spdk_nvme_registers *
+spdk_nvme_ctrlr_get_registers(struct spdk_nvme_ctrlr *ctrlr)
+{
+	return nvme_transport_ctrlr_get_registers(ctrlr);
+}
+
 void
 spdk_nvme_ctrlr_get_default_ctrlr_opts(struct spdk_nvme_ctrlr_opts *opts, size_t opts_size)
 {
@@ -151,7 +157,7 @@ spdk_nvme_ctrlr_get_default_ctrlr_opts(struct spdk_nvme_ctrlr_opts *opts, size_t
 	}
 
 	if (FIELD_OK(admin_timeout_ms)) {
-		opts->admin_timeout_ms = NVME_MAX_TIMEOUT_PERIOD * 1000;
+		opts->admin_timeout_ms = NVME_MAX_ADMIN_TIMEOUT_IN_SECS * 1000;
 	}
 
 	if (FIELD_OK(header_digest)) {
@@ -160,6 +166,10 @@ spdk_nvme_ctrlr_get_default_ctrlr_opts(struct spdk_nvme_ctrlr_opts *opts, size_t
 
 	if (FIELD_OK(data_digest)) {
 		opts->data_digest = false;
+	}
+
+	if (FIELD_OK(disable_error_logging)) {
+		opts->disable_error_logging = false;
 	}
 #undef FIELD_OK
 }
@@ -238,6 +248,30 @@ spdk_nvme_ctrlr_get_default_io_qpair_opts(struct spdk_nvme_ctrlr *ctrlr,
 		opts->delay_pcie_doorbell = false;
 	}
 
+	if (FIELD_OK(sq.vaddr)) {
+		opts->sq.vaddr = NULL;
+	}
+
+	if (FIELD_OK(sq.paddr)) {
+		opts->sq.paddr = 0;
+	}
+
+	if (FIELD_OK(sq.buffer_size)) {
+		opts->sq.buffer_size = 0;
+	}
+
+	if (FIELD_OK(cq.vaddr)) {
+		opts->cq.vaddr = NULL;
+	}
+
+	if (FIELD_OK(cq.paddr)) {
+		opts->cq.paddr = 0;
+	}
+
+	if (FIELD_OK(cq.buffer_size)) {
+		opts->cq.buffer_size = 0;
+	}
+
 #undef FIELD_OK
 }
 
@@ -265,6 +299,22 @@ spdk_nvme_ctrlr_alloc_io_qpair(struct spdk_nvme_ctrlr *ctrlr,
 	spdk_nvme_ctrlr_get_default_io_qpair_opts(ctrlr, &opts, sizeof(opts));
 	if (user_opts) {
 		memcpy(&opts, user_opts, spdk_min(sizeof(opts), opts_size));
+
+		/* If user passes buffers, make sure they're big enough for the requested queue size */
+		if (opts.sq.vaddr) {
+			if (opts.sq.buffer_size < (opts.io_queue_size * sizeof(struct spdk_nvme_cmd))) {
+				SPDK_ERRLOG("sq buffer size %lx is too small for sq size %lx\n",
+					    opts.sq.buffer_size, (opts.io_queue_size * sizeof(struct spdk_nvme_cmd)));
+				return NULL;
+			}
+		}
+		if (opts.cq.vaddr) {
+			if (opts.cq.buffer_size < (opts.io_queue_size * sizeof(struct spdk_nvme_cpl))) {
+				SPDK_ERRLOG("cq buffer size %lx is too small for cq size %lx\n",
+					    opts.cq.buffer_size, (opts.io_queue_size * sizeof(struct spdk_nvme_cpl)));
+				return NULL;
+			}
+		}
 	}
 
 	nvme_robust_mutex_lock(&ctrlr->ctrlr_lock);
@@ -724,12 +774,12 @@ static void
 nvme_ctrlr_free_doorbell_buffer(struct spdk_nvme_ctrlr *ctrlr)
 {
 	if (ctrlr->shadow_doorbell) {
-		spdk_dma_free(ctrlr->shadow_doorbell);
+		spdk_free(ctrlr->shadow_doorbell);
 		ctrlr->shadow_doorbell = NULL;
 	}
 
 	if (ctrlr->eventidx) {
-		spdk_dma_free(ctrlr->eventidx);
+		spdk_free(ctrlr->eventidx);
 		ctrlr->eventidx = NULL;
 	}
 }
@@ -768,8 +818,9 @@ nvme_ctrlr_set_doorbell_buffer_config(struct spdk_nvme_ctrlr *ctrlr)
 	}
 
 	/* only 1 page size for doorbell buffer */
-	ctrlr->shadow_doorbell = spdk_dma_zmalloc(ctrlr->page_size, ctrlr->page_size,
-				 NULL);
+	ctrlr->shadow_doorbell = spdk_zmalloc(ctrlr->page_size, ctrlr->page_size,
+					      NULL, SPDK_ENV_LCORE_ID_ANY,
+					      SPDK_MALLOC_DMA | SPDK_MALLOC_SHARE);
 	if (ctrlr->shadow_doorbell == NULL) {
 		rc = -ENOMEM;
 		goto error;
@@ -782,7 +833,9 @@ nvme_ctrlr_set_doorbell_buffer_config(struct spdk_nvme_ctrlr *ctrlr)
 		goto error;
 	}
 
-	ctrlr->eventidx = spdk_dma_zmalloc(ctrlr->page_size, ctrlr->page_size, NULL);
+	ctrlr->eventidx = spdk_zmalloc(ctrlr->page_size, ctrlr->page_size,
+				       NULL, SPDK_ENV_LCORE_ID_ANY,
+				       SPDK_MALLOC_DMA | SPDK_MALLOC_SHARE);
 	if (ctrlr->eventidx == NULL) {
 		rc = -ENOMEM;
 		goto error;
@@ -842,11 +895,18 @@ spdk_nvme_ctrlr_reset(struct spdk_nvme_ctrlr *ctrlr)
 		ctrlr->outstanding_aborts--;
 	}
 
+	nvme_transport_admin_qpair_abort_aers(ctrlr->adminq);
+
 	/* Disable all queues before disabling the controller hardware. */
-	nvme_qpair_disable(ctrlr->adminq);
 	TAILQ_FOREACH(qpair, &ctrlr->active_io_qpairs, tailq) {
 		nvme_qpair_disable(qpair);
+		nvme_transport_ctrlr_disconnect_qpair(ctrlr, qpair);
 	}
+	nvme_qpair_disable(ctrlr->adminq);
+	nvme_qpair_complete_error_reqs(ctrlr->adminq);
+	nvme_transport_qpair_abort_reqs(ctrlr->adminq, 0 /* retry */);
+	nvme_transport_ctrlr_disconnect_qpair(ctrlr, ctrlr->adminq);
+	nvme_transport_ctrlr_connect_qpair(ctrlr, ctrlr->adminq);
 
 	/* Doorbell buffer config is invalid during reset */
 	nvme_ctrlr_free_doorbell_buffer(ctrlr);
@@ -866,7 +926,7 @@ spdk_nvme_ctrlr_reset(struct spdk_nvme_ctrlr *ctrlr)
 	if (!ctrlr->is_failed) {
 		/* Reinitialize qpairs */
 		TAILQ_FOREACH(qpair, &ctrlr->active_io_qpairs, tailq) {
-			if (nvme_transport_ctrlr_reinit_io_qpair(ctrlr, qpair) != 0) {
+			if (nvme_transport_ctrlr_connect_qpair(ctrlr, qpair) != 0) {
 				nvme_ctrlr_fail(ctrlr, false);
 				rc = -1;
 			}
@@ -922,7 +982,17 @@ nvme_ctrlr_identify_done(void *arg, const struct spdk_nvme_cpl *cpl)
 
 	if (ctrlr->cdata.sgls.supported) {
 		ctrlr->flags |= SPDK_NVME_CTRLR_SGL_SUPPORTED;
+		/*
+		 * Use MSDBD to ensure our max_sges doesn't exceed what the
+		 *  controller supports.
+		 */
 		ctrlr->max_sges = nvme_transport_ctrlr_get_max_sges(ctrlr);
+		if (ctrlr->cdata.nvmf_specific.msdbd != 0) {
+			ctrlr->max_sges = spdk_min(ctrlr->cdata.nvmf_specific.msdbd, ctrlr->max_sges);
+		} else {
+			/* A value 0 indicates no limit. */
+		}
+		SPDK_DEBUGLOG(SPDK_LOG_NVME, "transport max_sges %u\n", ctrlr->max_sges);
 	}
 
 	if (ctrlr->cdata.oacs.security) {
@@ -963,7 +1033,7 @@ nvme_ctrlr_identify_active_ns(struct spdk_nvme_ctrlr *ctrlr)
 	uint32_t				*new_ns_list = NULL;
 
 	if (ctrlr->num_ns == 0) {
-		spdk_dma_free(ctrlr->active_ns_list);
+		spdk_free(ctrlr->active_ns_list);
 		ctrlr->active_ns_list = NULL;
 
 		return 0;
@@ -973,8 +1043,8 @@ nvme_ctrlr_identify_active_ns(struct spdk_nvme_ctrlr *ctrlr)
 	 * The allocated size must be a multiple of sizeof(struct spdk_nvme_ns_list)
 	 */
 	num_pages = (ctrlr->num_ns * sizeof(new_ns_list[0]) - 1) / sizeof(struct spdk_nvme_ns_list) + 1;
-	new_ns_list = spdk_dma_zmalloc(num_pages * sizeof(struct spdk_nvme_ns_list), ctrlr->page_size,
-				       NULL);
+	new_ns_list = spdk_zmalloc(num_pages * sizeof(struct spdk_nvme_ns_list), ctrlr->page_size,
+				   NULL, SPDK_ENV_LCORE_ID_ANY, SPDK_MALLOC_DMA | SPDK_MALLOC_SHARE);
 	if (!new_ns_list) {
 		SPDK_ERRLOG("Failed to allocate active_ns_list!\n");
 		return -ENOMEM;
@@ -1020,12 +1090,12 @@ nvme_ctrlr_identify_active_ns(struct spdk_nvme_ctrlr *ctrlr)
 	 * Now that that the list is properly setup, we can swap it in to the ctrlr and
 	 * free up the previous one.
 	 */
-	spdk_dma_free(ctrlr->active_ns_list);
+	spdk_free(ctrlr->active_ns_list);
 	ctrlr->active_ns_list = new_ns_list;
 
 	return 0;
 fail:
-	spdk_dma_free(new_ns_list);
+	spdk_free(new_ns_list);
 	return rc;
 }
 
@@ -1437,7 +1507,7 @@ nvme_ctrlr_destruct_namespaces(struct spdk_nvme_ctrlr *ctrlr)
 		ctrlr->nsdata = NULL;
 	}
 
-	spdk_dma_free(ctrlr->active_ns_list);
+	spdk_free(ctrlr->active_ns_list);
 	ctrlr->active_ns_list = NULL;
 }
 
@@ -1739,7 +1809,7 @@ nvme_ctrlr_remove_process(struct spdk_nvme_ctrlr *ctrlr,
 		spdk_pci_device_detach(proc->devhandle);
 	}
 
-	spdk_dma_free(proc);
+	spdk_free(proc);
 }
 
 /**
@@ -1777,7 +1847,7 @@ nvme_ctrlr_cleanup_process(struct spdk_nvme_ctrlr_process *proc)
 		spdk_nvme_ctrlr_free_io_qpair(qpair);
 	}
 
-	spdk_dma_free(proc);
+	spdk_free(proc);
 }
 
 /**
@@ -2124,8 +2194,6 @@ nvme_ctrlr_process_init(struct spdk_nvme_ctrlr *ctrlr)
 
 	case NVME_CTRLR_STATE_IDENTIFY_ID_DESCS:
 		rc = nvme_ctrlr_identify_id_desc_namespaces(ctrlr);
-		nvme_ctrlr_set_state(ctrlr, NVME_CTRLR_STATE_CONFIGURE_AER,
-				     ctrlr->opts.admin_timeout_ms);
 		break;
 
 	case NVME_CTRLR_STATE_WAIT_FOR_IDENTIFY_ID_DESCS:
@@ -2285,6 +2353,9 @@ nvme_ctrlr_destruct(struct spdk_nvme_ctrlr *ctrlr)
 	struct spdk_nvme_qpair *qpair, *tmp;
 
 	SPDK_DEBUGLOG(SPDK_LOG_NVME, "Prepare to destruct SSD: %s\n", ctrlr->trid.traddr);
+
+	nvme_transport_admin_qpair_abort_aers(ctrlr->adminq);
+
 	TAILQ_FOREACH_SAFE(qpair, &ctrlr->active_io_qpairs, tailq, tmp) {
 		spdk_nvme_ctrlr_free_io_qpair(qpair);
 	}
@@ -2838,4 +2909,10 @@ uint64_t
 spdk_nvme_ctrlr_get_flags(struct spdk_nvme_ctrlr *ctrlr)
 {
 	return ctrlr->flags;
+}
+
+const struct spdk_nvme_transport_id *
+spdk_nvme_ctrlr_get_transport_id(struct spdk_nvme_ctrlr *ctrlr)
+{
+	return &ctrlr->trid;
 }

@@ -122,7 +122,11 @@ spdk_nvme_wait_for_completion_robust_lock(
 			nvme_robust_mutex_lock(robust_mutex);
 		}
 
-		spdk_nvme_qpair_process_completions(qpair, 0);
+		if (spdk_nvme_qpair_process_completions(qpair, 0) < 0) {
+			status->done = true;
+			status->cpl.status.sct = SPDK_NVME_SCT_GENERIC;
+			status->cpl.status.sc = SPDK_NVME_SC_ABORTED_SQ_DELETION;
+		}
 
 		if (robust_mutex) {
 			nvme_robust_mutex_unlock(robust_mutex);
@@ -182,7 +186,7 @@ nvme_user_copy_cmd_complete(void *arg, const struct spdk_nvme_cpl *cpl)
 			memcpy(req->user_buffer, req->payload.contig_or_cb_arg, req->payload_size);
 		}
 
-		spdk_dma_free(req->payload.contig_or_cb_arg);
+		spdk_free(req->payload.contig_or_cb_arg);
 	}
 
 	/* Call the user's original callback now that the buffer has been copied */
@@ -391,6 +395,7 @@ nvme_driver_init(void)
 	return ret;
 }
 
+/* This function must only be called while holding g_spdk_nvme_driver->lock */
 int
 nvme_ctrlr_probe(const struct spdk_nvme_transport_id *trid,
 		 struct spdk_nvme_probe_ctx *probe_ctx, void *devhandle)
@@ -403,6 +408,21 @@ nvme_ctrlr_probe(const struct spdk_nvme_transport_id *trid,
 	spdk_nvme_ctrlr_get_default_ctrlr_opts(&opts, sizeof(opts));
 
 	if (!probe_ctx->probe_cb || probe_ctx->probe_cb(probe_ctx->cb_ctx, trid, &opts)) {
+		ctrlr = spdk_nvme_get_ctrlr_by_trid_unsafe(trid);
+		if (ctrlr) {
+			/* This ctrlr already exists.
+			* Increase the ref count before calling attach_cb() as the user may
+			* call nvme_detach() immediately. */
+			nvme_ctrlr_proc_get_ref(ctrlr);
+
+			if (probe_ctx->attach_cb) {
+				nvme_robust_mutex_unlock(&g_spdk_nvme_driver->lock);
+				probe_ctx->attach_cb(probe_ctx->cb_ctx, &ctrlr->trid, ctrlr, &ctrlr->opts);
+				nvme_robust_mutex_lock(&g_spdk_nvme_driver->lock);
+			}
+			return 0;
+		}
+
 		ctrlr = nvme_transport_ctrlr_construct(trid, &opts, devhandle);
 		if (ctrlr == NULL) {
 			SPDK_ERRLOG("Failed to construct NVMe controller for SSD: %s\n", trid->traddr);
@@ -945,8 +965,8 @@ spdk_nvme_transport_id_compare(const struct spdk_nvme_transport_id *trid1,
 	}
 
 	if (trid1->trtype == SPDK_NVME_TRANSPORT_PCIE) {
-		struct spdk_pci_addr pci_addr1;
-		struct spdk_pci_addr pci_addr2;
+		struct spdk_pci_addr pci_addr1 = {};
+		struct spdk_pci_addr pci_addr2 = {};
 
 		/* Normalize PCI addresses before comparing */
 		if (spdk_pci_addr_parse(&pci_addr1, trid1->traddr) < 0 ||

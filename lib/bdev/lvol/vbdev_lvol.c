@@ -579,12 +579,14 @@ void
 vbdev_lvol_destroy(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn, void *cb_arg)
 {
 	struct vbdev_lvol_destroy_ctx *ctx;
+	size_t count;
 
 	assert(lvol != NULL);
 	assert(cb_fn != NULL);
 
 	/* Check if it is possible to delete lvol */
-	if (spdk_lvol_deletable(lvol) == false) {
+	spdk_blob_get_clones(lvol->lvol_store->blobstore, lvol->blob_id, NULL, &count);
+	if (count > 1) {
 		/* throw an error */
 		SPDK_ERRLOG("Cannot delete lvol\n");
 		cb_fn(cb_arg, -EPERM);
@@ -967,7 +969,7 @@ _create_lvol_disk(struct spdk_lvol *lvol, bool destroy)
 	bdev->fn_table = &vbdev_lvol_fn_table;
 	bdev->module = &g_lvol_if;
 
-	rc = spdk_vbdev_register(bdev, &lvs_bdev->bdev, 1);
+	rc = spdk_bdev_register(bdev);
 	if (rc) {
 		free(bdev);
 		return rc;

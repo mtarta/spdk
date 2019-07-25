@@ -49,14 +49,6 @@ static TAILQ_HEAD(, spdk_iscsi_task) g_ut_read_tasks = TAILQ_HEAD_INITIALIZER(g_
 
 DEFINE_STUB(spdk_app_get_shm_id, int, (void), 0);
 
-DEFINE_STUB(spdk_env_get_current_core, uint32_t, (void), 0);
-
-DEFINE_STUB(spdk_env_get_first_core, uint32_t, (void), 0);
-
-DEFINE_STUB(spdk_env_get_last_core, uint32_t, (void), 0);
-
-DEFINE_STUB(spdk_env_get_next_core, uint32_t, (uint32_t prev_core), 0);
-
 DEFINE_STUB(spdk_event_allocate, struct spdk_event *,
 	    (uint32_t lcore, spdk_event_fn fn, void *arg1, void *arg2),
 	    NULL);
@@ -107,16 +99,16 @@ DEFINE_STUB(spdk_scsi_dev_has_pending_tasks, bool,
 	    (const struct spdk_scsi_dev *dev), true);
 
 DEFINE_STUB(spdk_scsi_lun_open, int,
-	    (struct spdk_scsi_lun *lun, spdk_scsi_remove_cb_t hotremove_cb,
-	     void *hotremove_ctx, struct spdk_scsi_desc **desc),
+	    (struct spdk_scsi_lun *lun, spdk_scsi_lun_remove_cb_t hotremove_cb,
+	     void *hotremove_ctx, struct spdk_scsi_lun_desc **desc),
 	    0);
 
-DEFINE_STUB_V(spdk_scsi_lun_close, (struct spdk_scsi_desc *desc));
+DEFINE_STUB_V(spdk_scsi_lun_close, (struct spdk_scsi_lun_desc *desc));
 
 DEFINE_STUB(spdk_scsi_lun_allocate_io_channel, int,
-	    (struct spdk_scsi_desc *desc), 0);
+	    (struct spdk_scsi_lun_desc *desc), 0);
 
-DEFINE_STUB_V(spdk_scsi_lun_free_io_channel, (struct spdk_scsi_desc *desc));
+DEFINE_STUB_V(spdk_scsi_lun_free_io_channel, (struct spdk_scsi_lun_desc *desc));
 
 DEFINE_STUB(spdk_scsi_lun_get_id, int, (const struct spdk_scsi_lun *lun), 0);
 

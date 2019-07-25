@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 
-set -e
-HOTPLUG_DIR=$(readlink -f $(dirname $0))
-
-. $HOTPLUG_DIR/common.sh
+testdir=$(readlink -f $(dirname $0))
+rootdir=$(readlink -f $testdir/../../..)
+source $rootdir/test/common/autotest_common.sh
+source $rootdir/test/vhost/common.sh
+source $rootdir/test/vhost/hotplug/common.sh
 
 function get_first_disk() {
     vm_check_scsi_location $1
@@ -23,7 +24,7 @@ function prepare_fio_cmd_tc1_iter1() {
     run_fio="$fio_bin --eta=never "
     for vm_num in $1; do
         cp $fio_job $tmp_detach_job
-        vm_dir=$VM_BASE_DIR/$vm_num
+        vm_dir=$VM_DIR/$vm_num
         vm_check_scsi_location $vm_num
         for disk in $SCSI_DISK; do
             echo "[nvme-host$disk]" >> $tmp_detach_job
@@ -40,7 +41,7 @@ function prepare_fio_cmd_tc1_iter2() {
 
     for vm_num in 2; do
         cp $fio_job $tmp_detach_job
-        vm_dir=$VM_BASE_DIR/$vm_num
+        vm_dir=$VM_DIR/$vm_num
         vm_check_scsi_location $vm_num
         for disk in $SCSI_DISK; do
             echo "[nvme-host$disk]" >> $tmp_detach_job
@@ -65,7 +66,7 @@ function prepare_fio_cmd_tc2_iter1() {
     run_fio="$fio_bin --eta=never "
     for vm_num in $1; do
         cp $fio_job $tmp_detach_job
-        vm_dir=$VM_BASE_DIR/$vm_num
+        vm_dir=$VM_DIR/$vm_num
         vm_check_scsi_location $vm_num
         disk_array=($SCSI_DISK)
         disk=${disk_array[0]}
@@ -88,7 +89,7 @@ function prepare_fio_cmd_tc2_iter2() {
         else
             vm_job_name=default_integrity_4discs.job
         fi
-        vm_dir=$VM_BASE_DIR/$vm_num
+        vm_dir=$VM_DIR/$vm_num
         vm_check_scsi_location $vm_num
         for disk in $SCSI_DISK; do
             echo "[nvme-host$disk]" >> $tmp_detach_job
@@ -112,7 +113,7 @@ function prepare_fio_cmd_tc3_iter1() {
         else
             vm_job_name=default_integrity_4discs.job
         fi
-        vm_dir=$VM_BASE_DIR/$vm_num
+        vm_dir=$VM_DIR/$vm_num
         vm_check_scsi_location $vm_num
         j=1
         for disk in $SCSI_DISK; do

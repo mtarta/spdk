@@ -212,6 +212,7 @@ prepare_for_test(struct spdk_nvme_ns *ns, struct spdk_nvme_ctrlr *ctrlr,
 	for (i = 0; i < num_requests; i++) {
 		struct nvme_request *req = qpair->req_buf + i * sizeof(struct nvme_request);
 
+		req->qpair = qpair;
 		STAILQ_INSERT_HEAD(&qpair->free_req, req, stailq);
 	}
 
@@ -592,7 +593,7 @@ test_nvme_ns_cmd_dataset_management(void)
 	CU_ASSERT(g_request->cmd.nsid == ns.id);
 	CU_ASSERT(g_request->cmd.cdw10 == 0);
 	CU_ASSERT(g_request->cmd.cdw11 == SPDK_NVME_DSM_ATTR_DEALLOCATE);
-	spdk_dma_free(g_request->payload.contig_or_cb_arg);
+	spdk_free(g_request->payload.contig_or_cb_arg);
 	nvme_free_request(g_request);
 
 	/* TRIM 256 LBAs */
@@ -604,7 +605,7 @@ test_nvme_ns_cmd_dataset_management(void)
 	CU_ASSERT(g_request->cmd.nsid == ns.id);
 	CU_ASSERT(g_request->cmd.cdw10 == 255u);
 	CU_ASSERT(g_request->cmd.cdw11 == SPDK_NVME_DSM_ATTR_DEALLOCATE);
-	spdk_dma_free(g_request->payload.contig_or_cb_arg);
+	spdk_free(g_request->payload.contig_or_cb_arg);
 	nvme_free_request(g_request);
 
 	rc = spdk_nvme_ns_cmd_dataset_management(&ns, &qpair, SPDK_NVME_DSM_ATTR_DEALLOCATE,
@@ -786,7 +787,7 @@ test_nvme_ns_cmd_reservation_register(void)
 
 	CU_ASSERT(g_request->cmd.cdw10 == tmp_cdw10);
 
-	spdk_dma_free(g_request->payload.contig_or_cb_arg);
+	spdk_free(g_request->payload.contig_or_cb_arg);
 	nvme_free_request(g_request);
 	free(payload);
 	cleanup_after_test(&qpair);
@@ -824,7 +825,7 @@ test_nvme_ns_cmd_reservation_release(void)
 
 	CU_ASSERT(g_request->cmd.cdw10 == tmp_cdw10);
 
-	spdk_dma_free(g_request->payload.contig_or_cb_arg);
+	spdk_free(g_request->payload.contig_or_cb_arg);
 	nvme_free_request(g_request);
 	free(payload);
 	cleanup_after_test(&qpair);
@@ -862,7 +863,7 @@ test_nvme_ns_cmd_reservation_acquire(void)
 
 	CU_ASSERT(g_request->cmd.cdw10 == tmp_cdw10);
 
-	spdk_dma_free(g_request->payload.contig_or_cb_arg);
+	spdk_free(g_request->payload.contig_or_cb_arg);
 	nvme_free_request(g_request);
 	free(payload);
 	cleanup_after_test(&qpair);
@@ -894,7 +895,7 @@ test_nvme_ns_cmd_reservation_report(void)
 
 	CU_ASSERT(g_request->cmd.cdw10 == (size / 4));
 
-	spdk_dma_free(g_request->payload.contig_or_cb_arg);
+	spdk_free(g_request->payload.contig_or_cb_arg);
 	nvme_free_request(g_request);
 	free(payload);
 	cleanup_after_test(&qpair);

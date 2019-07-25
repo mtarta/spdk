@@ -7,62 +7,33 @@ source $rootdir/test/nvmf/common.sh
 
 rpc_py="$rootdir/scripts/rpc.py"
 
-set -e
-
-# pass the parameter 'iso' to this script when running it in isolation to trigger rdma device initialization.
-# e.g. sudo ./aer.sh iso
-nvmftestinit $1
-
-RDMA_IP_LIST=$(get_available_rdma_ips)
-NVMF_FIRST_TARGET_IP=$(echo "$RDMA_IP_LIST" | head -n 1)
-if [ -z $NVMF_FIRST_TARGET_IP ]; then
-	echo "no NIC for nvmf test"
-	exit 0
-fi
-
 timing_enter aer
-timing_enter start_nvmf_tgt
+nvmftestinit
+nvmfappstart "-m 0xF"
 
-$NVMF_APP -m 0xF &
-nvmfpid=$!
-
-trap "process_shm --id $NVMF_APP_SHM_ID; killprocess $nvmfpid; nvmftestfini $1; exit 1" SIGINT SIGTERM EXIT
-
-waitforlisten $nvmfpid
-$rpc_py nvmf_create_transport -t RDMA -u 8192 -p 4
-timing_exit start_nvmf_tgt
-
-modprobe -v nvme-rdma
+$rpc_py nvmf_create_transport $NVMF_TRANSPORT_OPTS -u 8192
 
 $rpc_py construct_malloc_bdev 64 512 --name Malloc0
 $rpc_py nvmf_subsystem_create nqn.2016-06.io.spdk:cnode1 -a -s SPDK00000000000001 -m 2
 $rpc_py nvmf_subsystem_add_ns nqn.2016-06.io.spdk:cnode1 Malloc0
-$rpc_py nvmf_subsystem_add_listener nqn.2016-06.io.spdk:cnode1 -t rdma -a $NVMF_FIRST_TARGET_IP -s $NVMF_PORT
+$rpc_py nvmf_subsystem_add_listener nqn.2016-06.io.spdk:cnode1 -t $TEST_TRANSPORT -a $NVMF_FIRST_TARGET_IP -s $NVMF_PORT
 
 $rpc_py get_nvmf_subsystems
 
-# TODO: this aer test tries to invoke an AER completion by setting the temperature
-#threshold to a very low value.  This does not work with emulated controllers
-#though so currently the test is disabled.
-
-#$rootdir/test/nvme/aer/aer -r "\
-#        trtype:RDMA \
-#        adrfam:IPv4 \
-#        traddr:$NVMF_FIRST_TARGET_IP \
-#        trsvcid:$NVMF_PORT \
-#        subnqn:nqn.2014-08.org.nvmexpress.discovery"
+AER_TOUCH_FILE=/tmp/aer_touch_file
+rm -f $AER_TOUCH_FILE
 
 # Namespace Attribute Notice Tests
 $rootdir/test/nvme/aer/aer -r "\
-        trtype:RDMA \
+        trtype:$TEST_TRANSPORT \
         adrfam:IPv4 \
         traddr:$NVMF_FIRST_TARGET_IP \
         trsvcid:$NVMF_PORT \
-        subnqn:nqn.2016-06.io.spdk:cnode1" -n 2 &
+        subnqn:nqn.2016-06.io.spdk:cnode1" -n 2 -t $AER_TOUCH_FILE &
 aerpid=$!
 
 # Waiting for aer start to work
-sleep 5
+waitforfile $AER_TOUCH_FILE
 
 # Add a new namespace
 $rpc_py construct_malloc_bdev 64 4096 --name Malloc1
@@ -77,8 +48,5 @@ $rpc_py delete_nvmf_subsystem nqn.2016-06.io.spdk:cnode1
 
 trap - SIGINT SIGTERM EXIT
 
-
-nvmfcleanup
-killprocess $nvmfpid
-nvmftestfini $1
+nvmftestfini
 timing_exit aer

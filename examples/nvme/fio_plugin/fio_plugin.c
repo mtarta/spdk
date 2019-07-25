@@ -34,6 +34,7 @@
 #include "spdk/stdinc.h"
 
 #include "spdk/nvme.h"
+#include "spdk/vmd.h"
 #include "spdk/env.h"
 #include "spdk/string.h"
 #include "spdk/log.h"
@@ -45,10 +46,17 @@
 #include "fio.h"
 #include "optgroup.h"
 
+/* FreeBSD is missing CLOCK_MONOTONIC_RAW,
+ * so alternative is provided. */
+#ifndef CLOCK_MONOTONIC_RAW /* Defined in glibc bits/time.h */
+#define CLOCK_MONOTONIC_RAW CLOCK_MONOTONIC
+#endif
+
 #define NVME_IO_ALIGN		4096
 
 static bool g_spdk_env_initialized;
 static int g_spdk_enable_sgl = 0;
+static uint32_t g_spdk_sge_size = 4096;
 static uint32_t g_spdk_pract_flag;
 static uint32_t g_spdk_prchk_flags;
 static uint32_t g_spdk_md_per_io_size = 4096;
@@ -60,6 +68,7 @@ struct spdk_fio_options {
 	int	mem_size;
 	int	shm_id;
 	int	enable_sgl;
+	int	sge_size;
 	char	*hostnqn;
 	int	pi_act;
 	char	*pi_chk;
@@ -67,6 +76,7 @@ struct spdk_fio_options {
 	int	apptag;
 	int	apptag_mask;
 	char	*digest_enable;
+	int	enable_vmd;
 };
 
 struct spdk_fio_request {
@@ -407,6 +417,7 @@ static int spdk_fio_setup(struct thread_data *td)
 		opts.mem_size = fio_options->mem_size;
 		opts.shm_id = fio_options->shm_id;
 		g_spdk_enable_sgl = fio_options->enable_sgl;
+		g_spdk_sge_size = fio_options->sge_size;
 		parse_pract_flag(fio_options->pi_act);
 		g_spdk_md_per_io_size = spdk_max(fio_options->md_per_io_size, 4096);
 		g_spdk_apptag = (uint16_t)fio_options->apptag;
@@ -427,6 +438,10 @@ static int spdk_fio_setup(struct thread_data *td)
 		rc = pthread_create(&g_ctrlr_thread_id, NULL, &spdk_fio_poll_ctrlrs, NULL);
 		if (rc != 0) {
 			SPDK_ERRLOG("Unable to spawn a thread to poll admin queues. They won't be polled.\n");
+		}
+
+		if (fio_options->enable_vmd && spdk_vmd_init()) {
+			SPDK_ERRLOG("Failed to initialize VMD. Some NVMe devices can be unavailable.\n");
 		}
 	}
 
@@ -572,7 +587,7 @@ fio_extended_lba_setup_pi(struct spdk_fio_qpair *fio_qpair, struct io_u *io_u)
 	rc = spdk_dif_ctx_init(&fio_req->dif_ctx, extended_lba_size, md_size,
 			       true, fio_qpair->md_start,
 			       (enum spdk_dif_type)spdk_nvme_ns_get_pi_type(ns),
-			       fio_qpair->io_flags, lba, g_spdk_apptag_mask, g_spdk_apptag, 0);
+			       fio_qpair->io_flags, lba, g_spdk_apptag_mask, g_spdk_apptag, 0, 0);
 	if (rc != 0) {
 		fprintf(stderr, "Initialization of DIF context failed\n");
 		return rc;
@@ -606,7 +621,7 @@ fio_separate_md_setup_pi(struct spdk_fio_qpair *fio_qpair, struct io_u *io_u)
 	rc = spdk_dif_ctx_init(&fio_req->dif_ctx, block_size, md_size,
 			       false, fio_qpair->md_start,
 			       (enum spdk_dif_type)spdk_nvme_ns_get_pi_type(ns),
-			       fio_qpair->io_flags, lba, g_spdk_apptag_mask, g_spdk_apptag, 0);
+			       fio_qpair->io_flags, lba, g_spdk_apptag_mask, g_spdk_apptag, 0, 0);
 	if (rc != 0) {
 		fprintf(stderr, "Initialization of DIF context failed\n");
 		return rc;
@@ -708,16 +723,22 @@ spdk_nvme_io_next_sge(void *ref, void **address, uint32_t *length)
 {
 	struct spdk_fio_request *fio_req = (struct spdk_fio_request *)ref;
 	struct io_u *io_u = fio_req->io;
+	uint32_t iov_len;
 
 	*address = io_u->buf;
-	*length = io_u->xfer_buflen;
 
 	if (fio_req->iov_offset) {
 		assert(fio_req->iov_offset <= io_u->xfer_buflen);
 		*address += fio_req->iov_offset;
-		*length -= fio_req->iov_offset;
 	}
 
+	iov_len = io_u->xfer_buflen - fio_req->iov_offset;
+	if (iov_len > g_spdk_sge_size) {
+		iov_len = g_spdk_sge_size;
+	}
+
+	fio_req->iov_offset += iov_len;
+	*length = iov_len;
 	return 0;
 }
 
@@ -735,6 +756,7 @@ spdk_fio_queue(struct thread_data *td, struct io_u *io_u)
 	struct spdk_fio_request	*fio_req = io_u->engine_data;
 	struct spdk_fio_qpair	*fio_qpair;
 	struct spdk_nvme_ns	*ns = NULL;
+	void			*md_buf = NULL;
 	struct spdk_dif_ctx	*dif_ctx = &fio_req->dif_ctx;
 	uint32_t		block_size;
 	uint64_t		lba;
@@ -751,6 +773,9 @@ spdk_fio_queue(struct thread_data *td, struct io_u *io_u)
 	}
 	if (fio_qpair == NULL || ns == NULL) {
 		return -ENXIO;
+	}
+	if (fio_qpair->do_nvme_pi && !fio_qpair->extended_lba) {
+		md_buf = fio_req->md_buf;
 	}
 	fio_req->fio_qpair = fio_qpair;
 
@@ -775,26 +800,26 @@ spdk_fio_queue(struct thread_data *td, struct io_u *io_u)
 	switch (io_u->ddir) {
 	case DDIR_READ:
 		if (!g_spdk_enable_sgl) {
-			rc = spdk_nvme_ns_cmd_read_with_md(ns, fio_qpair->qpair, io_u->buf, fio_req->md_buf, lba, lba_count,
+			rc = spdk_nvme_ns_cmd_read_with_md(ns, fio_qpair->qpair, io_u->buf, md_buf, lba, lba_count,
 							   spdk_fio_completion_cb, fio_req,
 							   dif_ctx->dif_flags, dif_ctx->apptag_mask, dif_ctx->app_tag);
 		} else {
 			rc = spdk_nvme_ns_cmd_readv_with_md(ns, fio_qpair->qpair, lba,
 							    lba_count, spdk_fio_completion_cb, fio_req, dif_ctx->dif_flags,
-							    spdk_nvme_io_reset_sgl, spdk_nvme_io_next_sge, fio_req->md_buf,
+							    spdk_nvme_io_reset_sgl, spdk_nvme_io_next_sge, md_buf,
 							    dif_ctx->apptag_mask, dif_ctx->app_tag);
 		}
 		break;
 	case DDIR_WRITE:
 		if (!g_spdk_enable_sgl) {
-			rc = spdk_nvme_ns_cmd_write_with_md(ns, fio_qpair->qpair, io_u->buf, fio_req->md_buf, lba,
+			rc = spdk_nvme_ns_cmd_write_with_md(ns, fio_qpair->qpair, io_u->buf, md_buf, lba,
 							    lba_count,
 							    spdk_fio_completion_cb, fio_req,
 							    dif_ctx->dif_flags, dif_ctx->apptag_mask, dif_ctx->app_tag);
 		} else {
 			rc = spdk_nvme_ns_cmd_writev_with_md(ns, fio_qpair->qpair, lba,
 							     lba_count, spdk_fio_completion_cb, fio_req, dif_ctx->dif_flags,
-							     spdk_nvme_io_reset_sgl, spdk_nvme_io_next_sge, fio_req->md_buf,
+							     spdk_nvme_io_reset_sgl, spdk_nvme_io_next_sge, md_buf,
 							     dif_ctx->apptag_mask, dif_ctx->app_tag);
 		}
 		break;
@@ -898,6 +923,7 @@ static void spdk_fio_cleanup(struct thread_data *td)
 		fio_qpair = fio_qpair_tmp;
 	}
 
+	free(fio_thread->iocq);
 	free(fio_thread);
 
 	pthread_mutex_lock(&g_mutex);
@@ -953,6 +979,16 @@ static struct fio_option options[] = {
 		.off1		= offsetof(struct spdk_fio_options, enable_sgl),
 		.def		= "0",
 		.help		= "SGL Used for I/O Commands (enable_sgl=1 or enable_sgl=0)",
+		.category	= FIO_OPT_C_ENGINE,
+		.group		= FIO_OPT_G_INVALID,
+	},
+	{
+		.name		= "sge_size",
+		.lname		= "SGL size used for I/O commands",
+		.type		= FIO_OPT_INT,
+		.off1		= offsetof(struct spdk_fio_options, sge_size),
+		.def		= "4096",
+		.help		= "SGL size in bytes for I/O Commands (default 4096)",
 		.category	= FIO_OPT_C_ENGINE,
 		.group		= FIO_OPT_G_INVALID,
 	},
@@ -1022,6 +1058,16 @@ static struct fio_option options[] = {
 		.off1		= offsetof(struct spdk_fio_options, digest_enable),
 		.def		= NULL,
 		.help		= "Control the NVMe/TCP control(digest_enable=NONE|HEADER|DATA|BOTH)",
+		.category	= FIO_OPT_C_ENGINE,
+		.group		= FIO_OPT_G_INVALID,
+	},
+	{
+		.name		= "enable_vmd",
+		.lname		= "Enable VMD enumeration",
+		.type		= FIO_OPT_INT,
+		.off1		= offsetof(struct spdk_fio_options, enable_vmd),
+		.def		= "0",
+		.help		= "Enable VMD enumeration (enable_vmd=1 or enable_vmd=0)",
 		.category	= FIO_OPT_C_ENGINE,
 		.group		= FIO_OPT_G_INVALID,
 	},

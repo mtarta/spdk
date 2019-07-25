@@ -58,11 +58,45 @@ uint32_t g_lcore = 0;
 std::string g_bdev_name;
 volatile bool g_spdk_ready = false;
 volatile bool g_spdk_start_failure = false;
-struct sync_args {
-	struct spdk_io_channel *channel;
+
+void SpdkInitializeThread(void);
+
+class SpdkThreadCtx
+{
+public:
+	struct spdk_fs_thread_ctx *channel;
+
+	SpdkThreadCtx(void) : channel(NULL)
+	{
+		SpdkInitializeThread();
+	}
+
+	~SpdkThreadCtx(void)
+	{
+		if (channel) {
+			spdk_fs_free_thread_ctx(channel);
+			channel = NULL;
+		}
+	}
+
+private:
+	SpdkThreadCtx(const SpdkThreadCtx &);
+	SpdkThreadCtx &operator=(const SpdkThreadCtx &);
 };
 
-__thread struct sync_args g_sync_args;
+thread_local SpdkThreadCtx g_sync_args;
+
+static void
+set_channel()
+{
+	struct spdk_thread *thread;
+
+	if (g_fs != NULL && g_sync_args.channel == NULL) {
+		thread = spdk_thread_create("spdK_rocksdb", NULL);
+		spdk_set_thread(thread);
+		g_sync_args.channel = spdk_fs_alloc_thread_ctx(g_fs);
+	}
+}
 
 static void
 __call_fn(void *arg1, void *arg2)
@@ -129,6 +163,7 @@ public:
 
 SpdkSequentialFile::~SpdkSequentialFile(void)
 {
+	set_channel();
 	spdk_file_close(mFile, g_sync_args.channel);
 }
 
@@ -137,6 +172,7 @@ SpdkSequentialFile::Read(size_t n, Slice *result, char *scratch)
 {
 	int64_t ret;
 
+	set_channel();
 	ret = spdk_file_read(mFile, g_sync_args.channel, scratch, mOffset, n);
 	if (ret >= 0) {
 		mOffset += ret;
@@ -175,6 +211,7 @@ public:
 
 SpdkRandomAccessFile::~SpdkRandomAccessFile(void)
 {
+	set_channel();
 	spdk_file_close(mFile, g_sync_args.channel);
 }
 
@@ -183,6 +220,7 @@ SpdkRandomAccessFile::Read(uint64_t offset, size_t n, Slice *result, char *scrat
 {
 	int64_t rc;
 
+	set_channel();
 	rc = spdk_file_read(mFile, g_sync_args.channel, scratch, offset, n);
 	if (rc >= 0) {
 		*result = Slice(scratch, n);
@@ -224,6 +262,8 @@ public:
 	virtual Status Truncate(uint64_t size) override
 	{
 		int rc;
+
+		set_channel();
 		rc = spdk_file_truncate(mFile, g_sync_args.channel, size);
 		if (!rc) {
 			mSize = size;
@@ -235,6 +275,7 @@ public:
 	}
 	virtual Status Close() override
 	{
+		set_channel();
 		spdk_file_close(mFile, g_sync_args.channel);
 		mFile = NULL;
 		return Status::OK();
@@ -248,6 +289,7 @@ public:
 	{
 		int rc;
 
+		set_channel();
 		rc = spdk_file_sync(mFile, g_sync_args.channel);
 		if (!rc) {
 			return Status::OK();
@@ -260,6 +302,7 @@ public:
 	{
 		int rc;
 
+		set_channel();
 		rc = spdk_file_sync(mFile, g_sync_args.channel);
 		if (!rc) {
 			return Status::OK();
@@ -285,6 +328,7 @@ public:
 	{
 		int rc;
 
+		set_channel();
 		rc = spdk_file_truncate(mFile, g_sync_args.channel, offset + len);
 		if (!rc) {
 			return Status::OK();
@@ -302,6 +346,7 @@ public:
 		 * SPDK BlobFS does not have a range sync operation yet, so just sync
 		 *  the whole file.
 		 */
+		set_channel();
 		rc = spdk_file_sync(mFile, g_sync_args.channel);
 		if (!rc) {
 			return Status::OK();
@@ -328,6 +373,7 @@ SpdkWritableFile::Append(const Slice &data)
 {
 	int64_t rc;
 
+	set_channel();
 	rc = spdk_file_write(mFile, g_sync_args.channel, (void *)data.data(), mSize, data.size());
 	if (rc >= 0) {
 		mSize += data.size();
@@ -378,6 +424,7 @@ public:
 			int rc;
 
 			std::string name = sanitize_path(fname, mDirectory);
+			set_channel();
 			rc = spdk_fs_open_file(g_fs, g_sync_args.channel,
 					       name.c_str(), 0, &file);
 			if (rc == 0) {
@@ -405,6 +452,7 @@ public:
 			struct spdk_file *file;
 			int rc;
 
+			set_channel();
 			rc = spdk_fs_open_file(g_fs, g_sync_args.channel,
 					       name.c_str(), 0, &file);
 			if (rc == 0) {
@@ -428,6 +476,7 @@ public:
 			struct spdk_file *file;
 			int rc;
 
+			set_channel();
 			rc = spdk_fs_open_file(g_fs, g_sync_args.channel, name.c_str(),
 					       SPDK_BLOBFS_OPEN_CREATE, &file);
 			if (rc == 0) {
@@ -462,6 +511,7 @@ public:
 		int rc;
 		std::string name = sanitize_path(fname, mDirectory);
 
+		set_channel();
 		rc = spdk_fs_file_stat(g_fs, g_sync_args.channel, name.c_str(), &stat);
 		if (rc == 0) {
 			return Status::OK();
@@ -474,6 +524,7 @@ public:
 		std::string src_name = sanitize_path(src, mDirectory);
 		std::string target_name = sanitize_path(t, mDirectory);
 
+		set_channel();
 		rc = spdk_fs_rename_file(g_fs, g_sync_args.channel,
 					 src_name.c_str(), target_name.c_str());
 		if (rc == -ENOENT) {
@@ -492,6 +543,7 @@ public:
 		int rc;
 		std::string name = sanitize_path(fname, mDirectory);
 
+		set_channel();
 		rc = spdk_fs_file_stat(g_fs, g_sync_args.channel, name.c_str(), &stat);
 		if (rc == -ENOENT) {
 			return EnvWrapper::GetFileSize(fname, size);
@@ -504,18 +556,19 @@ public:
 		int rc;
 		std::string name = sanitize_path(fname, mDirectory);
 
+		set_channel();
 		rc = spdk_fs_delete_file(g_fs, g_sync_args.channel, name.c_str());
 		if (rc == -ENOENT) {
 			return EnvWrapper::DeleteFile(fname);
 		}
 		return Status::OK();
 	}
-	virtual void StartThread(void (*function)(void *arg), void *arg) override;
 	virtual Status LockFile(const std::string &fname, FileLock **lock) override
 	{
 		std::string name = sanitize_path(fname, mDirectory);
 		int64_t rc;
 
+		set_channel();
 		rc = spdk_fs_open_file(g_fs, g_sync_args.channel, name.c_str(),
 				       SPDK_BLOBFS_OPEN_CREATE, (struct spdk_file **)lock);
 		if (!rc) {
@@ -527,6 +580,7 @@ public:
 	}
 	virtual Status UnlockFile(FileLock *lock) override
 	{
+		set_channel();
 		spdk_file_close((struct spdk_file *)lock, g_sync_args.channel);
 		return Status::OK();
 	}
@@ -579,37 +633,20 @@ public:
 	}
 };
 
+/* The thread local constructor doesn't work for the main thread, since
+ * the filesystem hasn't been loaded yet.  So we break out this
+ * SpdkInitializeThread function, so that the main thread can explicitly
+ * call it after the filesystem has been loaded.
+ */
 void SpdkInitializeThread(void)
 {
 	struct spdk_thread *thread;
 
 	if (g_fs != NULL) {
-		thread = spdk_thread_create("spdk_rocksdb");
+		thread = spdk_thread_create("spdk_rocksdb", NULL);
 		spdk_set_thread(thread);
-		g_sync_args.channel = spdk_fs_alloc_io_channel_sync(g_fs);
+		g_sync_args.channel = spdk_fs_alloc_thread_ctx(g_fs);
 	}
-}
-
-struct SpdkThreadState {
-	void (*user_function)(void *);
-	void *arg;
-};
-
-static void SpdkStartThreadWrapper(void *arg)
-{
-	SpdkThreadState *state = reinterpret_cast<SpdkThreadState *>(arg);
-
-	SpdkInitializeThread();
-	state->user_function(state->arg);
-	delete state;
-}
-
-void SpdkEnv::StartThread(void (*function)(void *arg), void *arg)
-{
-	SpdkThreadState *state = new SpdkThreadState;
-	state->user_function = function;
-	state->arg = arg;
-	EnvWrapper::StartThread(SpdkStartThreadWrapper, state);
 }
 
 static void
@@ -722,6 +759,7 @@ SpdkEnv::~SpdkEnv()
 		if (!g_sync_args.channel) {
 			SpdkInitializeThread();
 		}
+
 		iter = spdk_fs_iter_first(g_fs);
 		while (iter != NULL) {
 			file = spdk_fs_iter_get_file(iter);

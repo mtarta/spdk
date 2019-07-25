@@ -427,6 +427,22 @@ spdk_posix_sock_set_sendbuf(struct spdk_sock *_sock, int sz)
 			  &sz, sizeof(sz));
 }
 
+static int
+spdk_posix_sock_set_priority(struct spdk_sock *_sock, int priority)
+{
+	int rc = 0;
+
+#if defined(SO_PRIORITY)
+	struct spdk_posix_sock *sock = __posix_sock(_sock);
+
+	assert(sock != NULL);
+
+	rc = setsockopt(sock->fd, SOL_SOCKET, SO_PRIORITY,
+			&priority, sizeof(priority));
+#endif
+	return rc;
+}
+
 static bool
 spdk_posix_sock_is_ipv6(struct spdk_sock *_sock)
 {
@@ -469,6 +485,24 @@ spdk_posix_sock_is_ipv4(struct spdk_sock *_sock)
 	return (sa.ss_family == AF_INET);
 }
 
+static int
+spdk_posix_sock_get_placement_id(struct spdk_sock *_sock, int *placement_id)
+{
+	int rc = -1;
+
+#if defined(SO_INCOMING_NAPI_ID)
+	struct spdk_posix_sock *sock = __posix_sock(_sock);
+	socklen_t salen = sizeof(int);
+
+	rc = getsockopt(sock->fd, SOL_SOCKET, SO_INCOMING_NAPI_ID, placement_id, &salen);
+	if (rc != 0) {
+		SPDK_ERRLOG("getsockopt() failed (errno=%d)\n", errno);
+	}
+
+#endif
+	return rc;
+}
+
 static struct spdk_sock_group_impl *
 spdk_posix_sock_group_impl_create(void)
 {
@@ -506,6 +540,7 @@ spdk_posix_sock_group_impl_add_sock(struct spdk_sock_group_impl *_group, struct 
 #if defined(__linux__)
 	struct epoll_event event;
 
+	memset(&event, 0, sizeof(event));
 	event.events = EPOLLIN;
 	event.data.ptr = sock;
 
@@ -601,8 +636,10 @@ static struct spdk_net_impl g_posix_net_impl = {
 	.set_recvlowat	= spdk_posix_sock_set_recvlowat,
 	.set_recvbuf	= spdk_posix_sock_set_recvbuf,
 	.set_sendbuf	= spdk_posix_sock_set_sendbuf,
+	.set_priority	= spdk_posix_sock_set_priority,
 	.is_ipv6	= spdk_posix_sock_is_ipv6,
 	.is_ipv4	= spdk_posix_sock_is_ipv4,
+	.get_placement_id	= spdk_posix_sock_get_placement_id,
 	.group_impl_create	= spdk_posix_sock_group_impl_create,
 	.group_impl_add_sock	= spdk_posix_sock_group_impl_add_sock,
 	.group_impl_remove_sock = spdk_posix_sock_group_impl_remove_sock,

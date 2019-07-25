@@ -133,6 +133,8 @@ parser.add_argument('rw', default="randread", type=str,
                     help="RW param for FIO. Default: randread")
 parser.add_argument('-m', '--rwmixread', default="70", type=str,
                     help="Percentage of reads in read-write mode. Default: 70")
+parser.add_argument('-n', '--numjobs', default="1", type=str,
+                    help="Numjobs value for FIO job. Default: 1")
 parser.add_argument('-r', '--runtime', default="10", type=str,
                     help="Run time param for FIO (in seconds). Default: 10")
 parser.add_argument('-R', '--ramptime', default="10", type=str,
@@ -150,7 +152,7 @@ parser.add_argument('-d', '--max-disks', default=0, type=int,
                     each virtual machine gets it's own bdev to work on.")
 parser.add_argument('-v', '--vm-count', default=1, type=int,
                     help="How many VMs to run in test. Default: 1")
-parser.add_argument('-i', '--vm-image', default="/home/sys_sgsw/vhost_vm_image.qcow2",
+parser.add_argument('-i', '--vm-image', default="$HOME/vhost_vm_image.qcow2",
                     type=str, help="VM image to use for running VMs.")
 
 subparsers = parser.add_subparsers()
