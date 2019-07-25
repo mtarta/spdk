@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 
-from rpc.client import print_dict, JSONRPCException
+from rpc.client import print_dict, print_json, JSONRPCException
+from rpc.helpers import deprecated_aliases
 
 import logging
 import argparse
 import rpc
 import sys
+import shlex
+import json
 
 try:
     from shlex import quote
@@ -32,7 +35,9 @@ if __name__ == "__main__":
                         help='Set verbose mode to INFO', default="ERROR")
     parser.add_argument('--verbose', dest='verbose', choices=['DEBUG', 'INFO', 'ERROR'],
                         help="""Set verbose level. """)
-    subparsers = parser.add_subparsers(help='RPC methods')
+    parser.add_argument('--dry_run', dest='dry_run', action='store_true', help="Display request and exit")
+    parser.set_defaults(dry_run=False)
+    subparsers = parser.add_subparsers(help='RPC methods', dest='called_rpc_name')
 
     def start_subsystem_init(args):
         rpc.start_subsystem_init(args.client)
@@ -46,13 +51,19 @@ if __name__ == "__main__":
     p = subparsers.add_parser('wait_subsystem_init', help='Block until subsystems have been initialized')
     p.set_defaults(func=wait_subsystem_init)
 
-    def get_rpc_methods(args):
-        print_dict(rpc.get_rpc_methods(args.client,
+    def rpc_get_methods(args):
+        print_dict(rpc.rpc_get_methods(args.client,
                                        current=args.current))
 
-    p = subparsers.add_parser('get_rpc_methods', help='Get list of supported RPC methods')
+    p = subparsers.add_parser('rpc_get_methods', help='Get list of supported RPC methods', aliases=['get_rpc_methods'])
     p.add_argument('-c', '--current', help='Get list of RPC methods only callable in the current state.', action='store_true')
-    p.set_defaults(func=get_rpc_methods)
+    p.set_defaults(func=rpc_get_methods)
+
+    def get_spdk_version(args):
+        print_json(rpc.get_spdk_version(args.client))
+
+    p = subparsers.add_parser('get_spdk_version', help='Get SPDK version')
+    p.set_defaults(func=get_spdk_version)
 
     def save_config(args):
         rpc.save_config(args.client,
@@ -125,18 +136,43 @@ if __name__ == "__main__":
     p.add_argument('-c', '--bdev-io-cache-size', help='Maximum number of bdev_io structures cached per thread', type=int)
     p.set_defaults(func=set_bdev_options)
 
+    def construct_compress_bdev(args):
+        print_json(rpc.bdev.construct_compress_bdev(args.client,
+                                                    base_bdev_name=args.base_bdev_name,
+                                                    pm_path=args.pm_path))
+    p = subparsers.add_parser('construct_compress_bdev',
+                              help='Add a compress vbdev')
+    p.add_argument('-b', '--base_bdev_name', help="Name of the base bdev")
+    p.add_argument('-p', '--pm_path', help="Path to persistent memory")
+    p.set_defaults(func=construct_compress_bdev)
+
+    def delete_compress_bdev(args):
+        rpc.bdev.delete_compress_bdev(args.client,
+                                      name=args.name)
+
+    p = subparsers.add_parser('delete_compress_bdev', help='Delete a compress disk')
+    p.add_argument('name', help='compress bdev name')
+    p.set_defaults(func=delete_compress_bdev)
+
+    def set_compress_pmd(args):
+        rpc.bdev.set_compress_pmd(args.client,
+                                  pmd=args.pmd)
+    p = subparsers.add_parser('set_compress_pmd', help='Set pmd option for a compress disk')
+    p.add_argument('-p', '--pmd', type=int, help='0 = auto-select, 1= QAT only, 2 = ISAL only')
+    p.set_defaults(func=set_compress_pmd)
+
     def construct_crypto_bdev(args):
-        print(rpc.bdev.construct_crypto_bdev(args.client,
-                                             base_bdev_name=args.base_bdev_name,
-                                             name=args.name,
-                                             crypto_pmd=args.crypto_pmd,
-                                             key=args.key))
+        print_json(rpc.bdev.construct_crypto_bdev(args.client,
+                                                  base_bdev_name=args.base_bdev_name,
+                                                  name=args.name,
+                                                  crypto_pmd=args.crypto_pmd,
+                                                  key=args.key))
     p = subparsers.add_parser('construct_crypto_bdev',
                               help='Add a crypto vbdev')
-    p.add_argument('-b', '--base_bdev_name', help="Name of the base bdev")
-    p.add_argument('-c', '--name', help="Name of the crypto vbdev")
-    p.add_argument('-d', '--crypto_pmd', help="Name of the crypto device driver")
-    p.add_argument('-k', '--key', help="Key")
+    p.add_argument('base_bdev_name', help="Name of the base bdev")
+    p.add_argument('name', help="Name of the crypto vbdev")
+    p.add_argument('crypto_pmd', help="Name of the crypto device driver")
+    p.add_argument('key', help="Key")
     p.set_defaults(func=construct_crypto_bdev)
 
     def delete_crypto_bdev(args):
@@ -148,15 +184,15 @@ if __name__ == "__main__":
     p.set_defaults(func=delete_crypto_bdev)
 
     def construct_ocf_bdev(args):
-        print(rpc.bdev.construct_ocf_bdev(args.client,
-                                          name=args.name,
-                                          mode=args.mode,
-                                          cache_bdev_name=args.cache_bdev_name,
-                                          core_bdev_name=args.core_bdev_name))
+        print_json(rpc.bdev.construct_ocf_bdev(args.client,
+                                               name=args.name,
+                                               mode=args.mode,
+                                               cache_bdev_name=args.cache_bdev_name,
+                                               core_bdev_name=args.core_bdev_name))
     p = subparsers.add_parser('construct_ocf_bdev',
                               help='Add an OCF block device')
     p.add_argument('name', help='Name of resulting OCF bdev')
-    p.add_argument('mode', help='OCF cache mode', choices=['wt', 'pt'])
+    p.add_argument('mode', help='OCF cache mode', choices=['wb', 'wt', 'pt'])
     p.add_argument('cache_bdev_name', help='Name of underlying cache bdev')
     p.add_argument('core_bdev_name', help='Name of unerlying core bdev')
     p.set_defaults(func=construct_ocf_bdev)
@@ -179,18 +215,20 @@ if __name__ == "__main__":
     p.set_defaults(func=get_ocf_stats)
 
     def get_ocf_bdevs(args):
-        print_dict(rpc.bdev.get_ocf_bdevs(args.client))
+        print_dict(rpc.bdev.get_ocf_bdevs(args.client,
+                                          name=args.name))
     p = subparsers.add_parser('get_ocf_bdevs',
                               help='Get list of OCF devices including unregistered ones')
+    p.add_argument('name', nargs='?', default=None, help='name of OCF vbdev or name of cache device or name of core device (optional)')
     p.set_defaults(func=get_ocf_bdevs)
 
     def construct_malloc_bdev(args):
         num_blocks = (args.total_size * 1024 * 1024) // args.block_size
-        print(rpc.bdev.construct_malloc_bdev(args.client,
-                                             num_blocks=int(num_blocks),
-                                             block_size=args.block_size,
-                                             name=args.name,
-                                             uuid=args.uuid))
+        print_json(rpc.bdev.construct_malloc_bdev(args.client,
+                                                  num_blocks=int(num_blocks),
+                                                  block_size=args.block_size,
+                                                  name=args.name,
+                                                  uuid=args.uuid))
     p = subparsers.add_parser('construct_malloc_bdev',
                               help='Add a bdev with malloc backend')
     p.add_argument('-b', '--name', help="Name of the bdev")
@@ -210,11 +248,11 @@ if __name__ == "__main__":
 
     def construct_null_bdev(args):
         num_blocks = (args.total_size * 1024 * 1024) // args.block_size
-        print(rpc.bdev.construct_null_bdev(args.client,
-                                           num_blocks=num_blocks,
-                                           block_size=args.block_size,
-                                           name=args.name,
-                                           uuid=args.uuid))
+        print_json(rpc.bdev.construct_null_bdev(args.client,
+                                                num_blocks=num_blocks,
+                                                block_size=args.block_size,
+                                                name=args.name,
+                                                uuid=args.uuid))
 
     p = subparsers.add_parser('construct_null_bdev',
                               help='Add a bdev with null backend')
@@ -234,10 +272,10 @@ if __name__ == "__main__":
     p.set_defaults(func=delete_null_bdev)
 
     def construct_aio_bdev(args):
-        print(rpc.bdev.construct_aio_bdev(args.client,
-                                          filename=args.filename,
-                                          name=args.name,
-                                          block_size=args.block_size))
+        print_json(rpc.bdev.construct_aio_bdev(args.client,
+                                               filename=args.filename,
+                                               name=args.name,
+                                               block_size=args.block_size))
 
     p = subparsers.add_parser('construct_aio_bdev',
                               help='Add a bdev with aio backend')
@@ -351,13 +389,13 @@ if __name__ == "__main__":
                 if len(parts) != 2:
                     raise Exception('--config %s not in key=value form' % entry)
                 config[parts[0]] = parts[1]
-        print(rpc.bdev.construct_rbd_bdev(args.client,
-                                          name=args.name,
-                                          user=args.user,
-                                          config=config,
-                                          pool_name=args.pool_name,
-                                          rbd_name=args.rbd_name,
-                                          block_size=args.block_size))
+        print_json(rpc.bdev.construct_rbd_bdev(args.client,
+                                               name=args.name,
+                                               user=args.user,
+                                               config=config,
+                                               pool_name=args.pool_name,
+                                               rbd_name=args.rbd_name,
+                                               block_size=args.block_size))
 
     p = subparsers.add_parser('construct_rbd_bdev',
                               help='Add a bdev with ceph rbd backend')
@@ -378,9 +416,36 @@ if __name__ == "__main__":
     p.add_argument('name', help='rbd bdev name')
     p.set_defaults(func=delete_rbd_bdev)
 
+    def bdev_delay_create(args):
+        print_json(rpc.bdev.bdev_delay_create(args.client,
+                                              base_bdev_name=args.base_bdev_name,
+                                              name=args.name,
+                                              avg_read_latency=args.avg_read_latency,
+                                              p99_read_latency=args.nine_nine_read_latency,
+                                              avg_write_latency=args.avg_write_latency,
+                                              p99_write_latency=args.nine_nine_write_latency))
+
+    p = subparsers.add_parser('bdev_delay_create',
+                              help='Add a delay bdev on existing bdev')
+    p.add_argument('-b', '--base-bdev-name', help="Name of the existing bdev", required=True)
+    p.add_argument('-d', '--name', help="Name of the delay bdev", required=True)
+    p.add_argument('-r', '--avg-read-latency', help="Average latency to apply before completing read ops", required=True, type=int)
+    p.add_argument('-t', '--nine-nine-read-latency', help="latency to apply to 1 in 100 read ops", required=True, type=int)
+    p.add_argument('-w', '--avg-write-latency', help="Average latency to apply before completing write ops", required=True, type=int)
+    p.add_argument('-n', '--nine-nine-write-latency', help="latency to apply to 1 in 100 write ops", required=True, type=int)
+    p.set_defaults(func=bdev_delay_create)
+
+    def bdev_delay_delete(args):
+        rpc.bdev.bdev_delay_delete(args.client,
+                                   name=args.name)
+
+    p = subparsers.add_parser('bdev_delay_delete', help='Delete a delay bdev')
+    p.add_argument('name', help='delay bdev name')
+    p.set_defaults(func=bdev_delay_delete)
+
     def construct_error_bdev(args):
-        print(rpc.bdev.construct_error_bdev(args.client,
-                                            base_name=args.base_name))
+        print_json(rpc.bdev.construct_error_bdev(args.client,
+                                                 base_name=args.base_name))
 
     p = subparsers.add_parser('construct_error_bdev',
                               help='Add bdev with error injection backend')
@@ -396,10 +461,10 @@ if __name__ == "__main__":
     p.set_defaults(func=delete_error_bdev)
 
     def construct_iscsi_bdev(args):
-        print(rpc.bdev.construct_iscsi_bdev(args.client,
-                                            name=args.name,
-                                            url=args.url,
-                                            initiator_iqn=args.initiator_iqn))
+        print_json(rpc.bdev.construct_iscsi_bdev(args.client,
+                                                 name=args.name,
+                                                 url=args.url,
+                                                 initiator_iqn=args.initiator_iqn))
 
     p = subparsers.add_parser('construct_iscsi_bdev',
                               help='Add bdev with iSCSI initiator backend')
@@ -417,9 +482,9 @@ if __name__ == "__main__":
     p.set_defaults(func=delete_iscsi_bdev)
 
     def construct_pmem_bdev(args):
-        print(rpc.bdev.construct_pmem_bdev(args.client,
-                                           pmem_file=args.pmem_file,
-                                           name=args.name))
+        print_json(rpc.bdev.construct_pmem_bdev(args.client,
+                                                pmem_file=args.pmem_file,
+                                                name=args.name))
 
     p = subparsers.add_parser('construct_pmem_bdev', help='Add a bdev with pmem backend')
     p.add_argument('pmem_file', help='Path to pmemblk pool file')
@@ -435,9 +500,9 @@ if __name__ == "__main__":
     p.set_defaults(func=delete_pmem_bdev)
 
     def construct_passthru_bdev(args):
-        print(rpc.bdev.construct_passthru_bdev(args.client,
-                                               base_bdev_name=args.base_bdev_name,
-                                               name=args.name))
+        print_json(rpc.bdev.construct_passthru_bdev(args.client,
+                                                    base_bdev_name=args.base_bdev_name,
+                                                    name=args.name))
 
     p = subparsers.add_parser('construct_passthru_bdev',
                               help='Add a pass through bdev on existing bdev')
@@ -568,8 +633,7 @@ if __name__ == "__main__":
             first_burst_length=args.first_burst_length,
             immediate_data=args.immediate_data,
             error_recovery_level=args.error_recovery_level,
-            allow_duplicated_isid=args.allow_duplicated_isid,
-            min_connections_per_core=args.min_connections_per_core)
+            allow_duplicated_isid=args.allow_duplicated_isid)
 
     p = subparsers.add_parser('set_iscsi_options', help="""Set options of iSCSI subsystem""")
     p.add_argument('-f', '--auth-file', help='Path to CHAP shared secret file')
@@ -592,7 +656,6 @@ if __name__ == "__main__":
     p.add_argument('-i', '--immediate-data', help='Negotiated parameter, ImmediateData.', action='store_true')
     p.add_argument('-l', '--error-recovery-level', help='Negotiated parameter, ErrorRecoveryLevel', type=int)
     p.add_argument('-p', '--allow-duplicated-isid', help='Allow duplicated initiator session ID.', action='store_true')
-    p.add_argument('-u', '--min-connections-per-core', help='Allocation unit of connections per core', type=int)
     p.set_defaults(func=set_iscsi_options)
 
     def set_iscsi_discovery_auth(args):
@@ -991,49 +1054,24 @@ Format: 'user:u1 secret:s1 muser:mu1 msecret:ms1,user:u2 secret:s2 muser:mu2 mse
     def set_log_flag(args):
         rpc.log.set_log_flag(args.client, flag=args.flag)
 
-    p = subparsers.add_parser('set_log_flag', help='set log flag')
+    p = subparsers.add_parser('set_log_flag', help='set log flag', aliases=['set_trace_flag'])
     p.add_argument(
         'flag', help='log flag we want to set. (for example "nvme").')
     p.set_defaults(func=set_log_flag)
 
-    def set_trace_flag(args):
-        print("set_trace_flag is deprecated - use set_log_flag instead")
-        rpc.log.set_trace_flag(args.client, flag=args.flag)
-
-    p = subparsers.add_parser('set_trace_flag', help='set trace flag')
-    p.add_argument(
-        'flag', help='trace mask we want to set. (for example "nvme").')
-    p.set_defaults(func=set_trace_flag)
-
     def clear_log_flag(args):
         rpc.log.clear_log_flag(args.client, flag=args.flag)
 
-    p = subparsers.add_parser('clear_log_flag', help='clear log flag')
+    p = subparsers.add_parser('clear_log_flag', help='clear log flag', aliases=['clear_trace_flag'])
     p.add_argument(
         'flag', help='log flag we want to clear. (for example "nvme").')
     p.set_defaults(func=clear_log_flag)
 
-    def clear_trace_flag(args):
-        print("clear_trace_flag is deprecated - use clear_log_flag instead")
-        rpc.log.clear_trace_flag(args.client, flag=args.flag)
-
-    p = subparsers.add_parser('clear_trace_flag', help='clear trace flag')
-    p.add_argument(
-        'flag', help='trace mask we want to clear. (for example "nvme").')
-    p.set_defaults(func=clear_trace_flag)
-
     def get_log_flags(args):
         print_dict(rpc.log.get_log_flags(args.client))
 
-    p = subparsers.add_parser('get_log_flags', help='get log flags')
+    p = subparsers.add_parser('get_log_flags', help='get log flags', aliases=['get_trace_flags'])
     p.set_defaults(func=get_log_flags)
-
-    def get_trace_flags(args):
-        print("get_trace_flags is deprecated - use get_log_flags instead")
-        print_dict(rpc.log.get_trace_flags(args.client))
-
-    p = subparsers.add_parser('get_trace_flags', help='get trace flags')
-    p.set_defaults(func=get_trace_flags)
 
     def set_log_level(args):
         rpc.log.set_log_level(args.client, level=args.level)
@@ -1063,11 +1101,11 @@ Format: 'user:u1 secret:s1 muser:mu1 msecret:ms1,user:u2 secret:s2 muser:mu2 mse
 
     # lvol
     def construct_lvol_store(args):
-        print(rpc.lvol.construct_lvol_store(args.client,
-                                            bdev_name=args.bdev_name,
-                                            lvs_name=args.lvs_name,
-                                            cluster_sz=args.cluster_sz,
-                                            clear_method=args.clear_method))
+        print_json(rpc.lvol.construct_lvol_store(args.client,
+                                                 bdev_name=args.bdev_name,
+                                                 lvs_name=args.lvs_name,
+                                                 cluster_sz=args.cluster_sz,
+                                                 clear_method=args.clear_method))
 
     p = subparsers.add_parser('construct_lvol_store', help='Add logical volume store on base bdev')
     p.add_argument('bdev_name', help='base bdev name')
@@ -1088,13 +1126,13 @@ Format: 'user:u1 secret:s1 muser:mu1 msecret:ms1,user:u2 secret:s2 muser:mu2 mse
     p.set_defaults(func=rename_lvol_store)
 
     def construct_lvol_bdev(args):
-        print(rpc.lvol.construct_lvol_bdev(args.client,
-                                           lvol_name=args.lvol_name,
-                                           size=args.size * 1024 * 1024,
-                                           thin_provision=args.thin_provision,
-                                           clear_method=args.clear_method,
-                                           uuid=args.uuid,
-                                           lvs_name=args.lvs_name))
+        print_json(rpc.lvol.construct_lvol_bdev(args.client,
+                                                lvol_name=args.lvol_name,
+                                                size=args.size * 1024 * 1024,
+                                                thin_provision=args.thin_provision,
+                                                clear_method=args.clear_method,
+                                                uuid=args.uuid,
+                                                lvs_name=args.lvs_name))
 
     p = subparsers.add_parser('construct_lvol_bdev', help='Add a bdev with an logical volume backend')
     p.add_argument('-u', '--uuid', help='lvol store UUID', required=False)
@@ -1107,9 +1145,9 @@ Format: 'user:u1 secret:s1 muser:mu1 msecret:ms1,user:u2 secret:s2 muser:mu2 mse
     p.set_defaults(func=construct_lvol_bdev)
 
     def snapshot_lvol_bdev(args):
-        print(rpc.lvol.snapshot_lvol_bdev(args.client,
-                                          lvol_name=args.lvol_name,
-                                          snapshot_name=args.snapshot_name))
+        print_json(rpc.lvol.snapshot_lvol_bdev(args.client,
+                                               lvol_name=args.lvol_name,
+                                               snapshot_name=args.snapshot_name))
 
     p = subparsers.add_parser('snapshot_lvol_bdev', help='Create a snapshot of an lvol bdev')
     p.add_argument('lvol_name', help='lvol bdev name')
@@ -1117,9 +1155,9 @@ Format: 'user:u1 secret:s1 muser:mu1 msecret:ms1,user:u2 secret:s2 muser:mu2 mse
     p.set_defaults(func=snapshot_lvol_bdev)
 
     def clone_lvol_bdev(args):
-        print(rpc.lvol.clone_lvol_bdev(args.client,
-                                       snapshot_name=args.snapshot_name,
-                                       clone_name=args.clone_name))
+        print_json(rpc.lvol.clone_lvol_bdev(args.client,
+                                            snapshot_name=args.snapshot_name,
+                                            clone_name=args.clone_name))
 
     p = subparsers.add_parser('clone_lvol_bdev', help='Create a clone of an lvol snapshot')
     p.add_argument('snapshot_name', help='lvol snapshot name')
@@ -1261,13 +1299,34 @@ Format: 'user:u1 secret:s1 muser:mu1 msecret:ms1,user:u2 secret:s2 muser:mu2 mse
     p.set_defaults(func=destruct_split_vbdev)
 
     # ftl
+    ftl_valid_limits = ('crit', 'high', 'low', 'start')
+
     def construct_ftl_bdev(args):
+        def parse_limits(limits, arg_dict, key_suffix=''):
+            for limit in limits.split(','):
+                key, value = limit.split(':', 1)
+                if key in ftl_valid_limits:
+                    arg_dict['limit_' + key + key_suffix] = int(value)
+                else:
+                    raise ValueError('Limit {} is not supported'.format(key))
+
+        arg_limits = {}
+        if args.limit_threshold:
+            parse_limits(args.limit_threshold, arg_limits, '_threshold')
+
+        if args.limit:
+            parse_limits(args.limit, arg_limits)
+
         print_dict(rpc.bdev.construct_ftl_bdev(args.client,
                                                name=args.name,
                                                trtype=args.trtype,
                                                traddr=args.traddr,
                                                punits=args.punits,
-                                               uuid=args.uuid))
+                                               uuid=args.uuid,
+                                               cache=args.cache,
+                                               allow_open_bands=args.allow_open_bands,
+                                               overprovisioning=args.overprovisioning,
+                                               **arg_limits))
 
     p = subparsers.add_parser('construct_ftl_bdev',
                               help='Add FTL bdev')
@@ -1280,6 +1339,18 @@ Format: 'user:u1 secret:s1 muser:mu1 msecret:ms1,user:u2 secret:s2 muser:mu2 mse
                    required=True)
     p.add_argument('-u', '--uuid', help='UUID of restored bdev (not applicable when creating new '
                    'instance): e.g. b286d19a-0059-4709-abcd-9f7732b1567d (optional)')
+    p.add_argument('-c', '--cache', help='Name of the bdev to be used as a write buffer cache (optional)')
+    p.add_argument('-o', '--allow_open_bands', help='Restoring after dirty shutdown without cache will'
+                   ' result in partial data recovery, instead of error', action='store_true')
+    p.add_argument('--overprovisioning', help='Percentage of device used for relocation, not exposed'
+                   ' to user (optional)', type=int)
+
+    limits = p.add_argument_group('Defrag limits', 'Configures defrag limits and thresholds for'
+                                  ' levels ' + str(ftl_valid_limits)[1:-1])
+    limits.add_argument('--limit', help='Percentage of allowed user versus internal writes at given'
+                        ' levels, e.g. crit:0,high:20,low:80')
+    limits.add_argument('--limit-threshold', help='Number of free bands triggering a given level of'
+                        ' write limiting e.g. crit:1,high:2,low:3,start:4')
     p.set_defaults(func=construct_ftl_bdev)
 
     def delete_ftl_bdev(args):
@@ -1297,7 +1368,7 @@ Format: 'user:u1 secret:s1 muser:mu1 msecret:ms1,user:u2 secret:s2 muser:mu2 mse
 
     p = subparsers.add_parser('start_nbd_disk', help='Export a bdev as a nbd disk')
     p.add_argument('bdev_name', help='Blockdev name to be exported. Example: Malloc0.')
-    p.add_argument('nbd_device', help='Nbd device name to be assigned. Example: /dev/nbd0.')
+    p.add_argument('nbd_device', help='Nbd device name to be assigned. Example: /dev/nbd0.', nargs='?')
     p.set_defaults(func=start_nbd_disk)
 
     def stop_nbd_disk(args):
@@ -1359,7 +1430,7 @@ Format: 'user:u1 secret:s1 muser:mu1 msecret:ms1,user:u2 secret:s2 muser:mu2 mse
     p.add_argument('-s', '--conn-sched', help="""'roundrobin' - Schedule the incoming connections from any host
     on the cores in a round robin manner (Default). 'hostip' - Schedule all the incoming connections from a
     specific host IP on to the same core. Connections from different IP will be assigned to cores in a round
-    robin manner""")
+    robin manner. 'transport' - Schedule the connection according to the transport characteristics.""")
     p.set_defaults(func=set_nvmf_target_config)
 
     def nvmf_create_transport(args):
@@ -1373,7 +1444,11 @@ Format: 'user:u1 secret:s1 muser:mu1 msecret:ms1,user:u2 secret:s2 muser:mu2 mse
                                        max_aq_depth=args.max_aq_depth,
                                        num_shared_buffers=args.num_shared_buffers,
                                        buf_cache_size=args.buf_cache_size,
-                                       max_srq_depth=args.max_srq_depth)
+                                       max_srq_depth=args.max_srq_depth,
+                                       no_srq=args.no_srq,
+                                       c2h_success=args.c2h_success,
+                                       dif_insert_or_strip=args.dif_insert_or_strip,
+                                       sock_priority=args.sock_priority)
 
     p = subparsers.add_parser('nvmf_create_transport', help='Create NVMf transport')
     p.add_argument('-t', '--trtype', help='Transport type (ex. RDMA)', type=str, required=True)
@@ -1386,6 +1461,10 @@ Format: 'user:u1 secret:s1 muser:mu1 msecret:ms1,user:u2 secret:s2 muser:mu2 mse
     p.add_argument('-n', '--num-shared-buffers', help='The number of pooled data buffers available to the transport', type=int)
     p.add_argument('-b', '--buf-cache-size', help='The number of shared buffers to reserve for each poll group', type=int)
     p.add_argument('-s', '--max-srq-depth', help='Max number of outstanding I/O per SRQ. Relevant only for RDMA transport', type=int)
+    p.add_argument('-r', '--no-srq', action='store_true', help='Disable per-thread shared receive queue. Relevant only for RDMA transport')
+    p.add_argument('-o', '--c2h-success', action='store_false', help='Disable C2H success optimization. Relevant only for TCP transport')
+    p.add_argument('-f', '--dif-insert-or-strip', action='store_true', help='Enable DIF insert/strip. Relevant only for TCP transport')
+    p.add_argument('-y', '--sock-priority', help='The sock priority of the tcp connection. Relevant only for TCP transport', type=int)
     p.set_defaults(func=nvmf_create_transport)
 
     def get_nvmf_transports(args):
@@ -1406,6 +1485,7 @@ Format: 'user:u1 secret:s1 muser:mu1 msecret:ms1,user:u2 secret:s2 muser:mu2 mse
         rpc.nvmf.nvmf_subsystem_create(args.client,
                                        nqn=args.nqn,
                                        serial_number=args.serial_number,
+                                       model_number=args.model_number,
                                        allow_any_host=args.allow_any_host,
                                        max_namespaces=args.max_namespaces)
 
@@ -1414,6 +1494,9 @@ Format: 'user:u1 secret:s1 muser:mu1 msecret:ms1,user:u2 secret:s2 muser:mu2 mse
     p.add_argument("-s", "--serial-number", help="""
     Format:  'sn' etc
     Example: 'SPDK00000000000001'""", default='00000000000000000000')
+    p.add_argument("-d", "--model-number", help="""
+    Format:  'mn' etc
+    Example: 'SPDK Controller'""", default='SPDK bdev Controller')
     p.add_argument("-a", "--allow-any-host", action='store_true', help="Allow any host to connect (don't enforce host NQN whitelist)")
     p.add_argument("-m", "--max-namespaces", help="Maximum number of namespaces allowed",
                    type=int, default=0)
@@ -1465,6 +1548,7 @@ Format: 'user:u1 secret:s1 muser:mu1 msecret:ms1,user:u2 secret:s2 muser:mu2 mse
         rpc.nvmf.nvmf_subsystem_add_ns(args.client,
                                        nqn=args.nqn,
                                        bdev_name=args.bdev_name,
+                                       ptpl_file=args.ptpl_file,
                                        nsid=args.nsid,
                                        nguid=args.nguid,
                                        eui64=args.eui64,
@@ -1473,6 +1557,7 @@ Format: 'user:u1 secret:s1 muser:mu1 msecret:ms1,user:u2 secret:s2 muser:mu2 mse
     p = subparsers.add_parser('nvmf_subsystem_add_ns', help='Add a namespace to an NVMe-oF subsystem')
     p.add_argument('nqn', help='NVMe-oF subsystem NQN')
     p.add_argument('bdev_name', help='The name of the bdev that will back this namespace')
+    p.add_argument('-p', '--ptpl-file', help='The persistent reservation storage location (optional)', type=str)
     p.add_argument('-n', '--nsid', help='The requested NSID (optional)', type=int)
     p.add_argument('-g', '--nguid', help='Namespace globally unique identifier (optional)')
     p.add_argument('-e', '--eui64', help='Namespace EUI-64 identifier (optional)')
@@ -1519,6 +1604,13 @@ Format: 'user:u1 secret:s1 muser:mu1 msecret:ms1,user:u2 secret:s2 muser:mu2 mse
     p.add_argument('-e', '--enable', action='store_true', help='Enable allowing any host')
     p.add_argument('-d', '--disable', action='store_true', help='Disable allowing any host')
     p.set_defaults(func=nvmf_subsystem_allow_any_host)
+
+    def nvmf_get_stats(args):
+        print_dict(rpc.nvmf.nvmf_get_stats(args.client))
+
+    p = subparsers.add_parser(
+        'nvmf_get_stats', help='Display current statistics for NVMf subsystem')
+    p.set_defaults(func=nvmf_get_stats)
 
     # pmem
     def create_pmem_pool(args):
@@ -1590,10 +1682,10 @@ Format: 'user:u1 secret:s1 muser:mu1 msecret:ms1,user:u2 secret:s2 muser:mu2 mse
     p.set_defaults(func=construct_vhost_scsi_controller)
 
     def add_vhost_scsi_lun(args):
-        print(rpc.vhost.add_vhost_scsi_lun(args.client,
-                                           ctrlr=args.ctrlr,
-                                           scsi_target_num=args.scsi_target_num,
-                                           bdev_name=args.bdev_name))
+        print_json(rpc.vhost.add_vhost_scsi_lun(args.client,
+                                                ctrlr=args.ctrlr,
+                                                scsi_target_num=args.scsi_target_num,
+                                                bdev_name=args.bdev_name))
 
     p = subparsers.add_parser('add_vhost_scsi_lun',
                               help='Add lun to vhost controller')
@@ -1740,13 +1832,79 @@ Format: 'user:u1 secret:s1 muser:mu1 msecret:ms1,user:u2 secret:s2 muser:mu2 mse
                    help="""Command execution timeout value, in milliseconds,  if 0, don't track timeout""", type=int, default=0)
     p.set_defaults(func=send_nvme_cmd)
 
-    args = parser.parse_args()
+    # Notifications
+    def get_notification_types(args):
+        print_dict(rpc.notify.get_notification_types(args.client))
 
-    with rpc.client.JSONRPCClient(args.server_addr, args.port, args.timeout, log_level=getattr(logging, args.verbose.upper())) as client:
-        try:
+    p = subparsers.add_parser('get_notification_types', help='List available notifications that user can subscribe to.')
+    p.set_defaults(func=get_notification_types)
+
+    def get_notifications(args):
+        ret = rpc.notify.get_notifications(args.client,
+                                           id=args.id,
+                                           max=args.max)
+        print_dict(ret)
+
+    p = subparsers.add_parser('get_notifications', help='Get notifications')
+    p.add_argument('-i', '--id', help="""First ID to start fetching from""", type=int)
+    p.add_argument('-n', '--max', help="""Maximum number of notifications to return in response""", type=int)
+    p.set_defaults(func=get_notifications)
+
+    def thread_get_stats(args):
+        print_dict(rpc.app.thread_get_stats(args.client))
+
+    p = subparsers.add_parser(
+        'thread_get_stats', help='Display current statistics of all the threads')
+    p.set_defaults(func=thread_get_stats)
+
+    def check_called_name(name):
+        if name in deprecated_aliases:
+            print("{} is deprecated, use {} instead.".format(name, deprecated_aliases[name]), file=sys.stderr)
+
+    class dry_run_client:
+        def call(self, method, params=None):
+            print("Request:\n" + json.dumps({"method": method, "params": params}, indent=2))
+
+    def null_print(arg):
+        pass
+
+    def call_rpc_func(args):
+        args.func(args)
+        check_called_name(args.called_rpc_name)
+
+    def execute_script(parser, client, fd):
+        executed_rpc = ""
+        for rpc_call in map(str.rstrip, fd):
+            if not rpc_call.strip():
+                continue
+            executed_rpc = "\n".join([executed_rpc, rpc_call])
+            args = parser.parse_args(shlex.split(rpc_call))
             args.client = client
-            args.func(args)
+            try:
+                call_rpc_func(args)
+            except JSONRPCException as ex:
+                print("Exception:")
+                print(executed_rpc.strip() + " <<<")
+                print(ex.message)
+                exit(1)
+
+    args = parser.parse_args()
+    if args.dry_run:
+        args.client = dry_run_client()
+        print_dict = null_print
+        print_json = null_print
+        print_array = null_print
+    else:
+        args.client = rpc.client.JSONRPCClient(args.server_addr, args.port, args.timeout, log_level=getattr(logging, args.verbose.upper()))
+    if hasattr(args, 'func'):
+        try:
+            call_rpc_func(args)
         except JSONRPCException as ex:
-            print("Exception:")
-            print(ex.message)
+            print(ex)
             exit(1)
+    elif sys.stdin.isatty():
+        # No arguments and no data piped through stdin
+        parser.print_help()
+        exit(1)
+    else:
+        execute_script(parser, args.client, sys.stdin)

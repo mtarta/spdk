@@ -23,7 +23,7 @@ class UIRoot(UINode):
         self.methods = []
 
     def refresh(self):
-        self.methods = self.get_rpc_methods(current=True)
+        self.methods = self.rpc_get_methods(current=True)
         if self.is_init is False:
             methods = "\n".join(self.methods)
             self.shell.log.warning("SPDK Application is not yet initialized.\n"
@@ -95,11 +95,11 @@ class UIRoot(UINode):
         with open(filename, "w") as fd:
             rpc.save_subsystem_config(self.client, fd, indent, subsystem)
 
-    def get_rpc_methods(self, current=False):
-        return rpc.get_rpc_methods(self.client, current=current)
+    def rpc_get_methods(self, current=False):
+        return rpc.rpc_get_methods(self.client, current=current)
 
     def check_init(self):
-        return "start_subsystem_init" not in self.get_rpc_methods(current=True)
+        return "start_subsystem_init" not in self.rpc_get_methods(current=True)
 
     def get_bdevs(self, bdev_type):
         if self.is_init:
@@ -215,6 +215,11 @@ class UIRoot(UINode):
         rpc.pmem.delete_pmem_pool(self.client, **kwargs)
 
     @verbose
+    def pmem_pool_info(self, **kwargs):
+        response = rpc.pmem.pmem_pool_info(self.client, **kwargs)
+        return response
+
+    @verbose
     def create_pmem_bdev(self, **kwargs):
         response = rpc.bdev.construct_pmem_bdev(self.client, **kwargs)
         return response
@@ -243,6 +248,14 @@ class UIRoot(UINode):
     def remove_virtio_bdev(self, **kwargs):
         response = rpc.vhost.remove_virtio_bdev(self.client, **kwargs)
         return response
+
+    @verbose
+    def construct_raid_bdev(self, **kwargs):
+        rpc.bdev.construct_raid_bdev(self.client, **kwargs)
+
+    @verbose
+    def destroy_raid_bdev(self, **kwargs):
+        rpc.bdev.destroy_raid_bdev(self.client, **kwargs)
 
     @verbose
     @is_method_available

@@ -57,6 +57,7 @@ struct spdk_sock {
 
 struct spdk_sock_group {
 	STAILQ_HEAD(, spdk_sock_group_impl)	group_impls;
+	void					*ctx;
 };
 
 struct spdk_sock_group_impl {
@@ -81,10 +82,12 @@ struct spdk_net_impl {
 	int (*set_recvlowat)(struct spdk_sock *sock, int nbytes);
 	int (*set_recvbuf)(struct spdk_sock *sock, int sz);
 	int (*set_sendbuf)(struct spdk_sock *sock, int sz);
+	int (*set_priority)(struct spdk_sock *sock, int priority);
 
 	bool (*is_ipv6)(struct spdk_sock *sock);
 	bool (*is_ipv4)(struct spdk_sock *sock);
 
+	int (*get_placement_id)(struct spdk_sock *sock, int *placement_id);
 	struct spdk_sock_group_impl *(*group_impl_create)(void);
 	int (*group_impl_add_sock)(struct spdk_sock_group_impl *group, struct spdk_sock *sock);
 	int (*group_impl_remove_sock)(struct spdk_sock_group_impl *group, struct spdk_sock *sock);

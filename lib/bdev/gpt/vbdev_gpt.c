@@ -97,7 +97,7 @@ spdk_gpt_base_free(void *ctx)
 {
 	struct gpt_base *gpt_base = ctx;
 
-	spdk_dma_free(gpt_base->gpt.buf);
+	spdk_free(gpt_base->gpt.buf);
 	free(gpt_base);
 }
 
@@ -147,7 +147,8 @@ spdk_gpt_base_bdev_init(struct spdk_bdev *bdev)
 	gpt = &gpt_base->gpt;
 	gpt->parse_phase = SPDK_GPT_PARSE_PHASE_PRIMARY;
 	gpt->buf_size = spdk_max(SPDK_GPT_BUFFER_SIZE, bdev->blocklen);
-	gpt->buf = spdk_dma_zmalloc(gpt->buf_size, spdk_bdev_get_buf_align(bdev), NULL);
+	gpt->buf = spdk_zmalloc(gpt->buf_size, spdk_bdev_get_buf_align(bdev), NULL,
+				SPDK_ENV_LCORE_ID_ANY, SPDK_MALLOC_DMA);
 	if (!gpt->buf) {
 		SPDK_ERRLOG("Cannot alloc buf\n");
 		spdk_bdev_part_base_free(gpt_base->part_base);
@@ -171,11 +172,14 @@ vbdev_gpt_destruct(void *ctx)
 }
 
 static void
+_vbdev_gpt_submit_request(struct spdk_io_channel *_ch, struct spdk_bdev_io *bdev_io);
+
+static void
 vbdev_gpt_resubmit_request(void *arg)
 {
 	struct gpt_io *io = (struct gpt_io *)arg;
 
-	vbdev_gpt_submit_request(io->ch, io->bdev_io);
+	_vbdev_gpt_submit_request(io->ch, io->bdev_io);
 }
 
 static void
@@ -196,7 +200,18 @@ vbdev_gpt_queue_io(struct gpt_io *io)
 }
 
 static void
-vbdev_gpt_submit_request(struct spdk_io_channel *_ch, struct spdk_bdev_io *bdev_io)
+vbdev_gpt_get_buf_cb(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io, bool success)
+{
+	if (!success) {
+		spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
+		return;
+	}
+
+	_vbdev_gpt_submit_request(ch, bdev_io);
+}
+
+static void
+_vbdev_gpt_submit_request(struct spdk_io_channel *_ch, struct spdk_bdev_io *bdev_io)
 {
 	struct gpt_channel *ch = spdk_io_channel_get_ctx(_ch);
 	struct gpt_io *io = (struct gpt_io *)bdev_io->driver_ctx;
@@ -213,6 +228,20 @@ vbdev_gpt_submit_request(struct spdk_io_channel *_ch, struct spdk_bdev_io *bdev_
 			SPDK_ERRLOG("gpt: error on bdev_io submission, rc=%d.\n", rc);
 			spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
 		}
+	}
+}
+
+static void
+vbdev_gpt_submit_request(struct spdk_io_channel *_ch, struct spdk_bdev_io *bdev_io)
+{
+	switch (bdev_io->type) {
+	case SPDK_BDEV_IO_TYPE_READ:
+		spdk_bdev_io_get_buf(bdev_io, vbdev_gpt_get_buf_cb,
+				     bdev_io->u.bdev.num_blocks * bdev_io->bdev->blocklen);
+		break;
+	default:
+		_vbdev_gpt_submit_request(_ch, bdev_io);
+		break;
 	}
 }
 

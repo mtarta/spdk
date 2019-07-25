@@ -52,7 +52,8 @@ vbdev_ocf_ctx_data_alloc(uint32_t pages)
 	data = vbdev_ocf_data_alloc(1);
 
 	sz = pages * PAGE_SIZE;
-	buf = spdk_dma_malloc(sz, PAGE_SIZE, NULL);
+	buf = spdk_malloc(sz, PAGE_SIZE, NULL,
+			  SPDK_ENV_LCORE_ID_ANY, SPDK_MALLOC_DMA);
 	if (buf == NULL) {
 		return NULL;
 	}
@@ -75,7 +76,7 @@ vbdev_ocf_ctx_data_free(ctx_data_t *ctx_data)
 	}
 
 	for (i = 0; i < data->iovcnt; i++) {
-		spdk_dma_free(data->iovs[i].iov_base);
+		spdk_free(data->iovs[i].iov_base);
 	}
 
 	vbdev_ocf_data_free(data);
@@ -224,11 +225,11 @@ vbdev_ocf_ctx_data_seek(ctx_data_t *dst, ctx_data_seek_t seek, uint32_t offset)
 
 	switch (seek) {
 	case ctx_data_seek_begin:
-		off = MIN(off, d->size);
+		off = MIN(offset, d->size);
 		d->seek = off;
 		break;
 	case ctx_data_seek_current:
-		off = MIN(off, d->size - d->seek);
+		off = MIN(offset, d->size - d->seek);
 		d->seek += off;
 		break;
 	}
@@ -287,31 +288,185 @@ vbdev_ocf_ctx_data_secure_erase(ctx_data_t *ctx_data)
 	}
 }
 
+int vbdev_ocf_queue_create(ocf_cache_t cache, ocf_queue_t *queue, const struct ocf_queue_ops *ops)
+{
+	int rc;
+	struct vbdev_ocf_cache_ctx *ctx = ocf_cache_get_priv(cache);
+
+	pthread_mutex_lock(&ctx->lock);
+	rc = ocf_queue_create(cache, queue, ops);
+	pthread_mutex_unlock(&ctx->lock);
+	return rc;
+}
+
+void vbdev_ocf_queue_put(ocf_queue_t queue)
+{
+	ocf_cache_t cache = ocf_queue_get_cache(queue);
+	struct vbdev_ocf_cache_ctx *ctx = ocf_cache_get_priv(cache);
+
+	pthread_mutex_lock(&ctx->lock);
+	ocf_queue_put(queue);
+	pthread_mutex_unlock(&ctx->lock);
+}
+
+void vbdev_ocf_cache_ctx_put(struct vbdev_ocf_cache_ctx *ctx)
+{
+	if (env_atomic_dec_return(&ctx->refcnt) == 0) {
+		pthread_mutex_destroy(&ctx->lock);
+		free(ctx);
+	}
+}
+
+void vbdev_ocf_cache_ctx_get(struct vbdev_ocf_cache_ctx *ctx)
+{
+	env_atomic_inc(&ctx->refcnt);
+}
+
+struct cleaner_priv {
+	struct spdk_poller *poller;
+	ocf_queue_t         queue;
+	uint64_t            next_run;
+};
+
+static int
+cleaner_poll(void *arg)
+{
+	ocf_cleaner_t cleaner = arg;
+	struct cleaner_priv *priv = ocf_cleaner_get_priv(cleaner);
+	uint32_t iono = ocf_queue_pending_io(priv->queue);
+	int i, max = spdk_min(32, iono);
+
+	for (i = 0; i < max; i++) {
+		ocf_queue_run_single(priv->queue);
+	}
+
+	if (spdk_get_ticks() >= priv->next_run) {
+		ocf_cleaner_run(cleaner, priv->queue);
+		return 1;
+	}
+
+	if (iono > 0) {
+		return 1;
+	} else {
+		return 0;
+	}
+}
+
+static void
+cleaner_cmpl(ocf_cleaner_t c, uint32_t interval)
+{
+	struct cleaner_priv *priv = ocf_cleaner_get_priv(c);
+
+	priv->next_run = spdk_get_ticks() + ((interval * spdk_get_ticks_hz()) / 1000);
+}
+
+static void
+cleaner_queue_kick(ocf_queue_t q)
+{
+}
+
+static void
+cleaner_queue_stop(ocf_queue_t q)
+{
+	struct cleaner_priv *cpriv = ocf_queue_get_priv(q);
+
+	if (cpriv) {
+		spdk_poller_unregister(&cpriv->poller);
+		free(cpriv);
+	}
+}
+
+const struct ocf_queue_ops cleaner_queue_ops = {
+	.kick_sync = cleaner_queue_kick,
+	.kick = cleaner_queue_kick,
+	.stop = cleaner_queue_stop,
+};
+
 static int
 vbdev_ocf_ctx_cleaner_init(ocf_cleaner_t c)
 {
-	/* TODO [writeback]: implement with writeback mode support */
+	int rc;
+	struct cleaner_priv        *priv  = calloc(1, sizeof(*priv));
+	ocf_cache_t                 cache = ocf_cleaner_get_cache(c);
+	struct vbdev_ocf_cache_ctx *cctx  = ocf_cache_get_priv(cache);
+
+	if (priv == NULL) {
+		return -ENOMEM;
+	}
+
+	rc = vbdev_ocf_queue_create(cache, &priv->queue, &cleaner_queue_ops);
+	if (rc) {
+		free(priv);
+		return rc;
+	}
+
+	ocf_queue_set_priv(priv->queue, priv);
+
+	cctx->cleaner_queue  = priv->queue;
+
+	ocf_cleaner_set_cmpl(c, cleaner_cmpl);
+	ocf_cleaner_set_priv(c, priv);
+
 	return 0;
 }
 
 static void
 vbdev_ocf_ctx_cleaner_stop(ocf_cleaner_t c)
 {
-	/* TODO [writeback]: implement with writeback mode support */
+	struct cleaner_priv *priv = ocf_cleaner_get_priv(c);
+
+	vbdev_ocf_queue_put(priv->queue);
 }
 
-static int vbdev_ocf_volume_updater_init(ocf_metadata_updater_t mu)
+static void
+vbdev_ocf_ctx_cleaner_kick(ocf_cleaner_t cleaner)
 {
-	/* TODO [metadata]: implement with persistent metadata support */
+	struct cleaner_priv *priv  = ocf_cleaner_get_priv(cleaner);
+
+	if (priv->poller) {
+		return;
+	}
+
+	/* We start cleaner poller at the same thread where cache was created
+	 * TODO: allow user to specify core at which cleaner should run */
+	priv->poller = spdk_poller_register(cleaner_poll, cleaner, 0);
+}
+
+static void
+vbdev_ocf_md_kick(void *ctx)
+{
+	ocf_metadata_updater_t mu = ctx;
+	ocf_cache_t cache = ocf_metadata_updater_get_cache(mu);
+
+	if (ocf_cache_is_running(cache)) {
+		ocf_metadata_updater_run(mu);
+	}
+}
+
+static int
+vbdev_ocf_volume_updater_init(ocf_metadata_updater_t mu)
+{
+	struct spdk_thread *md_thread = spdk_get_thread();
+
+	ocf_metadata_updater_set_priv(mu, md_thread);
+
 	return 0;
 }
-static void vbdev_ocf_volume_updater_stop(ocf_metadata_updater_t mu)
+
+static void
+vbdev_ocf_volume_updater_stop(ocf_metadata_updater_t mu)
 {
-	/* TODO [metadata]: implement with persistent metadata support */
+
 }
-static void vbdev_ocf_volume_updater_kick(ocf_metadata_updater_t mu)
+
+static void
+vbdev_ocf_volume_updater_kick(ocf_metadata_updater_t mu)
 {
-	/* TODO [metadata]: implement with persistent metadata support */
+	struct spdk_thread *md_thread = ocf_metadata_updater_get_priv(mu);
+
+	/* We need to send message to updater thread because
+	 * kick can happen from any thread */
+	spdk_thread_send_msg(md_thread, vbdev_ocf_md_kick, mu);
 }
 
 /* This function is main way by which OCF communicates with user
@@ -361,10 +516,11 @@ static const struct ocf_ctx_config vbdev_ocf_ctx_cfg = {
 		.cleaner = {
 			.init = vbdev_ocf_ctx_cleaner_init,
 			.stop = vbdev_ocf_ctx_cleaner_stop,
+			.kick = vbdev_ocf_ctx_cleaner_kick,
 		},
 
 		.logger = {
-			.printf = vbdev_ocf_ctx_log_printf,
+			.print = vbdev_ocf_ctx_log_printf,
 			.dump_stack = NULL,
 		},
 

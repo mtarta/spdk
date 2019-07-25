@@ -152,7 +152,7 @@ def case_message(func):
             # Provisioning
             650: 'thin_provisioning_check_space',
             651: 'thin_provisioning_read_empty_bdev',
-            652: 'thin_provisionind_data_integrity_test',
+            652: 'thin_provisioning_data_integrity_test',
             653: 'thin_provisioning_resize',
             654: 'thin_overprovisioning',
             655: 'thin_provisioning_filling_disks_less_than_lvs_size',
@@ -172,6 +172,8 @@ def case_message(func):
             758: 'decouple_parent',
             759: 'decouple_parent_rw',
             760: 'set_read_only',
+            761: 'delete_snapshot',
+            762: 'delete_snapshot_with_snapshot',
             # logical volume rename tests
             800: 'rename_positive',
             801: 'rename_lvs_nonexistent',
@@ -1300,12 +1302,8 @@ class TestCases(object):
         fail_count += self.c.snapshot_lvol_bdev(clone_bdev['name'], snapshot_name2)
         snapshot_bdev2 = self.c.get_lvol_bdev_with_name(self.lvs_name + "/" + snapshot_name2)
 
-        # Try to destroy snapshots with clones and check if it fails
+        # Try to destroy snapshot with 2 clones and check if it fails
         ret_value = self.c.destroy_lvol_bdev(snapshot_bdev['name'])
-        if ret_value == 0:
-            print("ERROR: Delete snapshot should fail but didn't")
-            fail_count += 1
-        ret_value = self.c.destroy_lvol_bdev(snapshot_bdev2['name'])
         if ret_value == 0:
             print("ERROR: Delete snapshot should fail but didn't")
             fail_count += 1
@@ -2078,6 +2076,9 @@ class TestCases(object):
         self.c.construct_aio_bdev(aio_bdev0, base_name_1M, 4096)
         self.c.construct_aio_bdev(aio_bdev1, base_name_32M, 4096)
 
+        # wait 1 second to allow time for lvolstore tasting
+        sleep(1)
+
         # Check if configuration was properly loaded after tasting
         # get all info all lvs and lvol bdevs, compare with previous info
         new_bdevs = sorted(self.c.get_lvol_bdevs(), key=lambda x: x["name"])
@@ -2704,12 +2705,6 @@ class TestCases(object):
         fail_count += self.c.snapshot_lvol_bdev(lvol_bdev['name'], snapshot_name)
         snapshot_bdev = self.c.get_lvol_bdev_with_name(self.lvs_name + "/" + snapshot_name)
 
-        # Try to destroy snapshot and check if it fails
-        ret_value = self.c.destroy_lvol_bdev(snapshot_bdev['name'])
-        if ret_value == 0:
-            print("ERROR: Delete snapshot should fail but didn't")
-            fail_count += 1
-
         # Decouple parent lvol bdev
         fail_count += self.c.decouple_parent_lvol_bdev(lvol_bdev['name'])
         lvol_bdev = self.c.get_lvol_bdev_with_name(uuid_bdev0)
@@ -2807,12 +2802,6 @@ class TestCases(object):
             fail_count += self.run_fio_test(nbd_name, begin_fill * MEGABYTE,
                                             fill_range * MEGABYTE, "read", pattern[i])
 
-        # Delete snapshot and check if it fails
-        ret_value = self.c.destroy_lvol_bdev(snapshot_bdev2['name'])
-        if ret_value == 0:
-            print("ERROR: Delete snapshot should fail but didn't")
-            fail_count += 1
-
         # Decouple parent
         fail_count += self.c.decouple_parent_lvol_bdev(lvol_bdev['name'])
         lvol_bdev = self.c.get_lvol_bdev_with_name(uuid_bdev0)
@@ -2903,6 +2892,205 @@ class TestCases(object):
         fail_count += self.c.destroy_lvol_bdev(clone_bdev['name'])
         # Destroy lvol bdev
         fail_count += self.c.destroy_lvol_bdev(lvol_bdev['name'])
+        # Destroy lvol store
+        fail_count += self.c.destroy_lvol_store(uuid_store)
+        # Delete malloc bdev
+        fail_count += self.c.delete_malloc_bdev(base_name)
+
+        # Expected result:
+        # - calls successful, return code = 0
+        # - no other operation fails
+        return fail_count
+
+    @case_message
+    def test_case761(self):
+        """
+        delete_snapshot
+
+        Check if it is possible to delete snapshot with clone
+        """
+        fail_count = 0
+        nbd_name0 = "/dev/nbd0"
+        nbd_name1 = "/dev/nbd1"
+        snapshot_name = "snapshot"
+        # Construct malloc bdev
+        base_name = self.c.construct_malloc_bdev(self.total_size,
+                                                 self.block_size)
+        # Construct lvol store on malloc bdev
+        uuid_store = self.c.construct_lvol_store(base_name,
+                                                 self.lvs_name)
+        fail_count += self.c.check_get_lvol_stores(base_name, uuid_store,
+                                                   self.cluster_size)
+
+        # Create lvol bdev with 50% of lvol store space
+        lvs = self.c.get_lvol_stores()[0]
+        bdev_size = self.get_lvs_divided_size(2)
+        bdev_name = self.c.construct_lvol_bdev(uuid_store, self.lbd_name,
+                                               bdev_size)
+        lvol_bdev = self.c.get_lvol_bdev_with_name(bdev_name)
+
+        # Perform write operation on lvol
+        fail_count += self.c.start_nbd_disk(lvol_bdev['name'], nbd_name0)
+        size = bdev_size * MEGABYTE
+        fail_count += self.run_fio_test(nbd_name0, 0, size, "write", "0xcc")
+
+        # Create snapshot of lvol bdev
+        fail_count += self.c.snapshot_lvol_bdev(lvol_bdev['name'], snapshot_name)
+        snapshot_bdev = self.c.get_lvol_bdev_with_name(self.lvs_name + "/" + snapshot_name)
+        if snapshot_bdev['driver_specific']['lvol']['clone'] is not False\
+                or snapshot_bdev['driver_specific']['lvol']['snapshot'] is not True:
+            fail_count += 1
+
+        # Fill first half of lvol bdev
+        half_size = bdev_size * MEGABYTE / 2
+        lvol_bdev = self.c.get_lvol_bdev_with_name(bdev_name)
+        fail_count += self.run_fio_test(nbd_name0, 0, half_size-1, "write", "0xee")
+
+        # Check if snapshot was unchanged
+        fail_count += self.c.start_nbd_disk(snapshot_bdev['name'], nbd_name1)
+        fail_count += self.run_fio_test(nbd_name1, 0, half_size-1, "read", "0xcc")
+
+        # Verify lvol bdev
+        fail_count += self.run_fio_test(nbd_name0, 0, half_size-1, "read", "0xee")
+        if lvol_bdev['driver_specific']['lvol']['clone'] is not True:
+            fail_count += 1
+
+        # Delete snapshot - should succeed
+        fail_count += self.c.stop_nbd_disk(nbd_name1)
+        fail_count += self.c.destroy_lvol_bdev(snapshot_bdev['name'])
+
+        # Check data consistency
+        lvol_bdev = self.c.get_lvol_bdev_with_name(bdev_name)
+        if lvol_bdev['driver_specific']['lvol']['clone'] is not False:
+            fail_count += 1
+        fail_count += self.run_fio_test(nbd_name0, 0, half_size-1, "read", "0xee")
+        fail_count += self.run_fio_test(nbd_name0, half_size, size-1, "read", "0xcc")
+
+        # Destroy lvol bdev
+        fail_count += self.c.stop_nbd_disk(nbd_name0)
+        fail_count += self.c.destroy_lvol_bdev(lvol_bdev['name'])
+
+        # Destroy lvol store
+        fail_count += self.c.destroy_lvol_store(uuid_store)
+        # Delete malloc bdev
+        fail_count += self.c.delete_malloc_bdev(base_name)
+
+        # Expected result:
+        # - calls successful, return code = 0
+        # - no other operation fails
+        return fail_count
+
+    @case_message
+    def test_case762(self):
+        """
+        delete_snapshot_with_snapshot
+
+        Check if it is possible to delete snapshot with one snapshot on it
+        """
+        fail_count = 0
+        nbd_name0 = "/dev/nbd0"
+        nbd_name1 = "/dev/nbd1"
+        nbd_name2 = "/dev/nbd2"
+        snapshot_name = "snapshot"
+        snapshot_name2 = "snapshot2"
+        # Construct malloc bdev
+        base_name = self.c.construct_malloc_bdev(self.total_size,
+                                                 self.block_size)
+        # Construct lvol store on malloc bdev
+        uuid_store = self.c.construct_lvol_store(base_name,
+                                                 self.lvs_name)
+        fail_count += self.c.check_get_lvol_stores(base_name, uuid_store,
+                                                   self.cluster_size)
+
+        # Create lvol bdev with one third of lvol store space
+        lvs = self.c.get_lvol_stores()[0]
+        bdev_size = self.get_lvs_divided_size(3)
+        bdev_name = self.c.construct_lvol_bdev(uuid_store, self.lbd_name,
+                                               bdev_size)
+        lvol_bdev = self.c.get_lvol_bdev_with_name(bdev_name)
+
+        # Perform write operation on lvol
+        fail_count += self.c.start_nbd_disk(lvol_bdev['name'], nbd_name0)
+        size = bdev_size * MEGABYTE
+        fail_count += self.run_fio_test(nbd_name0, 0, size-1, "write", "0xcc")
+
+        # Create snapshot of lvol bdev
+        fail_count += self.c.snapshot_lvol_bdev(lvol_bdev['name'], snapshot_name)
+        snapshot_bdev = self.c.get_lvol_bdev_with_name(self.lvs_name + "/" + snapshot_name)
+        lvol_bdev = self.c.get_lvol_bdev_with_name(bdev_name)
+        if lvol_bdev['driver_specific']['lvol']['base_snapshot'] != snapshot_name:
+            fail_count += 1
+
+        # Fill second 1/3 of lvol bdev
+        first_part = int(size / 3)
+        second_part = int(size / 3 * 2)
+        fail_count += self.run_fio_test(nbd_name0, first_part, second_part-first_part, "write", "0xee")
+
+        # Check if snapshot was unchanged
+        fail_count += self.c.start_nbd_disk(snapshot_bdev['name'], nbd_name1)
+        fail_count += self.run_fio_test(nbd_name1, 0, size-1, "read", "0xcc")
+
+        # Create second snapshot of lvol_bdev
+        # First snapshot becomes snapshot of second snapshot
+        fail_count += self.c.snapshot_lvol_bdev(lvol_bdev['name'], snapshot_name2)
+        snapshot_bdev2 = self.c.get_lvol_bdev_with_name(self.lvs_name + "/" + snapshot_name2)
+        snapshot_bdev = self.c.get_lvol_bdev_with_name(self.lvs_name + "/" + snapshot_name)
+        if snapshot_bdev2['driver_specific']['lvol']['base_snapshot'] != snapshot_name:
+            fail_count += 1
+        if self.lbd_name not in snapshot_bdev2['driver_specific']['lvol']['clones']:
+            fail_count += 1
+        if snapshot_bdev2['driver_specific']['lvol']['clone'] is not True\
+                or snapshot_bdev2['driver_specific']['lvol']['snapshot'] is not True:
+            fail_count += 1
+        if snapshot_name2 not in snapshot_bdev['driver_specific']['lvol']['clones']:
+            fail_count += 1
+
+        # Verify snapshots
+        fail_count += self.run_fio_test(nbd_name1, 0, size-1, "read", "0xcc")
+        fail_count += self.c.start_nbd_disk(snapshot_bdev2['name'], nbd_name2)
+        fail_count += self.run_fio_test(nbd_name2, 0, first_part-1, "read", "0xcc")
+        fail_count += self.run_fio_test(nbd_name2, first_part, second_part-first_part, "read", "0xee")
+        fail_count += self.run_fio_test(nbd_name2, second_part, size-second_part, "read", "0xcc")
+
+        # Verify lvol bdev
+        fail_count += self.run_fio_test(nbd_name0, first_part, second_part-first_part, "read", "0xee")
+        fail_count += self.run_fio_test(nbd_name0, second_part, size-second_part, "read", "0xcc")
+        lvol_bdev = self.c.get_lvol_bdev_with_name(bdev_name)
+        if lvol_bdev['driver_specific']['lvol']['clone'] is not True:
+            fail_count += 1
+        if lvol_bdev['driver_specific']['lvol']['base_snapshot'] != snapshot_name2:
+            fail_count += 1
+
+        # Fill third part of lvol bdev
+        fail_count += self.run_fio_test(nbd_name0, second_part, size-second_part, "write", "0xdd")
+
+        # Verify snapshots
+        fail_count += self.run_fio_test(nbd_name1, 0, size-1, "read", "0xcc")
+        fail_count += self.c.stop_nbd_disk(nbd_name1)
+        fail_count += self.run_fio_test(nbd_name2, second_part, size-second_part, "read", "0xcc")
+        fail_count += self.c.stop_nbd_disk(nbd_name2)
+
+        # Delete snapshot - should succeed
+        fail_count += self.c.destroy_lvol_bdev(snapshot_bdev2['name'])
+
+        # Check data consistency
+        snapshot_bdev = self.c.get_lvol_bdev_with_name(self.lvs_name + "/" + snapshot_name)
+        lvol_bdev = self.c.get_lvol_bdev_with_name(bdev_name)
+        if lvol_bdev['driver_specific']['lvol']['clone'] is not True:
+            fail_count += 1
+        if lvol_bdev['driver_specific']['lvol']['base_snapshot'] != snapshot_name:
+            fail_count += 1
+        if self.lbd_name not in snapshot_bdev['driver_specific']['lvol']['clones']:
+            fail_count += 1
+        fail_count += self.run_fio_test(nbd_name0, first_part, second_part-first_part, "read", "0xee")
+        fail_count += self.run_fio_test(nbd_name0, second_part, size-second_part, "read", "0xdd")
+        fail_count += self.c.stop_nbd_disk(nbd_name0)
+
+        # Destroy snapshot
+        fail_count += self.c.destroy_lvol_bdev(snapshot_bdev['name'])
+        # Destroy lvol bdev
+        fail_count += self.c.destroy_lvol_bdev(lvol_bdev['name'])
+
         # Destroy lvol store
         fail_count += self.c.destroy_lvol_store(uuid_store)
         # Delete malloc bdev

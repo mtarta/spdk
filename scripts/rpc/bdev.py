@@ -15,6 +15,42 @@ def set_bdev_options(client, bdev_io_pool_size=None, bdev_io_cache_size=None):
     return client.call('set_bdev_options', params)
 
 
+def construct_compress_bdev(client, base_bdev_name, pm_path):
+    """Construct a compress virtual block device.
+
+    Args:
+        base_bdev_name: name of the underlying base bdev
+        pm_path: path to persistent memory
+
+    Returns:
+        Name of created virtual block device.
+    """
+    params = {'base_bdev_name': base_bdev_name, 'pm_path': pm_path}
+
+    return client.call('construct_compress_bdev', params)
+
+
+def delete_compress_bdev(client, name):
+    """Delete compress virtual block device.
+
+    Args:
+        name: name of compress vbdev to delete
+    """
+    params = {'name': name}
+    return client.call('delete_compress_bdev', params)
+
+
+def set_compress_pmd(client, pmd):
+    """Set pmd options for the bdev compress.
+
+    Args:
+        pmd: 0 = auto-select, 1 = QAT, 2 = ISAL
+    """
+    params = {'pmd': pmd}
+
+    return client.call('set_compress_pmd', params)
+
+
 def construct_crypto_bdev(client, base_bdev_name, name, crypto_pmd, key):
     """Construct a crypto virtual block device.
 
@@ -47,7 +83,7 @@ def construct_ocf_bdev(client, name, mode, cache_bdev_name, core_bdev_name):
 
     Args:
         name: name of constructed OCF bdev
-        mode: OCF cache mode: {'wt', 'pt'}
+        mode: OCF cache mode: {'wb', 'wt', 'pt'}
         cache_bdev_name: name of underlying cache bdev
         core_bdev_name: name of underlying core bdev
 
@@ -85,15 +121,19 @@ def get_ocf_stats(client, name):
     return client.call('get_ocf_stats', params)
 
 
-def get_ocf_bdevs(client):
+def get_ocf_bdevs(client, name=None):
     """Get list of OCF devices including unregistered ones
 
     Args:
+        name: name of OCF vbdev or name of cache device or name of core device (optional)
 
     Returns:
         Array of OCF devices with their current status
     """
-    return client.call('get_ocf_bdevs', None)
+    params = None
+    if name:
+        params = {'name': name}
+    return client.call('get_ocf_bdevs', params)
 
 
 def construct_malloc_bdev(client, num_blocks, block_size, name=None, uuid=None):
@@ -169,7 +209,7 @@ def get_raid_bdevs(client, category):
 
 
 def construct_raid_bdev(client, name, raid_level, base_bdevs, strip_size=None, strip_size_kb=None):
-    """Construct pooled device. Either strip size arg will work but one is required.
+    """Construct raid bdev. Either strip size arg will work but one is required.
 
     Args:
         name: user defined raid bdev name
@@ -193,7 +233,7 @@ def construct_raid_bdev(client, name, raid_level, base_bdevs, strip_size=None, s
 
 
 def destroy_raid_bdev(client, name):
-    """Destroy pooled device
+    """Destroy raid bdev
 
     Args:
         name: raid bdev name
@@ -394,6 +434,41 @@ def construct_error_bdev(client, base_name):
     return client.call('construct_error_bdev', params)
 
 
+def bdev_delay_create(client, base_bdev_name, name, avg_read_latency, p99_read_latency, avg_write_latency, p99_write_latency):
+    """Construct a delay block device.
+
+    Args:
+        base_bdev_name: name of the existing bdev
+        name: name of block device
+        avg_read_latency: complete 99% of read ops with this delay
+        p99_read_latency: complete 1% of read ops with this delay
+        avg_write_latency: complete 99% of write ops with this delay
+        p99_write_latency: complete 1% of write ops with this delay
+
+    Returns:
+        Name of created block device.
+    """
+    params = {
+        'base_bdev_name': base_bdev_name,
+        'name': name,
+        'avg_read_latency': avg_read_latency,
+        'p99_read_latency': p99_read_latency,
+        'avg_write_latency': avg_write_latency,
+        'p99_write_latency': p99_write_latency,
+    }
+    return client.call('bdev_delay_create', params)
+
+
+def bdev_delay_delete(client, name):
+    """Remove delay bdev from the system.
+
+    Args:
+        name: name of delay bdev to delete
+    """
+    params = {'name': name}
+    return client.call('bdev_delay_delete', params)
+
+
 def delete_error_bdev(client, name):
     """Remove error bdev from the system.
 
@@ -521,7 +596,7 @@ def destruct_split_vbdev(client, base_bdev):
     return client.call('destruct_split_vbdev', params)
 
 
-def construct_ftl_bdev(client, name, trtype, traddr, punits, uuid=None):
+def construct_ftl_bdev(client, name, trtype, traddr, punits, **kwargs):
     """Construct FTL bdev
 
     Args:
@@ -529,14 +604,16 @@ def construct_ftl_bdev(client, name, trtype, traddr, punits, uuid=None):
         trtype: transport type
         traddr: transport address
         punit: parallel unit range
-        uuid: UUID of the device
+        kwargs: optional parameters
     """
     params = {'name': name,
               'trtype': trtype,
               'traddr': traddr,
               'punits': punits}
-    if uuid:
-        params['uuid'] = uuid
+    for key, value in kwargs.items():
+        if value is not None:
+            params[key] = value
+
     return client.call('construct_ftl_bdev', params)
 
 

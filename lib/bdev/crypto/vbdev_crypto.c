@@ -38,7 +38,7 @@
 #include "spdk/endian.h"
 #include "spdk/io_channel.h"
 #include "spdk/bdev_module.h"
-
+#include "spdk_internal/log.h"
 
 #include <rte_config.h>
 #include <rte_version.h>
@@ -127,6 +127,7 @@ static void _complete_internal_read(struct spdk_bdev_io *bdev_io, bool success, 
 static void _complete_internal_write(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg);
 static void vbdev_crypto_examine(struct spdk_bdev *bdev);
 static int vbdev_crypto_claim(struct spdk_bdev *bdev);
+static void vbdev_crypto_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io);
 
 /* list of crypto_bdev names and their base bdevs via configuration file.
  * Used so we can parse the conf once at init and use this list in examine().
@@ -192,6 +193,10 @@ struct crypto_bdev_io {
 	uint64_t cry_num_blocks;			/* num of blocks for the contiguous buffer */
 	uint64_t cry_offset_blocks;			/* block offset on media */
 	struct iovec cry_iov;				/* iov representing contig write buffer */
+
+	/* for bdev_io_wait */
+	struct spdk_bdev_io_wait_entry bdev_io_wait;
+	struct spdk_io_channel *ch;
 };
 
 /* Called by vbdev_crypto_init_crypto_drivers() to init each discovered crypto device */
@@ -626,6 +631,9 @@ _crypto_operation(struct spdk_bdev_io *bdev_io, enum rte_crypto_cipher_operation
 	}
 
 	/* Allocate crypto operations. */
+#ifdef DEBUG
+	memset(crypto_ops, 0, sizeof(crypto_ops));
+#endif
 	allocated = rte_crypto_op_bulk_alloc(g_crypto_op_mp,
 					     RTE_CRYPTO_OP_TYPE_SYMMETRIC,
 					     crypto_ops, cryop_cnt);
@@ -647,8 +655,9 @@ _crypto_operation(struct spdk_bdev_io *bdev_io, enum rte_crypto_cipher_operation
 		 * has a buffer, which ours always will.  So, until we modify that API
 		 * or better yet the current ZCOPY work lands, this is the best we can do.
 		 */
-		io_ctx->cry_iov.iov_base = spdk_dma_malloc(total_length,
-					   spdk_bdev_get_buf_align(bdev_io->bdev), NULL);
+		io_ctx->cry_iov.iov_base = spdk_malloc(total_length,
+						       spdk_bdev_get_buf_align(bdev_io->bdev), NULL,
+						       SPDK_ENV_LCORE_ID_ANY, SPDK_MALLOC_DMA);
 		if (!io_ctx->cry_iov.iov_base) {
 			SPDK_ERRLOG("ERROR trying to allocate write buffer for encryption!\n");
 			rc = -ENOMEM;
@@ -664,7 +673,7 @@ _crypto_operation(struct spdk_bdev_io *bdev_io, enum rte_crypto_cipher_operation
 	io_ctx->cryop_cnt_remaining = cryop_cnt;
 
 	/* As we don't support chaining because of a decision to use LBA as IV, construction
-	 * of crypto operaations is straightforward. We build both the op, the mbuf and the
+	 * of crypto operations is straightforward. We build both the op, the mbuf and the
 	 * dst_mbuf in our local arrays by looping through the length of the bdev IO and
 	 * picking off LBA sized blocks of memory from the IOVs as we walk through them. Each
 	 * LBA sized chunck of memory will correspond 1:1 to a crypto operation and a single
@@ -871,7 +880,7 @@ _complete_internal_write(struct spdk_bdev_io *bdev_io, bool success, void *cb_ar
 	int status = success ? SPDK_BDEV_IO_STATUS_SUCCESS : SPDK_BDEV_IO_STATUS_FAILED;
 	struct crypto_bdev_io *orig_ctx = (struct crypto_bdev_io *)orig_io->driver_ctx;
 
-	spdk_dma_free(orig_ctx->cry_iov.iov_base);
+	spdk_free(orig_ctx->cry_iov.iov_base);
 	spdk_bdev_io_complete(orig_io, status);
 	spdk_bdev_free_io(bdev_io);
 }
@@ -888,15 +897,42 @@ _complete_internal_read(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg
 		/* Save off this bdev_io so it can be freed after decryption. */
 		orig_ctx->read_io = bdev_io;
 
-		if (_crypto_operation(orig_io, RTE_CRYPTO_CIPHER_OP_DECRYPT)) {
+		if (!_crypto_operation(orig_io, RTE_CRYPTO_CIPHER_OP_DECRYPT)) {
+			return;
+		} else {
 			SPDK_ERRLOG("ERROR decrypting\n");
-			spdk_bdev_io_complete(orig_io, SPDK_BDEV_IO_STATUS_FAILED);
-			spdk_bdev_free_io(bdev_io);
 		}
 	} else {
 		SPDK_ERRLOG("ERROR on read prior to decrypting\n");
-		spdk_bdev_io_complete(orig_io, SPDK_BDEV_IO_STATUS_FAILED);
-		spdk_bdev_free_io(bdev_io);
+	}
+
+	spdk_bdev_io_complete(orig_io, SPDK_BDEV_IO_STATUS_FAILED);
+	spdk_bdev_free_io(bdev_io);
+}
+
+static void
+vbdev_crypto_resubmit_io(void *arg)
+{
+	struct spdk_bdev_io *bdev_io = (struct spdk_bdev_io *)arg;
+	struct crypto_bdev_io *io_ctx = (struct crypto_bdev_io *)bdev_io->driver_ctx;
+
+	vbdev_crypto_submit_request(io_ctx->ch, bdev_io);
+}
+
+static void
+vbdev_crypto_queue_io(struct spdk_bdev_io *bdev_io)
+{
+	struct crypto_bdev_io *io_ctx = (struct crypto_bdev_io *)bdev_io->driver_ctx;
+	int rc;
+
+	io_ctx->bdev_io_wait.bdev = bdev_io->bdev;
+	io_ctx->bdev_io_wait.cb_fn = vbdev_crypto_resubmit_io;
+	io_ctx->bdev_io_wait.cb_arg = bdev_io;
+
+	rc = spdk_bdev_queue_io_wait(bdev_io->bdev, io_ctx->ch, &io_ctx->bdev_io_wait);
+	if (rc != 0) {
+		SPDK_ERRLOG("Queue io failed in vbdev_crypto_queue_io, rc=%d.\n", rc);
+		spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
 	}
 }
 
@@ -911,6 +947,7 @@ crypto_read_get_buf_cb(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io,
 	struct vbdev_crypto *crypto_bdev = SPDK_CONTAINEROF(bdev_io->bdev, struct vbdev_crypto,
 					   crypto_bdev);
 	struct crypto_io_channel *crypto_ch = spdk_io_channel_get_ctx(ch);
+	struct crypto_bdev_io *io_ctx = (struct crypto_bdev_io *)bdev_io->driver_ctx;
 	int rc;
 
 	if (!success) {
@@ -923,8 +960,14 @@ crypto_read_get_buf_cb(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io,
 				    bdev_io->u.bdev.num_blocks, _complete_internal_read,
 				    bdev_io);
 	if (rc != 0) {
-		SPDK_ERRLOG("ERROR on bdev_io submission!\n");
-		spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
+		if (rc == -ENOMEM) {
+			SPDK_DEBUGLOG(SPDK_LOG_CRYPTO, "No memory, queue the IO.\n");
+			io_ctx->ch = ch;
+			vbdev_crypto_queue_io(bdev_io);
+		} else {
+			SPDK_ERRLOG("ERROR on bdev_io submission!\n");
+			spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
+		}
 	}
 }
 
@@ -981,8 +1024,14 @@ vbdev_crypto_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bde
 	}
 
 	if (rc != 0) {
-		SPDK_ERRLOG("ERROR on bdev_io submission!\n");
-		spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
+		if (rc == -ENOMEM) {
+			SPDK_DEBUGLOG(SPDK_LOG_CRYPTO, "No memory, queue the IO.\n");
+			io_ctx->ch = ch;
+			vbdev_crypto_queue_io(bdev_io);
+		} else {
+			SPDK_ERRLOG("ERROR on bdev_io submission!\n");
+			spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
+		}
 	}
 }
 
@@ -1344,6 +1393,7 @@ vbdev_crypto_finish(void)
 	struct vbdev_dev *device;
 	struct device_qp *dev_qp;
 	unsigned i;
+	int rc;
 
 	while ((name = TAILQ_FIRST(&g_bdev_names))) {
 		TAILQ_REMOVE(&g_bdev_names, name, link);
@@ -1368,8 +1418,11 @@ vbdev_crypto_finish(void)
 				rte_dev->dev_ops->queue_pair_release(rte_dev, i);
 			}
 		}
-
 		free(device);
+	}
+	rc = rte_vdev_uninit(AESNI_MB);
+	if (rc) {
+		SPDK_ERRLOG("%d from rte_vdev_uninit\n", rc);
 	}
 
 	while ((dev_qp = TAILQ_FIRST(&g_device_qp))) {
@@ -1469,7 +1522,7 @@ vbdev_crypto_claim(struct spdk_bdev *bdev)
 		if (strcmp(name->bdev_name, bdev->name) != 0) {
 			continue;
 		}
-		SPDK_DEBUGLOG(SPDK_LOG_VBDEV_crypto, "Match on %s\n", bdev->name);
+		SPDK_DEBUGLOG(SPDK_LOG_CRYPTO, "Match on %s\n", bdev->name);
 
 		vbdev = calloc(1, sizeof(struct vbdev_crypto));
 		if (!vbdev) {
@@ -1548,7 +1601,6 @@ vbdev_crypto_claim(struct spdk_bdev *bdev)
 			goto error_claim;
 		}
 
-
 		/* To init the session we have to get the cryptoDev device ID for this vbdev */
 		TAILQ_FOREACH(device, &g_vbdev_devs, link) {
 			if (strcmp(device->cdev_info.driver_name, vbdev->drv_name) == 0) {
@@ -1605,13 +1657,13 @@ vbdev_crypto_claim(struct spdk_bdev *bdev)
 			goto error_session_init;
 		}
 
-		rc = spdk_vbdev_register(&vbdev->crypto_bdev, &vbdev->base_bdev, 1);
+		rc = spdk_bdev_register(&vbdev->crypto_bdev);
 		if (rc < 0) {
-			SPDK_ERRLOG("ERROR trying to register vbdev\n");
+			SPDK_ERRLOG("ERROR trying to register bdev\n");
 			rc = -EINVAL;
-			goto error_vbdev_register;
+			goto error_bdev_register;
 		}
-		SPDK_DEBUGLOG(SPDK_LOG_VBDEV_crypto, "registered io_device and virtual bdev for: %s\n",
+		SPDK_DEBUGLOG(SPDK_LOG_CRYPTO, "registered io_device and virtual bdev for: %s\n",
 			      name->vbdev_name);
 		break;
 	}
@@ -1619,7 +1671,7 @@ vbdev_crypto_claim(struct spdk_bdev *bdev)
 	return rc;
 
 	/* Error cleanup paths. */
-error_vbdev_register:
+error_bdev_register:
 error_session_init:
 	rte_cryptodev_sym_session_free(vbdev->session_decrypt);
 error_session_de_create:
@@ -1684,15 +1736,8 @@ delete_crypto_disk(struct spdk_bdev *bdev, spdk_delete_crypto_complete cb_fn,
 static void
 vbdev_crypto_examine(struct spdk_bdev *bdev)
 {
-	int rc;
-
-	rc = vbdev_crypto_claim(bdev);
-	if (rc) {
-		spdk_bdev_module_examine_done(&crypto_if);
-		return;
-	}
-
+	vbdev_crypto_claim(bdev);
 	spdk_bdev_module_examine_done(&crypto_if);
 }
 
-SPDK_LOG_REGISTER_COMPONENT("vbdev_crypto", SPDK_LOG_VBDEV_crypto)
+SPDK_LOG_REGISTER_COMPONENT("vbdev_crypto", SPDK_LOG_CRYPTO)

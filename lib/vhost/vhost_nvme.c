@@ -1047,7 +1047,7 @@ free_task_pool(struct spdk_vhost_nvme_dev *nvme)
 	while (!STAILQ_EMPTY(&nvme->free_tasks)) {
 		task = STAILQ_FIRST(&nvme->free_tasks);
 		STAILQ_REMOVE_HEAD(&nvme->free_tasks, stailq);
-		spdk_dma_free(task);
+		spdk_free(task);
 	}
 }
 
@@ -1060,8 +1060,9 @@ alloc_task_pool(struct spdk_vhost_nvme_dev *nvme)
 	entries = nvme->num_io_queues * MAX_QUEUE_ENTRIES_SUPPORTED;
 
 	for (i = 0; i < entries; i++) {
-		task = spdk_dma_zmalloc(sizeof(struct spdk_vhost_nvme_task),
-					SPDK_CACHE_LINE_SIZE, NULL);
+		task = spdk_zmalloc(sizeof(struct spdk_vhost_nvme_task),
+				    SPDK_CACHE_LINE_SIZE, NULL,
+				    SPDK_ENV_LCORE_ID_ANY, SPDK_MALLOC_DMA);
 		if (task == NULL) {
 			SPDK_ERRLOG("Controller %s alloc task pool failed\n",
 				    nvme->vdev.name);
@@ -1091,7 +1092,7 @@ spdk_vhost_nvme_start_cb(struct spdk_vhost_dev *vdev,
 	}
 
 	SPDK_NOTICELOG("Start Device %u, Path %s, lcore %d\n", vsession->vid,
-		       vdev->path, vsession->lcore);
+		       vdev->path, spdk_env_get_current_core());
 
 	for (i = 0; i < nvme->num_ns; i++) {
 		ns_dev = &nvme->ns[i];
@@ -1105,13 +1106,14 @@ spdk_vhost_nvme_start_cb(struct spdk_vhost_dev *vdev,
 	/* Start the NVMe Poller */
 	nvme->requestq_poller = spdk_poller_register(nvme_worker, nvme, 0);
 
-	spdk_vhost_session_event_done(vsession, 0);
+	spdk_vhost_session_start_done(vsession, 0);
 	return 0;
 }
 
 static int
 spdk_vhost_nvme_start(struct spdk_vhost_session *vsession)
 {
+	struct vhost_poll_group *pg;
 	int rc;
 
 	if (vsession->vdev->active_session_num > 0) {
@@ -1120,13 +1122,12 @@ spdk_vhost_nvme_start(struct spdk_vhost_session *vsession)
 		return -1;
 	}
 
-	vsession->lcore = spdk_vhost_allocate_reactor(vsession->vdev->cpumask);
-	rc = spdk_vhost_session_send_event(vsession, spdk_vhost_nvme_start_cb,
+	pg = spdk_vhost_get_poll_group(vsession->vdev->cpumask);
+	rc = spdk_vhost_session_send_event(pg, vsession, spdk_vhost_nvme_start_cb,
 					   3, "start session");
 
 	if (rc != 0) {
-		spdk_vhost_free_reactor(vsession->lcore);
-		vsession->lcore = -1;
+		spdk_vhost_put_poll_group(pg);
 	}
 
 	return rc;
@@ -1163,6 +1164,10 @@ destroy_device_poller_cb(void *arg)
 
 	/* FIXME wait for pending I/Os to complete */
 
+	if (spdk_vhost_trylock() != 0) {
+		return -1;
+	}
+
 	for (i = 0; i < nvme->num_ns; i++) {
 		ns_dev = &nvme->ns[i];
 		if (ns_dev->bdev_io_channel) {
@@ -1181,8 +1186,9 @@ destroy_device_poller_cb(void *arg)
 	nvme->dataplane_started = false;
 
 	spdk_poller_unregister(&nvme->stop_poller);
-	spdk_vhost_session_event_done(nvme->vsession, 0);
+	spdk_vhost_session_stop_done(nvme->vsession, 0);
 
+	spdk_vhost_unlock();
 	return -1;
 }
 
@@ -1193,7 +1199,7 @@ spdk_vhost_nvme_stop_cb(struct spdk_vhost_dev *vdev,
 	struct spdk_vhost_nvme_dev *nvme = to_nvme_dev(vdev);
 
 	if (nvme == NULL) {
-		spdk_vhost_session_event_done(vsession, -1);
+		spdk_vhost_session_stop_done(vsession, -1);
 		return -1;
 	}
 
@@ -1209,17 +1215,8 @@ spdk_vhost_nvme_stop_cb(struct spdk_vhost_dev *vdev,
 static int
 spdk_vhost_nvme_stop(struct spdk_vhost_session *vsession)
 {
-	int rc;
-
-	rc = spdk_vhost_session_send_event(vsession, spdk_vhost_nvme_stop_cb,
-					   3, "start session");
-	if (rc != 0) {
-		return rc;
-	}
-
-	spdk_vhost_free_reactor(vsession->lcore);
-	vsession->lcore = -1;
-	return 0;
+	return spdk_vhost_session_send_event(vsession->poll_group, vsession,
+					     spdk_vhost_nvme_stop_cb, 3, "start session");
 }
 
 static void
@@ -1382,16 +1379,16 @@ spdk_vhost_nvme_ctrlr_identify_update(struct spdk_vhost_nvme_dev *dev)
 int
 spdk_vhost_nvme_dev_construct(const char *name, const char *cpumask, uint32_t num_io_queues)
 {
-	struct spdk_vhost_nvme_dev *dev = spdk_dma_zmalloc(sizeof(struct spdk_vhost_nvme_dev),
-					  SPDK_CACHE_LINE_SIZE, NULL);
+	struct spdk_vhost_nvme_dev *dev;
 	int rc;
 
-	if (dev == NULL) {
+	if (posix_memalign((void **)&dev, SPDK_CACHE_LINE_SIZE, sizeof(*dev))) {
 		return -ENOMEM;
 	}
+	memset(dev, 0, sizeof(*dev));
 
 	if (num_io_queues < 1 || num_io_queues > MAX_IO_QUEUES) {
-		spdk_dma_free(dev);
+		free(dev);
 		return -EINVAL;
 	}
 
@@ -1400,7 +1397,7 @@ spdk_vhost_nvme_dev_construct(const char *name, const char *cpumask, uint32_t nu
 				     &spdk_vhost_nvme_device_backend);
 
 	if (rc) {
-		spdk_dma_free(dev);
+		free(dev);
 		spdk_vhost_unlock();
 		return rc;
 	}
@@ -1441,7 +1438,7 @@ spdk_vhost_nvme_dev_remove(struct spdk_vhost_dev *vdev)
 		return rc;
 	}
 
-	spdk_dma_free(nvme);
+	free(nvme);
 	return 0;
 }
 

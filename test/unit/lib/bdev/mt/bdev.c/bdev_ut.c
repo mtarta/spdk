@@ -54,12 +54,14 @@ struct spdk_trace_histories *g_trace_histories;
 DEFINE_STUB_V(spdk_trace_add_register_fn, (struct spdk_trace_register_fn *reg_fn));
 DEFINE_STUB_V(spdk_trace_register_owner, (uint8_t type, char id_prefix));
 DEFINE_STUB_V(spdk_trace_register_object, (uint8_t type, char id_prefix));
-DEFINE_STUB_V(spdk_trace_register_description, (const char *name, const char *short_name,
+DEFINE_STUB_V(spdk_trace_register_description, (const char *name,
 		uint16_t tpoint_id, uint8_t owner_type,
 		uint8_t object_type, uint8_t new_object,
-		uint8_t arg1_is_ptr, const char *arg1_name));
+		uint8_t arg1_type, const char *arg1_name));
 DEFINE_STUB_V(_spdk_trace_record, (uint64_t tsc, uint16_t tpoint_id, uint16_t poller_id,
 				   uint32_t size, uint64_t object_id, uint64_t arg1));
+DEFINE_STUB(spdk_notify_send, uint64_t, (const char *type, const char *ctx), 0);
+DEFINE_STUB(spdk_notify_type_register, struct spdk_notify_type *, (const char *type), NULL);
 
 struct ut_bdev {
 	struct spdk_bdev	bdev;
@@ -185,9 +187,12 @@ static struct spdk_bdev_fn_table fn_table = {
 	.submit_request =	stub_submit_request,
 };
 
+struct spdk_bdev_module bdev_ut_if;
+
 static int
 module_init(void)
 {
+	spdk_bdev_module_init_done(&bdev_ut_if);
 	return 0;
 }
 
@@ -212,6 +217,7 @@ struct spdk_bdev_module bdev_ut_if = {
 	.name = "bdev_ut",
 	.module_init = module_init,
 	.module_fini = module_fini,
+	.async_init = true,
 	.init_complete = init_complete,
 	.fini_start = fini_start,
 };
@@ -356,10 +362,37 @@ unregister_and_close(void)
 	spdk_bdev_close(g_desc);
 	poll_threads();
 
+	/* Try hotremoving a bdev with descriptors which don't provide
+	 * the notification callback */
+	spdk_bdev_open(&g_bdev.bdev, true, NULL, NULL, &desc);
+	SPDK_CU_ASSERT_FATAL(desc != NULL);
+
+	/* There is an open descriptor on the device. Unregister it,
+	 * which can't proceed until the descriptor is closed. */
+	done = false;
+	spdk_bdev_unregister(&g_bdev.bdev, _bdev_unregistered, &done);
+
+	/* Poll the threads to allow all events to be processed */
+	poll_threads();
+
+	/* Make sure the bdev was not unregistered. We still have a
+	 * descriptor open */
+	CU_ASSERT(done == false);
+
+	spdk_bdev_close(desc);
+	poll_threads();
+
+	/* The unregister should have completed */
+	CU_ASSERT(done == true);
+
+
+	/* Register the bdev again */
+	register_bdev(&g_bdev, "ut_bdev", &g_io_device);
+
 	remove_notify = false;
 	spdk_bdev_open(&g_bdev.bdev, true, _bdev_removed, &remove_notify, &desc);
+	SPDK_CU_ASSERT_FATAL(desc != NULL);
 	CU_ASSERT(remove_notify == false);
-	CU_ASSERT(desc != NULL);
 
 	/* There is an open descriptor on the device. Unregister it,
 	 * which can't proceed until the descriptor is closed. */
@@ -382,9 +415,10 @@ unregister_and_close(void)
 	/* The unregister should have completed */
 	CU_ASSERT(done == true);
 
-	spdk_bdev_finish(finish_cb, NULL);
-	poll_threads();
-	free_threads();
+	/* Restore the original g_bdev so that we can use teardown_test(). */
+	register_bdev(&g_bdev, "ut_bdev", &g_io_device);
+	spdk_bdev_open(&g_bdev.bdev, true, NULL, NULL, &g_desc);
+	teardown_test();
 }
 
 static void
@@ -1464,7 +1498,17 @@ bdev_histograms_mt(void)
 	CU_ASSERT(g_status == 0);
 	CU_ASSERT(g_bdev.bdev.internal.histogram_enabled == false);
 
-	spdk_histogram_data_free(g_histogram);
+	spdk_histogram_data_free(histogram);
+
+	/* Tear down the channels */
+	set_thread(0);
+	spdk_put_io_channel(ch[0]);
+	set_thread(1);
+	spdk_put_io_channel(ch[1]);
+	poll_threads();
+	set_thread(0);
+	teardown_test();
+
 }
 
 int

@@ -49,11 +49,6 @@ struct spdk_bdev {
 	int x;
 };
 
-/* Unit test poller mockup */
-struct spdk_poller {
-	int y;
-};
-
 SPDK_LOG_REGISTER_COMPONENT("scsi", SPDK_LOG_SCSI)
 
 struct spdk_scsi_globals g_spdk_scsi;
@@ -110,6 +105,8 @@ DEFINE_STUB_V(spdk_scsi_dev_queue_mgmt_task,
 
 DEFINE_STUB_V(spdk_scsi_dev_delete_lun,
 	      (struct spdk_scsi_dev *dev, struct spdk_scsi_lun *lun));
+
+DEFINE_STUB(spdk_scsi_pr_check, int, (struct spdk_scsi_task *task), 0);
 
 void
 spdk_bdev_scsi_reset(struct spdk_scsi_task *task)
@@ -525,7 +522,7 @@ lun_reset_task_wait_scsi_task_complete(void)
 	CU_ASSERT(lun->reset_poller != NULL);
 
 	/* Execute the poller to check if the task prior to the reset task complete. */
-	spdk_scsi_lun_reset_check_outstanding_tasks(&mgmt_task);
+	scsi_lun_reset_check_outstanding_tasks(&mgmt_task);
 
 	CU_ASSERT(!TAILQ_EMPTY(&lun->mgmt_tasks));
 	CU_ASSERT(lun->reset_poller != NULL);
@@ -536,7 +533,7 @@ lun_reset_task_wait_scsi_task_complete(void)
 	CU_ASSERT(TAILQ_EMPTY(&lun->tasks));
 
 	/* Execute the poller to check if the task prior to the reset task complete. */
-	spdk_scsi_lun_reset_check_outstanding_tasks(&mgmt_task);
+	scsi_lun_reset_check_outstanding_tasks(&mgmt_task);
 
 	CU_ASSERT(TAILQ_EMPTY(&lun->mgmt_tasks));
 	CU_ASSERT(lun->reset_poller == NULL);

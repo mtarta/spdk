@@ -80,6 +80,8 @@ allocate_threads(int num_threads)
 	struct spdk_thread *thread;
 	uint32_t i;
 
+	spdk_thread_lib_init(NULL, 0);
+
 	g_ut_num_threads = num_threads;
 
 	g_ut_threads = calloc(num_threads, sizeof(*g_ut_threads));
@@ -87,7 +89,7 @@ allocate_threads(int num_threads)
 
 	for (i = 0; i < g_ut_num_threads; i++) {
 		set_thread(i);
-		thread = spdk_thread_create(NULL);
+		thread = spdk_thread_create(NULL, NULL);
 		assert(thread != NULL);
 		g_ut_threads[i].thread = thread;
 	}
@@ -104,12 +106,15 @@ free_threads(void)
 	for (i = 0; i < g_ut_num_threads; i++) {
 		set_thread(i);
 		spdk_thread_exit(g_ut_threads[i].thread);
+		spdk_thread_destroy(g_ut_threads[i].thread);
 		g_ut_threads[i].thread = NULL;
 	}
 
 	g_ut_num_threads = 0;
 	free(g_ut_threads);
 	g_ut_threads = NULL;
+
+	spdk_thread_lib_fini();
 }
 
 bool

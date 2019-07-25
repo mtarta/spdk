@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-SYSTEM=`uname -s`
+SYSTEM=$(uname -s)
 if [ $SYSTEM = "FreeBSD" ] ; then
     echo "blob_io_wait.sh cannot run on FreeBSD currently."
     exit 0
@@ -10,8 +10,7 @@ testdir=$(readlink -f $(dirname $0))
 rootdir=$(readlink -f $testdir/../../..)
 source $rootdir/test/common/autotest_common.sh
 source $rootdir/test/nvmf/common.sh
-rpc_py="python $rootdir/scripts/rpc.py"
-set -e
+rpc_py="$rootdir/scripts/rpc.py"
 
 timing_enter blob_bdev_io_wait
 

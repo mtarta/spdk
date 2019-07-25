@@ -45,7 +45,11 @@ def nvmf_create_transport(client,
                           max_aq_depth=None,
                           num_shared_buffers=None,
                           buf_cache_size=None,
-                          max_srq_depth=None):
+                          max_srq_depth=None,
+                          no_srq=False,
+                          c2h_success=True,
+                          dif_insert_or_strip=None,
+                          sock_priority=None):
     """NVMf Transport Create options.
 
     Args:
@@ -57,8 +61,11 @@ def nvmf_create_transport(client,
         io_unit_size: I/O unit size in bytes (optional)
         max_aq_depth: Max size admin quque per controller (optional)
         num_shared_buffers: The number of pooled data buffers available to the transport (optional)
-        buf_cache_size: The number of shared buffers to reserve for each poll group(optional)
-        max_srq_depth: Max number of outstanding I/O per shared receive queue (optional)
+        buf_cache_size: The number of shared buffers to reserve for each poll group (optional)
+        max_srq_depth: Max number of outstanding I/O per shared receive queue - RDMA specific (optional)
+        no_srq: Boolean flag to disable SRQ even for devices that support it - RDMA specific (optional)
+        c2h_success: Boolean flag to disable the C2H success optimization - TCP specific (optional)
+        dif_insert_or_strip: Boolean flag to enable DIF insert/strip for I/O - TCP specific (optional)
 
     Returns:
         True or False
@@ -84,6 +91,14 @@ def nvmf_create_transport(client,
         params['buf_cache_size'] = buf_cache_size
     if max_srq_depth:
         params['max_srq_depth'] = max_srq_depth
+    if no_srq:
+        params['no_srq'] = no_srq
+    if c2h_success is not None:
+        params['c2h_success'] = c2h_success
+    if dif_insert_or_strip:
+        params['dif_insert_or_strip'] = dif_insert_or_strip
+    if sock_priority:
+        params['sock_priority'] = sock_priority
     return client.call('nvmf_create_transport', params)
 
 
@@ -108,6 +123,7 @@ def get_nvmf_subsystems(client):
 def nvmf_subsystem_create(client,
                           nqn,
                           serial_number,
+                          model_number='SPDK bdev Controller',
                           allow_any_host=False,
                           max_namespaces=0):
     """Construct an NVMe over Fabrics target subsystem.
@@ -115,6 +131,7 @@ def nvmf_subsystem_create(client,
     Args:
         nqn: Subsystem NQN.
         serial_number: Serial number of virtual controller.
+        model_number: Model number of virtual controller.
         allow_any_host: Allow any host (True) or enforce allowed host whitelist (False). Default: False.
         max_namespaces: Maximum number of namespaces that can be attached to the subsystem (optional). Default: 0 (Unlimited).
 
@@ -127,6 +144,9 @@ def nvmf_subsystem_create(client,
 
     if serial_number:
         params['serial_number'] = serial_number
+
+    if model_number:
+        params['model_number'] = model_number
 
     if allow_any_host:
         params['allow_any_host'] = True
@@ -195,7 +215,7 @@ def nvmf_subsystem_remove_listener(
     return client.call('nvmf_subsystem_remove_listener', params)
 
 
-def nvmf_subsystem_add_ns(client, nqn, bdev_name, nsid=None, nguid=None, eui64=None, uuid=None):
+def nvmf_subsystem_add_ns(client, nqn, bdev_name, ptpl_file=None, nsid=None, nguid=None, eui64=None, uuid=None):
     """Add a namespace to a subsystem.
 
     Args:
@@ -210,6 +230,9 @@ def nvmf_subsystem_add_ns(client, nqn, bdev_name, nsid=None, nguid=None, eui64=N
         The namespace ID
     """
     ns = {'bdev_name': bdev_name}
+
+    if ptpl_file:
+        ns['ptpl_file'] = ptpl_file
 
     if nsid:
         ns['nsid'] = nsid
@@ -303,3 +326,12 @@ def delete_nvmf_subsystem(client, nqn):
     """
     params = {'nqn': nqn}
     return client.call('delete_nvmf_subsystem', params)
+
+
+def nvmf_get_stats(client):
+    """Query NVMf statistics.
+
+    Returns:
+        Current NVMf statistics.
+    """
+    return client.call('nvmf_get_stats')

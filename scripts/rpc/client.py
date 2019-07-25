@@ -10,6 +10,10 @@ def print_dict(d):
     print(json.dumps(d, indent=2))
 
 
+def print_json(s):
+    print(json.dumps(s, indent=2).strip('"'))
+
+
 class JSONRPCException(Exception):
     def __init__(self, message):
         self.message = message
@@ -34,16 +38,19 @@ class JSONRPCClient(object):
                 self._logger.debug("Trying to connect to UNIX socket: %s", addr)
                 self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
                 self.sock.connect(addr)
-            elif ':' in addr:
-                self._logger.debug("Trying to connect to IPv6 address addr:%s, port:%i", addr, port)
-                for res in socket.getaddrinfo(addr, port, socket.AF_INET6, socket.SOCK_STREAM, socket.SOL_TCP):
-                    af, socktype, proto, canonname, sa = res
-                self.sock = socket.socket(af, socktype, proto)
-                self.sock.connect(sa)
+            elif port:
+                if ':' in addr:
+                    self._logger.debug("Trying to connect to IPv6 address addr:%s, port:%i", addr, port)
+                    for res in socket.getaddrinfo(addr, port, socket.AF_INET6, socket.SOCK_STREAM, socket.SOL_TCP):
+                        af, socktype, proto, canonname, sa = res
+                    self.sock = socket.socket(af, socktype, proto)
+                    self.sock.connect(sa)
+                else:
+                    self._logger.debug("Trying to connect to IPv4 address addr:%s, port:%i'", addr, port)
+                    self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    self.sock.connect((addr, port))
             else:
-                self._logger.debug("Trying to connect to IPv4 address addr:%s, port:%i'", addr, port)
-                self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                self.sock.connect((addr, port))
+                raise socket.error("Unix socket '%s' does not exist" % addr)
         except socket.error as ex:
             raise JSONRPCException("Error while connecting to %s\n"
                                    "Error details: %s" % (addr, ex))
@@ -86,6 +93,7 @@ class JSONRPCClient(object):
 
         self._logger.debug("append request:\n%s\n", json.dumps(req))
         self._reqs.append(req)
+        return self._request_id
 
     def flush(self):
         self._logger.debug("Flushing buffer")
@@ -96,8 +104,9 @@ class JSONRPCClient(object):
         self.sock.sendall(reqstr.encode("utf-8"))
 
     def send(self, method, params=None):
-        self.add_request(method, params)
+        id = self.add_request(method, params)
         self.flush()
+        return id
 
     def decode_one_response(self):
         try:
@@ -133,18 +142,13 @@ class JSONRPCClient(object):
             raise JSONRPCException("Timeout while waiting for response:\n%s\n" % self._recv_buf)
 
         self._logger.info("response:\n%s\n", json.dumps(response, indent=2))
-        if 'error' in response:
-            msg = "\n".join(["Got JSON-RPC error response",
-                             "response:",
-                             json.dumps(response['error'], indent=2)])
-            raise JSONRPCException(msg)
         return response
 
-    def call(self, method, params=None):
+    def call(self, method, params={}):
         self._logger.debug("call('%s')" % method)
-        self.send(method, params)
+        req_id = self.send(method, params)
         try:
-            return self.recv()['result']
+            response = self.recv()
         except JSONRPCException as e:
             """ Don't expect response to kill """
             if not self.sock and method == "kill_instance":
@@ -152,3 +156,13 @@ class JSONRPCClient(object):
                 return {}
             else:
                 raise e
+
+        if 'error' in response:
+            msg = "\n".join(["request:", "%s" % json.dumps({**{"method": method, "req_id": req_id},
+                                                            **params}, indent=2),
+                             "Got JSON-RPC error response",
+                             "response:",
+                             json.dumps(response['error'], indent=2)])
+            raise JSONRPCException(msg)
+
+        return response['result']

@@ -42,11 +42,13 @@
 #include "spdk/util.h"
 #include "spdk/thread.h"
 #include "spdk/string.h"
+#include "spdk/rpc.h"
 
 struct bdevperf_task {
 	struct iovec			iov;
 	struct io_target		*target;
 	void				*buf;
+	void				*md_buf;
 	uint64_t			offset_blocks;
 	enum spdk_bdev_io_type		io_type;
 	TAILQ_ENTRY(bdevperf_task)	link;
@@ -77,10 +79,15 @@ static bool g_zcopy = true;
 static unsigned g_master_core;
 static int g_time_in_sec;
 static bool g_mix_specified;
+static const char *g_target_bdev_name;
+static bool g_wait_for_tests = false;
+static struct spdk_jsonrpc_request *g_request = NULL;
 
 static struct spdk_poller *g_perf_timer = NULL;
 
 static void bdevperf_submit_single(struct io_target *target, struct bdevperf_task *task);
+static void performance_dump(uint64_t io_time_in_usec, uint64_t ema_period);
+static void rpc_perform_tests_cb(int rc);
 
 struct io_target {
 	char				*name;
@@ -116,39 +123,72 @@ static int g_target_count = 0;
 static size_t g_min_alignment = 8;
 
 static void
-generate_data(void *buf, int buf_len, int block_size, int md_size,
+generate_data(void *buf, int buf_len, int block_size, void *md_buf, int md_size,
 	      int num_blocks, int seed)
 {
-	int offset_blocks = 0;
+	int offset_blocks = 0, md_offset, data_block_size;
 
 	if (buf_len < num_blocks * block_size) {
 		return;
 	}
 
+	if (md_buf == NULL) {
+		data_block_size = block_size - md_size;
+		md_buf = (char *)buf + data_block_size;
+		md_offset = block_size;
+	} else {
+		data_block_size = block_size;
+		md_offset = md_size;
+	}
+
 	while (offset_blocks < num_blocks) {
-		memset(buf, seed, block_size - md_size);
-		memset(buf + block_size - md_size, 0, md_size);
+		memset(buf, seed, data_block_size);
+		memset(md_buf, seed, md_size);
 		buf += block_size;
+		md_buf += md_offset;
 		offset_blocks++;
 	}
 }
 
 static bool
-verify_data(void *wr_buf, int wr_buf_len, void *rd_buf, int rd_buf_len,
-	    int block_size, int md_size, int num_blocks)
+verify_data(void *wr_buf, int wr_buf_len, void *rd_buf, int rd_buf_len, int block_size,
+	    void *wr_md_buf, void *rd_md_buf, int md_size, int num_blocks, bool md_check)
 {
-	int offset_blocks = 0;
+	int offset_blocks = 0, md_offset, data_block_size;
 
 	if (wr_buf_len < num_blocks * block_size || rd_buf_len < num_blocks * block_size) {
 		return false;
 	}
 
+	assert((wr_md_buf != NULL) == (rd_md_buf != NULL));
+
+	if (wr_md_buf == NULL) {
+		data_block_size = block_size - md_size;
+		wr_md_buf = (char *)wr_buf + data_block_size;
+		rd_md_buf = (char *)rd_buf + data_block_size;
+		md_offset = block_size;
+	} else {
+		data_block_size = block_size;
+		md_offset = md_size;
+	}
+
 	while (offset_blocks < num_blocks) {
-		if (memcmp(wr_buf, rd_buf, block_size - md_size) != 0) {
+		if (memcmp(wr_buf, rd_buf, data_block_size) != 0) {
 			return false;
 		}
+
 		wr_buf += block_size;
 		rd_buf += block_size;
+
+		if (md_check) {
+			if (memcmp(wr_md_buf, rd_md_buf, md_size) != 0) {
+				return false;
+			}
+
+			wr_md_buf += md_offset;
+			rd_md_buf += md_offset;
+		}
+
 		offset_blocks++;
 	}
 
@@ -190,7 +230,8 @@ bdevperf_free_target(struct io_target *target)
 
 	TAILQ_FOREACH_SAFE(task, &target->task_list, link, tmp) {
 		TAILQ_REMOVE(&target->task_list, task, link);
-		spdk_dma_free(task->buf);
+		spdk_free(task->buf);
+		spdk_free(task->md_buf);
 		free(task);
 	}
 
@@ -199,7 +240,7 @@ bdevperf_free_target(struct io_target *target)
 }
 
 static void
-blockdev_heads_destroy(void)
+bdevperf_free_targets(void)
 {
 	uint32_t i, core_count;
 	struct io_target *target, *next_target;
@@ -211,26 +252,43 @@ blockdev_heads_destroy(void)
 	core_count = spdk_env_get_core_count();
 	for (i = 0; i < core_count; i++) {
 		target = g_head[i];
+		g_head[i] = NULL;
 		while (target != NULL) {
 			next_target = target->next;
 			bdevperf_free_target(target);
 			target = next_target;
 		}
 	}
+}
 
+static void
+blockdev_heads_destroy(void)
+{
+	bdevperf_free_targets();
 	free(g_head);
 	free(g_coremap);
 }
 
+static void
+bdevperf_target_gone(void *arg)
+{
+	struct io_target *target = arg;
+
+	spdk_poller_unregister(&target->run_timer);
+	if (g_reset) {
+		spdk_poller_unregister(&target->reset_timer);
+	}
+
+	target->is_draining = true;
+}
+
 static int
-bdevperf_construct_target(struct spdk_bdev *bdev, struct io_target **_target)
+bdevperf_construct_target(struct spdk_bdev *bdev)
 {
 	struct io_target *target;
 	size_t align;
-	int block_size, md_size, data_block_size;
-	int rc;
-
-	*_target = NULL;
+	int block_size, data_block_size;
+	int rc, index;
 
 	if (g_unmap && !spdk_bdev_io_type_supported(bdev, SPDK_BDEV_IO_TYPE_UNMAP)) {
 		printf("Skipping %s because it does not support unmap\n", spdk_bdev_get_name(bdev));
@@ -252,7 +310,7 @@ bdevperf_construct_target(struct spdk_bdev *bdev, struct io_target **_target)
 		return -ENOMEM;
 	}
 
-	rc = spdk_bdev_open(bdev, true, NULL, NULL, &target->bdev_desc);
+	rc = spdk_bdev_open(bdev, true, bdevperf_target_gone, target, &target->bdev_desc);
 	if (rc != 0) {
 		SPDK_ERRLOG("Could not open leaf bdev %s, error=%d\n", spdk_bdev_get_name(bdev), rc);
 		free(target->name);
@@ -266,14 +324,7 @@ bdevperf_construct_target(struct spdk_bdev *bdev, struct io_target **_target)
 	target->offset_in_ios = 0;
 
 	block_size = spdk_bdev_get_block_size(bdev);
-	md_size = spdk_bdev_get_md_size(bdev);
-	if (md_size != 0 && !spdk_bdev_is_md_interleaved(bdev)) {
-		SPDK_ERRLOG("Separate metadata is not expected.\n");
-		free(target->name);
-		free(target);
-		return -EINVAL;
-	}
-	data_block_size = block_size - md_size;
+	data_block_size = spdk_bdev_get_data_block_size(bdev);
 	target->io_size_blocks = g_io_size / data_block_size;
 	if ((g_io_size % data_block_size) != 0) {
 		SPDK_ERRLOG("IO size (%d) is not multiples of data block size of bdev %s (%"PRIu32")\n",
@@ -307,33 +358,40 @@ bdevperf_construct_target(struct spdk_bdev *bdev, struct io_target **_target)
 	target->reset_timer = NULL;
 	TAILQ_INIT(&target->task_list);
 
-	*_target = target;
+	/* Mapping each created target to lcore */
+	index = g_target_count % spdk_env_get_core_count();
+	target->next = g_head[index];
+	target->lcore = g_coremap[index];
+	g_head[index] = target;
+	g_target_count++;
+
 	return 0;
 }
 
 static void
 bdevperf_construct_targets(void)
 {
-	int index = 0;
 	struct spdk_bdev *bdev;
-	struct io_target *target;
 	int rc;
 
-	bdev = spdk_bdev_first_leaf();
-	while (bdev != NULL) {
-		rc = bdevperf_construct_target(bdev, &target);
-		if (rc != 0) {
+	if (g_target_bdev_name != NULL) {
+		bdev = spdk_bdev_get_by_name(g_target_bdev_name);
+		if (!bdev) {
+			fprintf(stderr, "Unable to find bdev '%s'\n", g_target_bdev_name);
 			return;
 		}
-		if (target != NULL) {
-			/* Mapping each created target to lcore */
-			index = g_target_count % spdk_env_get_core_count();
-			target->next = g_head[index];
-			target->lcore = g_coremap[index];
-			g_head[index] = target;
-			g_target_count++;
+
+		bdevperf_construct_target(bdev);
+	} else {
+		bdev = spdk_bdev_first_leaf();
+		while (bdev != NULL) {
+			rc = bdevperf_construct_target(bdev);
+			if (rc != 0) {
+				return;
+			}
+
+			bdev = spdk_bdev_next_leaf(bdev);
 		}
-		bdev = spdk_bdev_next_leaf(bdev);
 	}
 }
 
@@ -341,6 +399,7 @@ static void
 end_run(void *arg1, void *arg2)
 {
 	struct io_target *target = arg1;
+	int rc = 0;
 
 	spdk_put_io_channel(target->ch);
 	spdk_bdev_close(target->bdev_desc);
@@ -348,10 +407,28 @@ end_run(void *arg1, void *arg2)
 		if (g_show_performance_real_time) {
 			spdk_poller_unregister(&g_perf_timer);
 		}
-		if (g_run_failed) {
-			spdk_app_stop(1);
+		if (g_shutdown) {
+			g_time_in_usec = g_shutdown_tsc * 1000000 / spdk_get_ticks_hz();
+			printf("Received shutdown signal, test time is about %.6f seconds\n",
+			       (double)g_time_in_usec / 1000000);
+		}
+
+		if (g_time_in_usec) {
+			if (!g_run_failed) {
+				performance_dump(g_time_in_usec, 0);
+			}
 		} else {
-			spdk_app_stop(0);
+			printf("Test time less than one microsecond, no performance data will be shown\n");
+		}
+
+		if (g_run_failed) {
+			rc = 1;
+		}
+
+		if (g_request && !g_shutdown) {
+			rpc_perform_tests_cb(rc);
+		} else {
+			spdk_app_stop(rc);
 		}
 	}
 }
@@ -364,8 +441,10 @@ bdevperf_complete(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 	struct spdk_event	*complete;
 	struct iovec		*iovs;
 	int			iovcnt;
+	bool			md_check;
 
 	target = task->target;
+	md_check = spdk_bdev_get_dif_type(target->bdev) == SPDK_DIF_DISABLE;
 
 	if (!success) {
 		if (!g_reset) {
@@ -380,8 +459,9 @@ bdevperf_complete(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 		assert(iovs != NULL);
 		if (!verify_data(task->buf, g_buf_size, iovs[0].iov_base, iovs[0].iov_len,
 				 spdk_bdev_get_block_size(target->bdev),
+				 task->md_buf, spdk_bdev_io_get_md_buf(bdev_io),
 				 spdk_bdev_get_md_size(target->bdev),
-				 target->io_size_blocks) != 0) {
+				 target->io_size_blocks, md_check) != 0) {
 			printf("Buffer mismatch! Disk Offset: %lu\n", task->offset_blocks);
 			target->is_draining = true;
 			g_run_failed = true;
@@ -423,8 +503,16 @@ bdevperf_verify_submit_read(void *cb_arg)
 	target = task->target;
 
 	/* Read the data back in */
-	rc = spdk_bdev_read_blocks(target->bdev_desc, target->ch, NULL, task->offset_blocks,
-				   target->io_size_blocks, bdevperf_complete, task);
+	if (spdk_bdev_is_md_separate(target->bdev)) {
+		rc = spdk_bdev_read_blocks_with_md(target->bdev_desc, target->ch, NULL, NULL,
+						   task->offset_blocks, target->io_size_blocks,
+						   bdevperf_complete, task);
+	} else {
+		rc = spdk_bdev_read_blocks(target->bdev_desc, target->ch, NULL,
+					   task->offset_blocks, target->io_size_blocks,
+					   bdevperf_complete, task);
+	}
+
 	if (rc == -ENOMEM) {
 		task->bdev_io_wait.bdev = target->bdev;
 		task->bdev_io_wait.cb_fn = bdevperf_verify_submit_read;
@@ -449,6 +537,17 @@ bdevperf_verify_write_complete(struct spdk_bdev_io *bdev_io, bool success,
 	}
 }
 
+static void
+bdevperf_zcopy_complete(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
+{
+	if (!success) {
+		bdevperf_complete(bdev_io, success, cb_arg);
+		return;
+	}
+
+	spdk_bdev_zcopy_end(bdev_io, false, bdevperf_complete, cb_arg);
+}
+
 static __thread unsigned int seed = 0;
 
 static void
@@ -470,7 +569,7 @@ bdevperf_prep_task(struct bdevperf_task *task)
 	if (g_verify || g_reset) {
 		generate_data(task->buf, g_buf_size,
 			      spdk_bdev_get_block_size(target->bdev),
-			      spdk_bdev_get_md_size(target->bdev),
+			      task->md_buf, spdk_bdev_get_md_size(target->bdev),
 			      target->io_size_blocks, rand_r(&seed) % 256);
 		task->iov.iov_base = task->buf;
 		task->iov.iov_len = g_buf_size;
@@ -506,15 +605,25 @@ bdevperf_generate_dif(struct bdevperf_task *task)
 			       spdk_bdev_is_dif_head_of_md(bdev),
 			       spdk_bdev_get_dif_type(bdev),
 			       target->dif_check_flags,
-			       task->offset_blocks, 0, 0, 0);
+			       task->offset_blocks, 0, 0, 0, 0);
 	if (rc != 0) {
 		fprintf(stderr, "Initialization of DIF context failed\n");
 		return rc;
 	}
 
-	rc = spdk_dif_generate(&task->iov, 1, target->io_size_blocks, &dif_ctx);
+	if (spdk_bdev_is_md_interleaved(bdev)) {
+		rc = spdk_dif_generate(&task->iov, 1, target->io_size_blocks, &dif_ctx);
+	} else {
+		struct iovec md_iov = {
+			.iov_base	= task->md_buf,
+			.iov_len	= spdk_bdev_get_md_size(bdev) * target->io_size_blocks,
+		};
+
+		rc = spdk_dix_generate(&task->iov, 1, &md_iov, target->io_size_blocks, &dif_ctx);
+	}
+
 	if (rc != 0) {
-		fprintf(stderr, "Generation of DIF failed\n");
+		fprintf(stderr, "Generation of DIF/DIX failed\n");
 	}
 
 	return rc;
@@ -528,7 +637,6 @@ bdevperf_submit_task(void *arg)
 	struct spdk_bdev_desc	*desc;
 	struct spdk_io_channel	*ch;
 	spdk_bdev_io_completion_cb cb_fn;
-	void			*rbuf;
 	int			rc = 0;
 
 	desc = target->bdev_desc;
@@ -541,8 +649,19 @@ bdevperf_submit_task(void *arg)
 		}
 		if (rc == 0) {
 			cb_fn = (g_verify || g_reset) ? bdevperf_verify_write_complete : bdevperf_complete;
-			rc = spdk_bdev_writev_blocks(desc, ch, &task->iov, 1, task->offset_blocks,
-						     target->io_size_blocks, cb_fn, task);
+
+			if (spdk_bdev_is_md_separate(target->bdev)) {
+				rc = spdk_bdev_writev_blocks_with_md(desc, ch, &task->iov, 1,
+								     task->md_buf,
+								     task->offset_blocks,
+								     target->io_size_blocks,
+								     cb_fn, task);
+			} else {
+				rc = spdk_bdev_writev_blocks(desc, ch, &task->iov, 1,
+							     task->offset_blocks,
+							     target->io_size_blocks,
+							     cb_fn, task);
+			}
 		}
 		break;
 	case SPDK_BDEV_IO_TYPE_FLUSH:
@@ -558,9 +677,20 @@ bdevperf_submit_task(void *arg)
 						   target->io_size_blocks, bdevperf_complete, task);
 		break;
 	case SPDK_BDEV_IO_TYPE_READ:
-		rbuf = g_zcopy ? NULL : task->buf;
-		rc = spdk_bdev_read_blocks(desc, ch, rbuf, task->offset_blocks,
-					   target->io_size_blocks, bdevperf_complete, task);
+		if (g_zcopy) {
+			rc = spdk_bdev_zcopy_start(desc, ch, task->offset_blocks, target->io_size_blocks,
+						   true, bdevperf_zcopy_complete, task);
+		} else {
+			if (spdk_bdev_is_md_separate(target->bdev)) {
+				rc = spdk_bdev_read_blocks_with_md(desc, ch, task->buf, task->md_buf,
+								   task->offset_blocks,
+								   target->io_size_blocks,
+								   bdevperf_complete, task);
+			} else {
+				rc = spdk_bdev_read_blocks(desc, ch, task->buf, task->offset_blocks,
+							   target->io_size_blocks, bdevperf_complete, task);
+			}
+		}
 		break;
 	default:
 		assert(false);
@@ -718,6 +848,8 @@ bdevperf_usage(void)
 	printf("\t\t(Formula: M = 2 / (n + 1), EMA[i+1] = IO/s * M + (1 - M) * EMA[i])\n");
 	printf("\t\t(only valid with -S)\n");
 	printf(" -S <period>               show performance result in real time every <period> seconds\n");
+	printf(" -T <target>               target bdev\n");
+	printf(" -z                        start bdevperf, but wait for RPC to start tests\n");
 }
 
 /*
@@ -806,11 +938,24 @@ static struct bdevperf_task *bdevperf_construct_task_on_target(struct io_target 
 		return NULL;
 	}
 
-	task->buf = spdk_dma_zmalloc(g_io_size, g_min_alignment, NULL);
+	task->buf = spdk_zmalloc(g_io_size, g_min_alignment, NULL, SPDK_ENV_LCORE_ID_ANY,
+				 SPDK_MALLOC_DMA);
 	if (!task->buf) {
 		fprintf(stderr, "Cannot allocate buf for task=%p\n", task);
 		free(task);
 		return NULL;
+	}
+
+	if (spdk_bdev_is_md_separate(target->bdev)) {
+		task->md_buf = spdk_zmalloc(target->io_size_blocks *
+					    spdk_bdev_get_md_size(target->bdev), 0, NULL,
+					    SPDK_ENV_LCORE_ID_ANY, SPDK_MALLOC_DMA);
+		if (!task->md_buf) {
+			fprintf(stderr, "Cannot allocate md buf for task=%p\n", task);
+			free(task->buf);
+			free(task);
+			return NULL;
+		}
 	}
 
 	task->target = target;
@@ -861,32 +1006,159 @@ ret:
 	return -1;
 }
 
-static void
-bdevperf_run(void *arg1)
+static int
+verify_test_params(struct spdk_app_opts *opts)
+{
+	/* When RPC is used for starting tests and
+	 * no rpc_addr was configured for the app,
+	 * use the default address. */
+	if (g_wait_for_tests && opts->rpc_addr == NULL) {
+		opts->rpc_addr = SPDK_DEFAULT_RPC_ADDR;
+	}
+
+	if (g_queue_depth <= 0) {
+		spdk_app_usage();
+		bdevperf_usage();
+		return 1;
+	}
+	if (g_io_size <= 0) {
+		spdk_app_usage();
+		bdevperf_usage();
+		return 1;
+	}
+	if (!g_workload_type) {
+		spdk_app_usage();
+		bdevperf_usage();
+		return 1;
+	}
+	if (g_time_in_sec <= 0) {
+		spdk_app_usage();
+		bdevperf_usage();
+		return 1;
+	}
+	g_time_in_usec = g_time_in_sec * 1000000LL;
+
+	if (g_show_performance_ema_period > 0 &&
+	    g_show_performance_real_time == 0) {
+		fprintf(stderr, "-P option must be specified with -S option\n");
+		return 1;
+	}
+
+	if (strcmp(g_workload_type, "read") &&
+	    strcmp(g_workload_type, "write") &&
+	    strcmp(g_workload_type, "randread") &&
+	    strcmp(g_workload_type, "randwrite") &&
+	    strcmp(g_workload_type, "rw") &&
+	    strcmp(g_workload_type, "randrw") &&
+	    strcmp(g_workload_type, "verify") &&
+	    strcmp(g_workload_type, "reset") &&
+	    strcmp(g_workload_type, "unmap") &&
+	    strcmp(g_workload_type, "write_zeroes") &&
+	    strcmp(g_workload_type, "flush")) {
+		fprintf(stderr,
+			"io pattern type must be one of\n"
+			"(read, write, randread, randwrite, rw, randrw, verify, reset, unmap, flush)\n");
+		return 1;
+	}
+
+	if (!strcmp(g_workload_type, "read") ||
+	    !strcmp(g_workload_type, "randread")) {
+		g_rw_percentage = 100;
+	}
+
+	if (!strcmp(g_workload_type, "write") ||
+	    !strcmp(g_workload_type, "randwrite")) {
+		g_rw_percentage = 0;
+	}
+
+	if (!strcmp(g_workload_type, "unmap")) {
+		g_unmap = true;
+	}
+
+	if (!strcmp(g_workload_type, "write_zeroes")) {
+		g_write_zeroes = true;
+	}
+
+	if (!strcmp(g_workload_type, "flush")) {
+		g_flush = true;
+	}
+
+	if (!strcmp(g_workload_type, "verify") ||
+	    !strcmp(g_workload_type, "reset")) {
+		g_rw_percentage = 50;
+		if (g_io_size > SPDK_BDEV_LARGE_BUF_MAX_SIZE) {
+			fprintf(stderr, "Unable to exceed max I/O size of %d for verify. (%d provided).\n",
+				SPDK_BDEV_LARGE_BUF_MAX_SIZE, g_io_size);
+			return 1;
+		}
+		if (opts->reactor_mask) {
+			fprintf(stderr, "Ignoring -m option. Verify can only run with a single core.\n");
+			opts->reactor_mask = NULL;
+		}
+		g_verify = true;
+		if (!strcmp(g_workload_type, "reset")) {
+			g_reset = true;
+		}
+	}
+
+	if (!strcmp(g_workload_type, "read") ||
+	    !strcmp(g_workload_type, "randread") ||
+	    !strcmp(g_workload_type, "write") ||
+	    !strcmp(g_workload_type, "randwrite") ||
+	    !strcmp(g_workload_type, "verify") ||
+	    !strcmp(g_workload_type, "reset") ||
+	    !strcmp(g_workload_type, "unmap") ||
+	    !strcmp(g_workload_type, "write_zeroes") ||
+	    !strcmp(g_workload_type, "flush")) {
+		if (g_mix_specified) {
+			fprintf(stderr, "Ignoring -M option... Please use -M option"
+				" only when using rw or randrw.\n");
+		}
+	}
+
+	if (!strcmp(g_workload_type, "rw") ||
+	    !strcmp(g_workload_type, "randrw")) {
+		if (g_rw_percentage < 0 || g_rw_percentage > 100) {
+			fprintf(stderr,
+				"-M must be specified to value from 0 to 100 "
+				"for rw or randrw.\n");
+			return 1;
+		}
+	}
+
+	if (!strcmp(g_workload_type, "read") ||
+	    !strcmp(g_workload_type, "write") ||
+	    !strcmp(g_workload_type, "rw") ||
+	    !strcmp(g_workload_type, "verify") ||
+	    !strcmp(g_workload_type, "reset") ||
+	    !strcmp(g_workload_type, "unmap") ||
+	    !strcmp(g_workload_type, "write_zeroes")) {
+		g_is_random = 0;
+	} else {
+		g_is_random = 1;
+	}
+
+	if (g_io_size > SPDK_BDEV_LARGE_BUF_MAX_SIZE) {
+		printf("I/O size of %d is greater than zero copy threshold (%d).\n",
+		       g_io_size, SPDK_BDEV_LARGE_BUF_MAX_SIZE);
+		printf("Zero copy mechanism will not be used.\n");
+		g_zcopy = false;
+	}
+
+	return 0;
+}
+
+static int
+bdevperf_test(void)
 {
 	uint32_t i;
 	struct io_target *target;
 	struct spdk_event *event;
 	int rc;
 
-	rc = blockdev_heads_init();
-	if (rc) {
-		spdk_app_stop(1);
-		return;
-	}
-
-	bdevperf_construct_targets();
-
-	if (g_target_count == 0) {
-		fprintf(stderr, "No valid bdevs found.\n");
-		spdk_app_stop(1);
-		return;
-	}
-
 	rc = bdevperf_construct_targets_tasks();
 	if (rc) {
-		spdk_app_stop(1);
-		return;
+		return rc;
 	}
 
 	printf("Running I/O for %" PRIu64 " seconds...\n", g_time_in_usec / 1000000);
@@ -899,16 +1171,49 @@ bdevperf_run(void *arg1)
 						    g_show_performance_period_in_usec);
 	}
 
-	g_master_core = spdk_env_get_current_core();
 	/* Send events to start all I/O */
 	for (i = 0; i < spdk_env_get_core_count(); i++) {
 		target = g_head[i];
 		if (target == NULL) {
-			break;
+			return -1;
 		}
 		event = spdk_event_allocate(target->lcore, bdevperf_submit_on_core,
 					    target, NULL);
 		spdk_event_call(event);
+	}
+	return 0;
+}
+
+static void
+bdevperf_run(void *arg1)
+{
+	int rc;
+
+	rc = blockdev_heads_init();
+	if (rc) {
+		spdk_app_stop(1);
+		return;
+	}
+
+	g_master_core = spdk_env_get_current_core();
+
+	if (g_wait_for_tests) {
+		/* Do not perform any tests until RPC is received */
+		return;
+	}
+
+	bdevperf_construct_targets();
+
+	if (g_target_count == 0) {
+		fprintf(stderr, "No valid bdevs found.\n");
+		spdk_app_stop(1);
+		return;
+	}
+
+	rc = bdevperf_test();
+	if (rc) {
+		spdk_app_stop(1);
+		return;
 	}
 }
 
@@ -932,6 +1237,12 @@ spdk_bdevperf_shutdown_cb(void)
 	struct spdk_event *event;
 
 	g_shutdown = true;
+
+	if (g_target_count == 0) {
+		spdk_app_stop(0);
+		return;
+	}
+
 	g_shutdown_tsc = spdk_get_ticks() - g_shutdown_tsc;
 
 	/* Send events to stop all I/O on each core */
@@ -956,6 +1267,10 @@ bdevperf_parse_arg(int ch, char *arg)
 
 	if (ch == 'w') {
 		g_workload_type = optarg;
+	} else if (ch == 'T') {
+		g_target_bdev_name = optarg;
+	} else if (ch == 'z') {
+		g_wait_for_tests = true;
 	} else {
 		tmp = spdk_strtoll(optarg, 10);
 		if (tmp < 0) {
@@ -996,6 +1311,67 @@ bdevperf_parse_arg(int ch, char *arg)
 	return 0;
 }
 
+static void
+rpc_perform_tests_cb(int rc)
+{
+	struct spdk_json_write_ctx *w;
+	struct spdk_jsonrpc_request *request = g_request;
+
+	g_request = NULL;
+
+	if (rc == 0) {
+		w = spdk_jsonrpc_begin_result(request);
+		if (w == NULL) {
+			return;
+		}
+		spdk_json_write_uint32(w, rc);
+		spdk_jsonrpc_end_result(request, w);
+	} else {
+		spdk_jsonrpc_send_error_response_fmt(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
+						     "bdevperf failed with error %s", spdk_strerror(-rc));
+	}
+
+	bdevperf_free_targets();
+}
+
+static void
+rpc_perform_tests(struct spdk_jsonrpc_request *request, const struct spdk_json_val *params)
+{
+	int rc;
+
+	if (params != NULL) {
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+						 "perform_tests method requires no parameters");
+		return;
+	}
+	if (g_request != NULL) {
+		fprintf(stderr, "Another test is already in progress.\n");
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
+						 spdk_strerror(-EINPROGRESS));
+		return;
+	}
+	g_request = request;
+
+	bdevperf_construct_targets();
+	if (g_target_count == 0) {
+		g_request = NULL;
+		fprintf(stderr, "No valid bdevs found.\n");
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
+						 spdk_strerror(-ENODEV));
+		return;
+	}
+
+	rc = bdevperf_test();
+	if (rc) {
+		g_request = NULL;
+		bdevperf_free_targets();
+		spdk_jsonrpc_send_error_response_fmt(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
+						     "Could not perform tests due to error: %s", spdk_strerror(-rc));
+		return;
+	}
+}
+SPDK_RPC_REGISTER("perform_tests", rpc_perform_tests, SPDK_RPC_RUNTIME)
+
 int
 main(int argc, char **argv)
 {
@@ -1015,158 +1391,19 @@ main(int argc, char **argv)
 	g_time_in_sec = 0;
 	g_mix_specified = false;
 
-	if ((rc = spdk_app_parse_args(argc, argv, &opts, "q:o:t:w:M:P:S:", NULL,
+	if ((rc = spdk_app_parse_args(argc, argv, &opts, "zq:o:t:w:M:P:S:T:", NULL,
 				      bdevperf_parse_arg, bdevperf_usage)) !=
 	    SPDK_APP_PARSE_ARGS_SUCCESS) {
 		return rc;
 	}
 
-	if (g_queue_depth <= 0) {
-		spdk_app_usage();
-		bdevperf_usage();
+	if (verify_test_params(&opts) != 0) {
 		exit(1);
-	}
-	if (g_io_size <= 0) {
-		spdk_app_usage();
-		bdevperf_usage();
-		exit(1);
-	}
-	if (!g_workload_type) {
-		spdk_app_usage();
-		bdevperf_usage();
-		exit(1);
-	}
-	if (g_time_in_sec <= 0) {
-		spdk_app_usage();
-		bdevperf_usage();
-		exit(1);
-	}
-	g_time_in_usec = g_time_in_sec * 1000000LL;
-
-	if (g_show_performance_ema_period > 0 &&
-	    g_show_performance_real_time == 0) {
-		fprintf(stderr, "-P option must be specified with -S option\n");
-		exit(1);
-	}
-
-	if (strcmp(g_workload_type, "read") &&
-	    strcmp(g_workload_type, "write") &&
-	    strcmp(g_workload_type, "randread") &&
-	    strcmp(g_workload_type, "randwrite") &&
-	    strcmp(g_workload_type, "rw") &&
-	    strcmp(g_workload_type, "randrw") &&
-	    strcmp(g_workload_type, "verify") &&
-	    strcmp(g_workload_type, "reset") &&
-	    strcmp(g_workload_type, "unmap") &&
-	    strcmp(g_workload_type, "write_zeroes") &&
-	    strcmp(g_workload_type, "flush")) {
-		fprintf(stderr,
-			"io pattern type must be one of\n"
-			"(read, write, randread, randwrite, rw, randrw, verify, reset, unmap, flush)\n");
-		exit(1);
-	}
-
-	if (!strcmp(g_workload_type, "read") ||
-	    !strcmp(g_workload_type, "randread")) {
-		g_rw_percentage = 100;
-	}
-
-	if (!strcmp(g_workload_type, "write") ||
-	    !strcmp(g_workload_type, "randwrite")) {
-		g_rw_percentage = 0;
-	}
-
-	if (!strcmp(g_workload_type, "unmap")) {
-		g_unmap = true;
-	}
-
-	if (!strcmp(g_workload_type, "write_zeroes")) {
-		g_write_zeroes = true;
-	}
-
-	if (!strcmp(g_workload_type, "flush")) {
-		g_flush = true;
-	}
-
-	if (!strcmp(g_workload_type, "verify") ||
-	    !strcmp(g_workload_type, "reset")) {
-		g_rw_percentage = 50;
-		if (g_io_size > SPDK_BDEV_LARGE_BUF_MAX_SIZE) {
-			fprintf(stderr, "Unable to exceed max I/O size of %d for verify. (%d provided).\n",
-				SPDK_BDEV_LARGE_BUF_MAX_SIZE, g_io_size);
-			exit(1);
-		}
-		if (opts.reactor_mask) {
-			fprintf(stderr, "Ignoring -m option. Verify can only run with a single core.\n");
-			opts.reactor_mask = NULL;
-		}
-		g_verify = true;
-		if (!strcmp(g_workload_type, "reset")) {
-			g_reset = true;
-		}
-	}
-
-	if (!strcmp(g_workload_type, "read") ||
-	    !strcmp(g_workload_type, "randread") ||
-	    !strcmp(g_workload_type, "write") ||
-	    !strcmp(g_workload_type, "randwrite") ||
-	    !strcmp(g_workload_type, "verify") ||
-	    !strcmp(g_workload_type, "reset") ||
-	    !strcmp(g_workload_type, "unmap") ||
-	    !strcmp(g_workload_type, "write_zeroes") ||
-	    !strcmp(g_workload_type, "flush")) {
-		if (g_mix_specified) {
-			fprintf(stderr, "Ignoring -M option... Please use -M option"
-				" only when using rw or randrw.\n");
-		}
-	}
-
-	if (!strcmp(g_workload_type, "rw") ||
-	    !strcmp(g_workload_type, "randrw")) {
-		if (g_rw_percentage < 0 || g_rw_percentage > 100) {
-			fprintf(stderr,
-				"-M must be specified to value from 0 to 100 "
-				"for rw or randrw.\n");
-			exit(1);
-		}
-	}
-
-	if (!strcmp(g_workload_type, "read") ||
-	    !strcmp(g_workload_type, "write") ||
-	    !strcmp(g_workload_type, "rw") ||
-	    !strcmp(g_workload_type, "verify") ||
-	    !strcmp(g_workload_type, "reset") ||
-	    !strcmp(g_workload_type, "unmap") ||
-	    !strcmp(g_workload_type, "write_zeroes")) {
-		g_is_random = 0;
-	} else {
-		g_is_random = 1;
-	}
-
-	if (g_io_size > SPDK_BDEV_LARGE_BUF_MAX_SIZE) {
-		printf("I/O size of %d is greater than zero copy threshold (%d).\n",
-		       g_io_size, SPDK_BDEV_LARGE_BUF_MAX_SIZE);
-		printf("Zero copy mechanism will not be used.\n");
-		g_zcopy = false;
 	}
 
 	rc = spdk_app_start(&opts, bdevperf_run, NULL);
 	if (rc) {
 		g_run_failed = true;
-	}
-
-	if (g_shutdown) {
-		g_time_in_usec = g_shutdown_tsc * 1000000 / spdk_get_ticks_hz();
-		printf("Received shutdown signal, test time is about %.6f seconds\n",
-		       (double)g_time_in_usec / 1000000);
-	}
-
-	if (g_time_in_usec) {
-		if (!g_run_failed) {
-			performance_dump(g_time_in_usec, 0);
-		}
-	} else {
-		printf("Test time less than one microsecond, no performance data will be shown\n");
 	}
 
 	blockdev_heads_destroy();

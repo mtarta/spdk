@@ -297,7 +297,8 @@ struct spdk_bdev {
 	/**
 	 * UUID for this bdev.
 	 *
-	 * Fill with zeroes if no uuid is available.
+	 * Fill with zeroes if no uuid is available. The bdev layer
+	 * will automatically populate this if necessary.
 	 */
 	struct spdk_uuid uuid;
 
@@ -440,6 +441,9 @@ struct spdk_bdev_io {
 			/** For SG buffer cases, number of iovecs in iovec array. */
 			int iovcnt;
 
+			/* Metadata buffer */
+			void *md_buf;
+
 			/** Total size of data to be transferred. */
 			uint64_t num_blocks;
 
@@ -457,6 +461,17 @@ struct spdk_bdev_io {
 
 			/** count of outstanding batched split I/Os */
 			uint32_t split_outstanding;
+
+			struct {
+				/** Whether the buffer should be populated with the real data */
+				uint8_t populate : 1;
+
+				/** Whether the buffer should be committed back to disk */
+				uint8_t commit : 1;
+
+				/** True if this request is in the 'start' phase of zcopy. False if in 'end'. */
+				uint8_t start : 1;
+			} zcopy;
 		} bdev;
 		struct {
 			/** Channel reference held while messages for this reset are in progress. */
@@ -549,6 +564,7 @@ struct spdk_bdev_io {
 		struct iovec  bounce_iov;
 		struct iovec *orig_iovs;
 		int           orig_iovcnt;
+		void	     *orig_md_buf;
 
 		/** Callback for when buf is allocated */
 		spdk_bdev_io_get_buf_cb get_buf_cb;
@@ -583,7 +599,10 @@ struct spdk_bdev_io {
 int spdk_bdev_register(struct spdk_bdev *bdev);
 
 /**
- * Unregister a bdev
+ * Start unregistering a bdev. This will notify each currently open descriptor
+ * on this bdev about the hotremoval in hopes that the upper layers will stop
+ * using this bdev and manually close all the descriptors with spdk_bdev_close().
+ * The actual bdev unregistration may be deferred until all descriptors are closed.
  *
  * \param bdev Block device to unregister.
  * \param cb_fn Callback function to be called when the unregister is complete.
@@ -606,6 +625,10 @@ void spdk_bdev_destruct_done(struct spdk_bdev *bdev, int bdeverrno);
 
 /**
  * Register a virtual bdev.
+ *
+ * This function is deprecated.  Users should call spdk_bdev_register instead.
+ * The bdev layer currently makes no use of the base_bdevs array, so switching
+ * to spdk_bdev_register results in no loss of functionality.
  *
  * \param vbdev Virtual bdev to register.
  * \param base_bdevs Array of bdevs upon which this vbdev is based.
@@ -741,6 +764,15 @@ void spdk_bdev_io_get_buf(struct spdk_bdev_io *bdev_io, spdk_bdev_io_get_buf_cb 
  *
  */
 void spdk_bdev_io_set_buf(struct spdk_bdev_io *bdev_io, void *buf, size_t len);
+
+/**
+ * Set the given buffer as metadata buffer described by this bdev_io.
+ *
+ * \param bdev_io I/O to set the buffer on.
+ * \param md_buf The buffer to set as the active metadata buffer.
+ * \param len The length of the metadata buffer.
+ */
+void spdk_bdev_io_set_md_buf(struct spdk_bdev_io *bdev_io, void *md_buf, size_t len);
 
 /**
  * Complete a bdev_io

@@ -76,7 +76,7 @@ static const struct spdk_json_object_decoder rpc_copy_engine_ioat_decoder[] = {
 };
 
 static void
-spdk_rpc_scan_copy_engine_ioat(struct spdk_jsonrpc_request *request,
+spdk_rpc_scan_ioat_copy_engine(struct spdk_jsonrpc_request *request,
 			       const struct spdk_json_val *params)
 {
 	struct rpc_copy_engine_ioat req = {};
@@ -108,11 +108,7 @@ spdk_rpc_scan_copy_engine_ioat(struct spdk_jsonrpc_request *request,
 	copy_engine_ioat_enable_probe();
 
 	w = spdk_jsonrpc_begin_result(request);
-	if (w == NULL) {
-		return;
-	}
-
 	spdk_json_write_bool(w, true);
 	spdk_jsonrpc_end_result(request, w);
 }
-SPDK_RPC_REGISTER("scan_ioat_copy_engine", spdk_rpc_scan_copy_engine_ioat, SPDK_RPC_STARTUP)
+SPDK_RPC_REGISTER("scan_ioat_copy_engine", spdk_rpc_scan_ioat_copy_engine, SPDK_RPC_STARTUP)

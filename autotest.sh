@@ -1,10 +1,17 @@
 #!/usr/bin/env bash
 
 rootdir=$(readlink -f $(dirname $0))
+
+# In autotest_common.sh all tests are disabled by default.
+# If the configuration of tests is not provided, no tests will be carried out.
+if [[ ! -f $1 ]]; then
+	echo "ERROR: SPDK test configuration not specified"
+	exit 1
+fi
+
+source "$1"
 source "$rootdir/test/common/autotest_common.sh"
 source "$rootdir/test/nvmf/common.sh"
-
-set -xe
 
 if [ $EUID -ne 0 ]; then
 	echo "$0 must be run as root"
@@ -107,10 +114,6 @@ done
 
 sync
 
-if [ $(uname -s) = Linux ]; then
-	# Load RAM disk driver if available
-	modprobe brd || true
-fi
 timing_exit cleanup
 
 # set up huge pages
@@ -122,7 +125,7 @@ timing_enter nvmf_setup
 rdma_device_init
 timing_exit nvmf_setup
 
-if [ $SPDK_TEST_CRYPTO -eq 1 ]; then
+if [[ $SPDK_TEST_CRYPTO -eq 1 || $SPDK_TEST_REDUCE -eq 1 ]]; then
 	if grep -q '#define SPDK_CONFIG_IGB_UIO_DRIVER 1' $rootdir/include/spdk/config.h; then
 		./scripts/qat_setup.sh igb_uio
 	else
@@ -151,7 +154,9 @@ if [ $SPDK_RUN_FUNCTIONAL_TEST -eq 1 ]; then
 
 	if [ $SPDK_TEST_BLOCKDEV -eq 1 ]; then
 		run_test suite test/bdev/blockdev.sh
-		run_test suite test/bdev/bdev_raid.sh
+		if [[ $RUN_NIGHTLY -eq 1 ]]; then
+			run_test suite test/bdev/bdev_raid.sh
+		fi
 	fi
 
 	if [ $SPDK_TEST_JSON -eq 1 ]; then
@@ -185,6 +190,13 @@ if [ $SPDK_RUN_FUNCTIONAL_TEST -eq 1 ]; then
 	if [ $SPDK_TEST_ISCSI -eq 1 ]; then
 		run_test suite ./test/iscsi_tgt/iscsi_tgt.sh posix
 		run_test suite ./test/spdkcli/iscsi.sh
+
+		# Run raid spdkcli test under iSCSI since blockdev tests run on systems that can't run spdkcli yet
+		run_test suite test/spdkcli/raid.sh
+	fi
+
+	if [ $SPDK_TEST_VPP -eq 1 ]; then
+		run_test suite ./test/iscsi_tgt/iscsi_tgt.sh vpp
 	fi
 
 	if [ $SPDK_TEST_BLOBFS -eq 1 ]; then
@@ -193,7 +205,7 @@ if [ $SPDK_RUN_FUNCTIONAL_TEST -eq 1 ]; then
 	fi
 
 	if [ $SPDK_TEST_NVMF -eq 1 ]; then
-		run_test suite ./test/nvmf/nvmf.sh
+		run_test suite ./test/nvmf/nvmf.sh --transport=$SPDK_TEST_NVMF_TRANSPORT
 		run_test suite ./test/spdkcli/nvmf.sh
 	fi
 
@@ -215,6 +227,7 @@ if [ $SPDK_RUN_FUNCTIONAL_TEST -eq 1 ]; then
 		run_test suite ./test/vhost/initiator/blockdev.sh
 		run_test suite ./test/spdkcli/virtio.sh
 		run_test suite ./test/vhost/shared/shared.sh
+		run_test suite ./test/vhost/fuzz/fuzz.sh
 		report_test_completion "vhost_initiator"
 		timing_exit vhost_initiator
 	fi
@@ -234,6 +247,10 @@ if [ $SPDK_RUN_FUNCTIONAL_TEST -eq 1 ]; then
 
 	if [ $SPDK_TEST_BDEV_FTL -eq 1 ]; then
 		run_test suite ./test/ftl/ftl.sh
+	fi
+
+	if [ $SPDK_TEST_VMD -eq 1 ]; then
+		run_test suite ./test/vmd/vmd.sh
 	fi
 fi
 

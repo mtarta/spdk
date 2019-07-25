@@ -181,6 +181,13 @@ struct spdk_nvme_ctrlr_opts {
 	 * Set to true, means having data digest for the data in the NVMe/TCP PDU
 	 */
 	bool data_digest;
+
+	/**
+	 * Disable logging of requests that are completed with error status.
+	 *
+	 * Defaults to 'false' (errors are logged).
+	 */
+	bool disable_error_logging;
 };
 
 /**
@@ -946,6 +953,34 @@ struct spdk_nvme_io_qpair_opts {
 	 *
 	 * This only applies to local PCIe devices. */
 	bool delay_pcie_doorbell;
+
+	/**
+	 * These fields allow specifying the memory buffers for the submission and/or
+	 * completion queues.
+	 * By default, vaddr is set to NULL meaning SPDK will allocate the memory to be used.
+	 * If vaddr is NULL then paddr must be set to 0.
+	 * If vaddr is non-NULL, and paddr is zero, SPDK derives the physical
+	 * address for the NVMe device, in this case the memory must be registered.
+	 * If a paddr value is non-zero, SPDK uses the vaddr and paddr as passed
+	 * SPDK assumes that the memory passed is both virtually and physically
+	 * contiguous.
+	 * If these fields are used, SPDK will NOT impose any restriction
+	 * on the number of elements in the queues.
+	 * The buffer sizes are in number of bytes, and are used to confirm
+	 * that the buffers are large enough to contain the appropriate queue.
+	 * These fields are only used by PCIe attached NVMe devices.  They
+	 * are presently ignored for other transports.
+	 */
+	struct {
+		struct spdk_nvme_cmd *vaddr;
+		uint64_t paddr;
+		uint64_t buffer_size;
+	} sq;
+	struct {
+		struct spdk_nvme_cpl *vaddr;
+		uint64_t paddr;
+		uint64_t buffer_size;
+	} cq;
 };
 
 /**
@@ -986,6 +1021,43 @@ struct spdk_nvme_qpair *spdk_nvme_ctrlr_alloc_io_qpair(struct spdk_nvme_ctrlr *c
  * \return 0 on success, -1 on failure.
  */
 int spdk_nvme_ctrlr_free_io_qpair(struct spdk_nvme_qpair *qpair);
+
+/**
+ * Send the given NVM I/O command, I/O buffers, lists and all to the NVMe controller.
+ *
+ * This is a low level interface for submitting I/O commands directly.
+ *
+ * This function allows a caller to submit an I/O request that is
+ * COMPLETELY pre-defined, right down to the "physical" memory buffers.
+ * It is intended for testing hardware, specifying exact buffer location,
+ * alignment, and offset.  It also allows for specific choice of PRP
+ * and SGLs.
+ *
+ * The driver sets the CID.  EVERYTHING else is assumed set by the caller.
+ * Needless to say, this is potentially extremely dangerous for both the host
+ * (accidental/malicionus storage usage/corruption), and the device.
+ * Thus its intent is for very specific hardware testing and environment
+ * reproduction.
+ *
+ * The command is submitted to a qpair allocated by spdk_nvme_ctrlr_alloc_io_qpair().
+ * The user must ensure that only one thread submits I/O on a given qpair at any
+ * given time.
+ *
+ * This function can only be used on PCIe controllers and qpairs.
+ *
+ * \param ctrlr Opaque handle to NVMe controller.
+ * \param qpair I/O qpair to submit command.
+ * \param cmd NVM I/O command to submit.
+ * \param cb_fn Callback function invoked when the I/O command completes.
+ * \param cb_arg Argument passed to callback function.
+ *
+ * \return 0 on success, negated errno on failure.
+ */
+
+int spdk_nvme_ctrlr_io_cmd_raw_no_payload_build(struct spdk_nvme_ctrlr *ctrlr,
+		struct spdk_nvme_qpair *qpair,
+		struct spdk_nvme_cmd *cmd,
+		spdk_nvme_cmd_cb cb_fn, void *cb_arg);
 
 /**
  * Send the given NVM I/O command to the NVMe controller.
@@ -1468,6 +1540,18 @@ int spdk_nvme_ctrlr_update_firmware(struct spdk_nvme_ctrlr *ctrlr, void *payload
 				    struct spdk_nvme_status *completion_status);
 
 /**
+ * Return virtual address of PCIe NVM I/O registers
+ *
+ * This function returns a pointer to the PCIe I/O registers for a controller
+ * or NULL if unsupported for this transport.
+ *
+ * \param ctrlr Controller whose registers are to be accessed.
+ *
+ * \return Pointer to virtual address of register bank, or NULL.
+ */
+volatile struct spdk_nvme_registers *spdk_nvme_ctrlr_get_registers(struct spdk_nvme_ctrlr *ctrlr);
+
+/**
  * Allocate an I/O buffer from the controller memory buffer (Experimental).
  *
  * This function allocates registered memory which belongs to the Controller
@@ -1495,6 +1579,15 @@ void *spdk_nvme_ctrlr_alloc_cmb_io_buffer(struct spdk_nvme_ctrlr *ctrlr, size_t 
  * \param size Size of buf in bytes.
  */
 void spdk_nvme_ctrlr_free_cmb_io_buffer(struct spdk_nvme_ctrlr *ctrlr, void *buf, size_t size);
+
+/**
+ * Get the transport ID for a given NVMe controller.
+ *
+ * \param ctrlr Controller to get the transport ID.
+ * \return Pointer to the controller's transport ID.
+ */
+const struct spdk_nvme_transport_id *spdk_nvme_ctrlr_get_transport_id(
+	struct spdk_nvme_ctrlr *ctrlr);
 
 /**
  * Get the identify namespace data as defined by the NVMe specification.
@@ -2252,6 +2345,32 @@ int spdk_nvme_qpair_add_cmd_error_injection(struct spdk_nvme_ctrlr *ctrlr,
 void spdk_nvme_qpair_remove_cmd_error_injection(struct spdk_nvme_ctrlr *ctrlr,
 		struct spdk_nvme_qpair *qpair,
 		uint8_t opc);
+
+/**
+ * \brief Given NVMe status, return ASCII string for that error.
+ *
+ * \param status Status from NVMe completion queue element.
+ * \return Returns status as an ASCII string.
+ */
+const char *spdk_nvme_cpl_get_status_string(const struct spdk_nvme_status *status);
+
+/**
+ * \brief Prints (SPDK_NOTICELOG) the contents of an NVMe submission queue entry (command).
+ *
+ * \param qpair Pointer to the NVMe queue pair - used to determine admin versus I/O queue.
+ * \param cmd Pointer to the submission queue command to be formatted.
+ */
+void spdk_nvme_qpair_print_command(struct spdk_nvme_qpair *qpair,
+				   struct spdk_nvme_cmd *cmd);
+
+/**
+ * \brief Prints (SPDK_NOTICELOG) the contents of an NVMe completion queue entry.
+ *
+ * \param qpair Pointer to the NVMe queue pair - presently unused.
+ * \param cpl Pointer to the completion queue element to be formatted.
+ */
+void spdk_nvme_qpair_print_completion(struct spdk_nvme_qpair *qpair,
+				      struct spdk_nvme_cpl *cpl);
 
 #ifdef SPDK_CONFIG_RDMA
 struct ibv_context;

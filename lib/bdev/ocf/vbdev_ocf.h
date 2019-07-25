@@ -39,6 +39,8 @@
 #include "spdk/bdev.h"
 #include "spdk/bdev_module.h"
 
+#define VBDEV_OCF_MD_MAX_LEN 4096
+
 struct vbdev_ocf;
 
 /* Context for OCF queue poller
@@ -65,6 +67,8 @@ struct vbdev_ocf_state {
 	bool                         doing_reset;
 	/* From the moment when exp_bdev is registered */
 	bool                         started;
+	/* Status of last attempt for stopping this device */
+	int                          stop_status;
 };
 
 /*
@@ -79,6 +83,37 @@ struct vbdev_ocf_config {
 
 	/* Core initial config */
 	struct ocf_mngt_core_config         core;
+
+	/* Load flag, if set to true, then we will try load cache instance from disk,
+	 * otherwise we will create new cache on that disk */
+	bool                                loadq;
+};
+
+/* Types for management operations */
+typedef void (*vbdev_ocf_mngt_fn)(struct vbdev_ocf *);
+typedef void (*vbdev_ocf_mngt_callback)(int, struct vbdev_ocf *, void *);
+
+/* Context for asynchronous management operations
+ * Single management operation usually contains a list of sub procedures,
+ * this structure handles sharing between those sub procedures */
+struct vbdev_ocf_mngt_ctx {
+	/* Pointer to function that is currently being executed
+	 * It gets incremented on each step until it dereferences to NULL */
+	vbdev_ocf_mngt_fn                  *current_step;
+
+	/* Poller, registered once per whole management operation */
+	struct spdk_poller                 *poller;
+	/* Function that gets invoked by poller on each iteration */
+	vbdev_ocf_mngt_fn                   poller_fn;
+	/* Poller timeout time stamp - when the poller should stop with error */
+	uint64_t                            timeout_ts;
+
+	/* Status of management operation */
+	int                                 status;
+
+	/* External callback and its argument */
+	vbdev_ocf_mngt_callback             cb;
+	void                               *cb_arg;
 };
 
 /* Base device info */
@@ -100,6 +135,9 @@ struct vbdev_ocf_base {
 
 	/* True if SPDK bdev has been claimed and opened for writing */
 	bool                         attached;
+
+	/* Channel for cleaner operations */
+	struct spdk_io_channel      *management_channel;
 
 	/* Reference to main vbdev */
 	struct vbdev_ocf            *parent;
@@ -125,18 +163,29 @@ struct vbdev_ocf {
 	struct vbdev_ocf_config      cfg;
 	struct vbdev_ocf_state       state;
 
+	/* Management context */
+	struct vbdev_ocf_mngt_ctx    mngt_ctx;
+	/* Cache conext */
+	struct vbdev_ocf_cache_ctx  *cache_ctx;
+
 	/* Exposed SPDK bdev. Registered in bdev layer */
 	struct spdk_bdev             exp_bdev;
+
+	/* OCF uuid for core device of this vbdev */
+	char uuid[VBDEV_OCF_MD_MAX_LEN];
 
 	/* Link to global list of this type structures */
 	TAILQ_ENTRY(vbdev_ocf)       tailq;
 };
 
-int vbdev_ocf_construct(
+void vbdev_ocf_construct(
 	const char *vbdev_name,
 	const char *cache_mode_name,
 	const char *cache_name,
-	const char *core_name);
+	const char *core_name,
+	bool loadq,
+	void (*cb)(int, struct vbdev_ocf *, void *),
+	void *cb_arg);
 
 /* If vbdev is online, return its object */
 struct vbdev_ocf *vbdev_ocf_get_by_name(const char *name);
@@ -145,7 +194,7 @@ struct vbdev_ocf *vbdev_ocf_get_by_name(const char *name);
 struct vbdev_ocf_base *vbdev_ocf_get_base_by_name(const char *name);
 
 /* Stop OCF cache and unregister SPDK bdev */
-int vbdev_ocf_delete(struct vbdev_ocf *vbdev);
+int vbdev_ocf_delete(struct vbdev_ocf *vbdev, void (*cb)(void *, int), void *cb_arg);
 
 typedef void (*vbdev_ocf_foreach_fn)(struct vbdev_ocf *, void *);
 

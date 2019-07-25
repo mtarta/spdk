@@ -14,6 +14,10 @@ function nproc() {
 
 fi
 
+function version_lt() {
+	[ $( echo -e "$1\n$2" | sort -V | head -1 ) != "$1" ]
+}
+
 rc=0
 
 echo -n "Checking file permissions..."
@@ -92,6 +96,14 @@ else
 	echo "You do not have astyle installed so your code style is not being checked!"
 fi
 
+GIT_VERSION=$( git --version | cut -d' ' -f3 )
+
+if version_lt "1.9.5" "${GIT_VERSION}"; then
+	# git <1.9.5 doesn't support pathspec magic exclude
+	echo " Your git version is too old to perform all tests. Please update git to at least 1.9.5 version..."
+	exit 0
+fi
+
 echo -n "Checking comment style..."
 
 git grep --line-number -e '/[*][^ *-]' -- '*.[ch]' > comment.log || true
@@ -110,7 +122,7 @@ fi
 rm -f comment.log
 
 echo -n "Checking for spaces before tabs..."
-git grep --line-number $' \t' -- > whitespace.log || true
+git grep --line-number $' \t' -- './*' ':!*.patch' > whitespace.log || true
 if [ -s whitespace.log ]; then
 	echo " Spaces before tabs detected"
 	cat whitespace.log
@@ -159,7 +171,7 @@ rm -f badcunit.log
 
 echo -n "Checking blank lines at end of file..."
 
-if ! git grep -I -l -e . -z | \
+if ! git grep -I -l -e . -z  './*' ':!*.patch' | \
 	xargs -0 -P$(nproc) -n1 scripts/eofnl > eofnl.log; then
 	echo " Incorrect end-of-file formatting detected"
 	cat eofnl.log
@@ -170,7 +182,7 @@ fi
 rm -f eofnl.log
 
 echo -n "Checking for POSIX includes..."
-git grep -I -i -f scripts/posix.txt -- './*' ':!include/spdk/stdinc.h' ':!include/linux/**' ':!lib/vhost/rte_vhost*/**' ':!scripts/posix.txt' > scripts/posix.log || true
+git grep -I -i -f scripts/posix.txt -- './*' ':!include/spdk/stdinc.h' ':!include/linux/**' ':!lib/vhost/rte_vhost*/**' ':!scripts/posix.txt' ':!*.patch' > scripts/posix.log || true
 if [ -s scripts/posix.log ]; then
 	echo "POSIX includes detected. Please include spdk/stdinc.h instead."
 	cat scripts/posix.log

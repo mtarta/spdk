@@ -6,9 +6,9 @@
 
 # The purpose of this script is to provide a simple procedure for spinning up a new
 # virtual test environment capable of running our whole test suite. This script, when
-# applied to a fresh install of fedora 26 server will install all of the necessary dependencies
-# to run almost the complete test suite. The main exception being VHost. Vhost requires the
-# configuration of a second virtual machine. instructions for how to configure
+# applied to a fresh install of fedora 26 or ubuntu 16,18 server will install all of the
+# necessary dependencies to run almost the complete test suite. The main exception being VHost.
+# Vhost requires the configuration of a second virtual machine. instructions for how to configure
 # that vm are included in the file TEST_ENV_SETUP_README inside this repository
 
 # it is important to enable nesting for vms in kernel command line of your machine for the vhost tests.
@@ -25,6 +25,11 @@ VM_SETUP_PATH=$(readlink -f ${BASH_SOURCE%/*})
 UPGRADE=false
 INSTALL=false
 CONF="librxe,iscsi,rocksdb,fio,flamegraph,tsocks,qemu,vpp,libiscsi,nvmecli,qat,ocf"
+LIBRXE_INSTALL=true
+
+OSID=$(source /etc/os-release && echo $ID)
+OSVERSION=$(source /etc/os-release && echo $VERSION_ID)
+PACKAGEMNG='undefined'
 
 function install_rxe_cfg()
 {
@@ -71,7 +76,7 @@ function install_iscsi_adm()
                 git -C open-iscsi-install/open-iscsi config user.email none
 
                 git -C open-iscsi-install/open-iscsi checkout 86e8892
-                for patch in `ls open-iscsi-install/patches`; do
+                for patch in $(ls open-iscsi-install/patches); do
                     git -C open-iscsi-install/open-iscsi am ../patches/$patch
                 done
                 sed -i '427s/.*/-1);/' open-iscsi-install/open-iscsi/usr/session_info.c
@@ -86,6 +91,13 @@ function install_iscsi_adm()
 
 function install_qat()
 {
+
+    if [ "$PACKAGEMNG" = "dnf" ]; then
+        sudo dnf install -y libudev-devel
+    elif [ "$PACKAGEMNG" = "apt-get" ]; then
+        sudo apt-get install -y libudev-dev
+    fi
+
     if echo $CONF | grep -q qat; then
         qat_tarball=$(basename $DRIVER_LOCATION_QAT)
         kernel_maj=$(uname -r | cut -d'.' -f1)
@@ -175,7 +187,18 @@ function install_flamegraph()
 function install_qemu()
 {
     if echo $CONF | grep -q qemu; then
-        # Qemu is used in the vhost tests.
+        # Two versions of QEMU are used in the tests.
+        # Stock QEMU is used for vhost. A special fork
+        # is used to test OCSSDs. Install both.
+
+        # Packaged QEMU
+        if [ "$PACKAGEMNG" = "dnf" ]; then
+                sudo dnf install -y qemu-system-x86 qemu-img
+        elif [ "$PACKAGEMNG" = "apt-get" ]; then
+                sudo apt-get install -y qemu-system-x86 qemu-img
+        fi
+
+        # Forked QEMU
         SPDK_QEMU_BRANCH=spdk-3.0.0
         mkdir -p qemu
         if [ ! -d "qemu/$SPDK_QEMU_BRANCH" ]; then
@@ -205,54 +228,32 @@ function install_qemu()
 function install_vpp()
 {
     if echo $CONF | grep -q vpp; then
-        # Vector packet processing (VPP) is installed for use with iSCSI tests.
-        # At least on fedora 28, the yum setup that vpp uses is deprecated and fails.
-        # The actions taken under the vpp_setup script are necessary to fix this issue.
-        if [ -d vpp_setup ]; then
-            echo "vpp setup already done."
-        else
-            echo "%_topdir  $HOME/vpp_setup/src/rpm" >> ~/.rpmmacros
-            sudo dnf install -y perl-generators
-            mkdir -p ~/vpp_setup/src/rpm
-            mkdir -p vpp_setup/src/rpm/BUILD vpp_setup/src/rpm/RPMS vpp_setup/src/rpm/SOURCES \
-            vpp_setup/src/rpm/SPECS vpp_setup/src/rpm/SRPMS
-            dnf download --downloaddir=./vpp_setup/src/rpm --source redhat-rpm-config
-            rpm -ivh ~/vpp_setup/src/rpm/redhat-rpm-config*
-            sed -i s/"Requires: (annobin if gcc)"//g ~/vpp_setup/src/rpm/SPECS/redhat-rpm-config.spec
-            rpmbuild -ba ~/vpp_setup/src/rpm/SPECS/*.spec
-            sudo dnf remove -y --noautoremove redhat-rpm-config
-            sudo rpm -Uvh ~/vpp_setup/src/rpm/RPMS/noarch/*
-        fi
-
-        if [ -d vpp ]; then
+        if [ -d /usr/local/src/vpp ]; then
             echo "vpp already cloned."
-            if [ ! -d vpp/build-root ]; then
+            if [ ! -d /usr/local/src/vpp/build-root ]; then
                 echo "build-root has not been done"
-                echo "remove the `pwd` and start again"
+                echo "remove the $(pwd) and start again"
                 exit 1
             fi
         else
             git clone "${GIT_REPO_VPP}"
-            git -C ./vpp checkout v18.01.1
-            # VPP 18.01.1 does not support OpenSSL 1.1.
-            # For compilation, a compatibility package is used temporarily.
-            sudo dnf install -y --allowerasing compat-openssl10-devel
+            git -C ./vpp checkout stable/1904
+
+            if [ "${OSID}" == 'fedora' ]; then
+                if [ ${OSVERSION} -eq 29 ]; then
+                    git -C ./vpp apply ${VM_SETUP_PATH}/patch/vpp/fedora29-fix.patch
+                fi
+                if [ ${OSVERSION} -eq 30 ]; then
+                    git -C ./vpp apply ${VM_SETUP_PATH}/patch/vpp/fedora30-fix.patch
+                fi
+            fi
+
             # Installing required dependencies for building VPP
             yes | make -C ./vpp install-dep
 
-            make -C ./vpp pkg-rpm -j${jobs}
-            # Reinstall latest OpenSSL devel package.
-            sudo dnf install -y --allowerasing openssl-devel
-            sudo dnf install -y \
-                ./vpp/build_root/vpp-lib-18.01.1-release.x86_64.rpm \
-                ./vpp/build_root/vpp-devel-18.01.1-release.x86_64.rpm \
-                ./vpp/build_root/vpp-18.01.1-release.x86_64.rpm
-            # Since hugepage configuration is done via spdk/scripts/setup.sh,
-            # this default config is not needed.
-            #
-            # NOTE: Parameters kernel.shmmax and vm.max_map_count are set to
-            # very low count and cause issues with hugepage total sizes above 1GB.
-            sudo rm -f /etc/sysctl.d/80-vpp.conf
+            make -C ./vpp build -j${jobs}
+
+            sudo mv ./vpp /usr/local/src/vpp-19.04
         fi
     fi
 }
@@ -301,18 +302,35 @@ function install_ocf()
 
 function usage()
 {
-    echo "This script is intended to automate the environment setup for a fedora linux virtual machine."
+    echo "This script is intended to automate the environment setup for a linux virtual machine."
     echo "Please run this script as your regular user. The script will make calls to sudo as needed."
     echo ""
     echo "./vm_setup.sh"
     echo "  -h --help"
-    echo "  -u --upgrade Run dnf upgrade"
-    echo "  -i --install-deps Install dnf based dependencies"
+    echo "  -u --upgrade Run $PACKAGEMNG upgrade"
+    echo "  -i --install-deps Install $PACKAGEMNG based dependencies"
     echo "  -t --test-conf List of test configurations to enable (${CONF})"
     echo "  -c --conf-path Path to configuration file"
     exit 0
 }
 
+# Get package manager #
+if hash dnf &>/dev/null; then
+    PACKAGEMNG=dnf
+elif hash apt-get &>/dev/null; then
+    PACKAGEMNG=apt-get
+else
+    echo 'Supported package manager not found. Script supports "dnf" and "apt-get".'
+fi
+
+if [ $PACKAGEMNG == 'apt-get' ] && [ $OSID != 'ubuntu' ]; then
+    echo 'Located apt-get package manager, but it was tested for Ubuntu only'
+fi
+if [ $PACKAGEMNG == 'dnf' ] && [ $OSID != 'fedora' ]; then
+    echo 'Located dnf package manager, but it was tested for Fedora only'
+fi
+
+# Parse input arguments #
 while getopts 'iuht:c:-:' optchar; do
     case "$optchar" in
         -)
@@ -347,7 +365,7 @@ fi
 
 cd ~
 
-: ${GIT_REPO_SPDK=https://review.gerrithub.io/spdk/spdk}; export GIT_REPO_SPDK
+: ${GIT_REPO_SPDK=https://github.com/spdk/spdk.git}; export GIT_REPO_SPDK
 : ${GIT_REPO_DPDK=https://github.com/spdk/dpdk.git}; export GIT_REPO_DPDK
 : ${GIT_REPO_LIBRXE=https://github.com/SoftRoCE/librxe-dev.git}; export GIT_REPO_LIBRXE
 : ${GIT_REPO_OPEN_ISCSI=https://github.com/open-iscsi/open-iscsi}; export GIT_REPO_OPEN_ISCSI
@@ -365,11 +383,14 @@ cd ~
 jobs=$(($(nproc)*2))
 
 if $UPGRADE; then
-    sudo dnf upgrade -y
+    if [ $PACKAGEMNG == 'apt-get' ]; then
+        sudo $PACKAGEMNG update
+    fi
+    sudo $PACKAGEMNG upgrade -y
 fi
 
 if $INSTALL; then
-    sudo dnf install -y git
+    sudo $PACKAGEMNG install -y git
 fi
 
 mkdir -p spdk_repo/output
@@ -384,56 +405,139 @@ git -C spdk_repo/spdk config submodule.intel-ipsec-mb.url "${GIT_REPO_INTEL_IPSE
 git -C spdk_repo/spdk submodule update --init --recursive
 
 if $INSTALL; then
-    sudo spdk_repo/spdk/scripts/pkgdep.sh -i
+    sudo spdk_repo/spdk/scripts/pkgdep.sh
 
-    if echo $CONF | grep -q tsocks; then
-        sudo dnf install -y tsocks
+    if [ $PACKAGEMNG == 'dnf' ]; then
+        if echo $CONF | grep -q tsocks; then
+            sudo dnf install -y tsocks
+        fi
+
+        sudo dnf install -y \
+        valgrind \
+        jq \
+        nvme-cli \
+        ceph \
+        gdb \
+        fio \
+        librbd-devel \
+        kernel-devel \
+        gflags-devel \
+        libasan \
+        libubsan \
+        autoconf \
+        automake \
+        libtool \
+        libmount-devel \
+        iscsi-initiator-utils \
+        isns-utils-devel \
+        pmempool \
+        perl-open \
+        glib2-devel \
+        pixman-devel \
+        astyle-devel \
+        elfutils \
+        elfutils-libelf-devel \
+        flex \
+        bison \
+        targetcli \
+        perl-Switch \
+        librdmacm-utils \
+        libibverbs-utils \
+        gdisk \
+        socat \
+        sshfs \
+        sshpass \
+        python3-pandas \
+        btrfs-progs \
+        rpm-build \
+        iptables \
+        clang-analyzer \
+        bc
+
+    elif [ $PACKAGEMNG == 'apt-get' ]; then
+        echo "Package perl-open is not available at Ubuntu repositories" >&2
+
+        if echo $CONF | grep -q tsocks; then
+            sudo apt-get install -y tsocks
+        fi
+
+        # asan an ubsan have to be installed together to not mix up gcc versions
+        if sudo apt-get install -y libasan5; then
+            sudo apt-get install -y libubsan1
+        else
+            echo "Latest libasan5 is not available" >&2
+            echo "  installing libasan2 and corresponding libubsan0" >&2
+            sudo apt-get install -y libasan2
+            sudo apt-get install -y libubsan0
+        fi
+        if ! sudo apt-get install -y rdma-core; then
+            echo "Package rdma-core is avaliable at Ubuntu 18 [universe] repositorium" >&2
+            sudo apt-get install -y rdmacm-utils
+            sudo apt-get install -y ibverbs-utils
+        else
+            LIBRXE_INSTALL=false
+        fi
+        if ! sudo apt-get install -y libpmempool1; then
+            echo "Package libpmempool1 is available at Ubuntu 18 [universe] repositorium" >&2
+        fi
+        if ! sudo apt-get install -y clang-tools; then
+            echo "Package clang-tools is available at Ubuntu 18 [universe] repositorium" >&2
+        fi
+        if ! sudo apt-get install -y --no-install-suggests --no-install-recommends open-isns-utils; then
+            echo "Package open-isns-utils is available at Ubuntu 18 [universe] repositorium" >&2
+        fi
+
+        # Package name for Ubuntu 18 is targetcli-fb but for Ubuntu 16 it's targetcli
+        if ! sudo apt-get install -y targetcli-fb; then
+            sudo apt-get install -y targetcli
+        fi
+
+        sudo apt-get install -y \
+        valgrind \
+        jq \
+        nvme-cli \
+        ceph \
+        gdb \
+        fio \
+        librbd-dev \
+        linux-headers-generic \
+        libgflags-dev \
+        autoconf \
+        automake \
+        libtool \
+        libmount-dev \
+        open-iscsi \
+        libglib2.0-dev \
+        libpixman-1-dev \
+        astyle \
+        elfutils \
+        libelf-dev \
+        flex \
+        bison \
+        libswitch-perl \
+        gdisk \
+        socat \
+        sshfs \
+        sshpass \
+        python3-pandas \
+        btrfs-tools \
+        bc
+
+        # rpm-build is not used
+        # iptables installed by default
+
+    else
+        echo "Package manager is undefined, skipping INSTALL step"
     fi
-
-    sudo dnf install -y \
-    valgrind \
-    jq \
-    nvme-cli \
-    ceph \
-    gdb \
-    fio \
-    librbd-devel \
-    kernel-devel \
-    gflags-devel \
-    libasan \
-    libubsan \
-    autoconf \
-    automake \
-    libtool \
-    libmount-devel \
-    iscsi-initiator-utils \
-    isns-utils-devel \
-    pmempool \
-    perl-open \
-    glib2-devel \
-    pixman-devel \
-    astyle-devel \
-    elfutils \
-    elfutils-libelf-devel \
-    flex \
-    bison \
-    targetcli \
-    perl-Switch \
-    librdmacm-utils \
-    libibverbs-utils \
-    gdisk \
-    socat \
-    sshfs \
-    sshpass \
-    python3-pandas \
-    btrfs-progs \
-    rpm-build \
-    iptables
 fi
 
 sudo mkdir -p /usr/src
 
-install_rxe_cfg&
+if [ $LIBRXE_INSTALL = true ]; then
+    #Ubuntu18 integrates librxe to rdma-core, libibverbs-dev no longer ships infiniband/driver.h.
+    #Don't compile librxe on ubuntu18 or later version, install package rdma-core instead.
+    install_rxe_cfg&
+fi
 install_iscsi_adm&
 install_rocksdb&
 install_fio&

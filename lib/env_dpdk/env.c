@@ -32,6 +32,7 @@
  */
 
 #include "spdk/stdinc.h"
+#include "spdk/util.h"
 
 #include "env_internal.h"
 
@@ -58,11 +59,14 @@ virt_to_phys(void *vaddr)
 void *
 spdk_malloc(size_t size, size_t align, uint64_t *phys_addr, int socket_id, uint32_t flags)
 {
+	void *buf;
+
 	if (flags == 0) {
 		return NULL;
 	}
 
-	void *buf = rte_malloc_socket(NULL, size, align, socket_id);
+	align = spdk_max(align, RTE_CACHE_LINE_SIZE);
+	buf = rte_malloc_socket(NULL, size, align, socket_id);
 	if (buf && phys_addr) {
 #ifdef DEBUG
 		fprintf(stderr, "phys_addr param in spdk_*malloc() is deprecated\n");
@@ -85,6 +89,7 @@ spdk_zmalloc(size_t size, size_t align, uint64_t *phys_addr, int socket_id, uint
 void *
 spdk_realloc(void *buf, size_t size, size_t align)
 {
+	align = spdk_max(align, RTE_CACHE_LINE_SIZE);
 	return rte_realloc(buf, size, align);
 }
 
@@ -121,7 +126,10 @@ spdk_dma_zmalloc(size_t size, size_t align, uint64_t *phys_addr)
 void *
 spdk_dma_realloc(void *buf, size_t size, size_t align, uint64_t *phys_addr)
 {
-	void *new_buf = rte_realloc(buf, size, align);
+	void *new_buf;
+
+	align = spdk_max(align, RTE_CACHE_LINE_SIZE);
+	new_buf = rte_realloc(buf, size, align);
 	if (new_buf && phys_addr) {
 		*phys_addr = virt_to_phys(new_buf);
 	}
@@ -288,6 +296,20 @@ spdk_mempool_count(const struct spdk_mempool *pool)
 	return rte_mempool_avail_count((struct rte_mempool *)pool);
 }
 
+uint32_t
+spdk_mempool_obj_iter(struct spdk_mempool *mp, spdk_mempool_obj_cb_t obj_cb,
+		      void *obj_cb_arg)
+{
+	return rte_mempool_obj_iter((struct rte_mempool *)mp, (rte_mempool_obj_cb_t *)obj_cb,
+				    obj_cb_arg);
+}
+
+struct spdk_mempool *
+spdk_mempool_lookup(const char *name)
+{
+	return (struct spdk_mempool *)rte_mempool_lookup(name);
+}
+
 bool
 spdk_process_is_primary(void)
 {
@@ -358,17 +380,17 @@ spdk_ring_create(enum spdk_ring_type type, size_t count, int socket_id)
 {
 	char ring_name[64];
 	static uint32_t ring_num = 0;
-	unsigned flags = 0;
+	unsigned flags = RING_F_EXACT_SZ;
 
 	switch (type) {
 	case SPDK_RING_TYPE_SP_SC:
-		flags = RING_F_SP_ENQ | RING_F_SC_DEQ;
+		flags |= RING_F_SP_ENQ | RING_F_SC_DEQ;
 		break;
 	case SPDK_RING_TYPE_MP_SC:
-		flags = RING_F_SC_DEQ;
+		flags |= RING_F_SC_DEQ;
 		break;
 	case SPDK_RING_TYPE_MP_MC:
-		flags = 0;
+		flags |= 0;
 		break;
 	default:
 		return NULL;
@@ -393,9 +415,11 @@ spdk_ring_count(struct spdk_ring *ring)
 }
 
 size_t
-spdk_ring_enqueue(struct spdk_ring *ring, void **objs, size_t count)
+spdk_ring_enqueue(struct spdk_ring *ring, void **objs, size_t count,
+		  size_t *free_space)
 {
-	return rte_ring_enqueue_bulk((struct rte_ring *)ring, objs, count, NULL);
+	return rte_ring_enqueue_bulk((struct rte_ring *)ring, objs, count,
+				     (unsigned int *)free_space);
 }
 
 size_t

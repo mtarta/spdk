@@ -56,7 +56,7 @@ test_init_ftl_dev(const struct spdk_ocssd_geometry_data *geo,
 	dev->xfer_size = geo->ws_opt;
 	dev->geo = *geo;
 	dev->range = *range;
-	dev->core_thread.thread = spdk_thread_create("unit_test_thread");
+	dev->core_thread.thread = spdk_thread_create("unit_test_thread", NULL);
 	spdk_set_thread(dev->core_thread.thread);
 
 	dev->bands = calloc(geo->num_chk, sizeof(*dev->bands));
@@ -64,6 +64,11 @@ test_init_ftl_dev(const struct spdk_ocssd_geometry_data *geo,
 
 	dev->punits = calloc(ftl_dev_num_punits(dev), sizeof(*dev->punits));
 	SPDK_CU_ASSERT_FATAL(dev->punits != NULL);
+
+	dev->lba_pool = spdk_mempool_create("ftl_ut", 2, 0x18000,
+					    SPDK_MEMPOOL_DEFAULT_CACHE_SIZE,
+					    SPDK_ENV_SOCKET_ID_ANY);
+	SPDK_CU_ASSERT_FATAL(dev->lba_pool != NULL);
 
 	for (size_t i = 0; i < ftl_dev_num_punits(dev); ++i) {
 		punit = range->begin + i;
@@ -95,11 +100,14 @@ test_init_ftl_band(struct spdk_ftl_dev *dev, size_t id)
 	LIST_INSERT_HEAD(&dev->shut_bands, band, list_entry);
 	CIRCLEQ_INIT(&band->chunks);
 
-	band->md.vld_map = spdk_bit_array_create(ftl_num_band_lbks(dev));
-	SPDK_CU_ASSERT_FATAL(band->md.vld_map != NULL);
+	band->lba_map.vld = spdk_bit_array_create(ftl_num_band_lbks(dev));
+	SPDK_CU_ASSERT_FATAL(band->lba_map.vld != NULL);
 
 	band->chunk_buf = calloc(ftl_dev_num_punits(dev), sizeof(*band->chunk_buf));
 	SPDK_CU_ASSERT_FATAL(band->chunk_buf != NULL);
+
+	band->reloc_bitmap = spdk_bit_array_create(ftl_dev_num_bands(dev));
+	SPDK_CU_ASSERT_FATAL(band->reloc_bitmap != NULL);
 
 	for (size_t i = 0; i < ftl_dev_num_punits(dev); ++i) {
 		chunk = &band->chunk_buf[i];
@@ -112,7 +120,7 @@ test_init_ftl_band(struct spdk_ftl_dev *dev, size_t id)
 		band->num_chunks++;
 	}
 
-	pthread_spin_init(&band->md.lock, PTHREAD_PROCESS_PRIVATE);
+	pthread_spin_init(&band->lba_map.lock, PTHREAD_PROCESS_PRIVATE);
 	return band;
 }
 
@@ -120,7 +128,10 @@ void
 test_free_ftl_dev(struct spdk_ftl_dev *dev)
 {
 	SPDK_CU_ASSERT_FATAL(dev != NULL);
+	spdk_set_thread(dev->core_thread.thread);
 	spdk_thread_exit(dev->core_thread.thread);
+	spdk_thread_destroy(dev->core_thread.thread);
+	spdk_mempool_free(dev->lba_pool);
 	free(dev->punits);
 	free(dev->bands);
 	free(dev);
@@ -130,9 +141,10 @@ void
 test_free_ftl_band(struct ftl_band *band)
 {
 	SPDK_CU_ASSERT_FATAL(band != NULL);
-	spdk_bit_array_free(&band->md.vld_map);
+	spdk_bit_array_free(&band->lba_map.vld);
+	spdk_bit_array_free(&band->reloc_bitmap);
 	free(band->chunk_buf);
-	free(band->md.lba_map);
+	spdk_dma_free(band->lba_map.dma_buf);
 }
 
 uint64_t

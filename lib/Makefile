@@ -35,16 +35,15 @@ SPDK_ROOT_DIR := $(abspath $(CURDIR)/..)
 include $(SPDK_ROOT_DIR)/mk/spdk.common.mk
 
 DIRS-y += bdev blob blobfs conf copy event json jsonrpc \
-          log lvol net rpc sock thread trace util nvme nvmf scsi ioat \
-	  ut_mock iscsi
+          log lvol net rpc sock thread trace util nvme vmd nvmf scsi ioat \
+          ut_mock iscsi notify
 ifeq ($(OS),Linux)
-DIRS-y += nbd
-DIRS-$(CONFIG_VHOST) += vhost
-DIRS-$(CONFIG_VIRTIO) += virtio
+DIRS-y += nbd ftl
 endif
 
+DIRS-$(CONFIG_VHOST) += vhost
+DIRS-$(CONFIG_VIRTIO) += virtio
 DIRS-$(CONFIG_REDUCE) += reduce
-DIRS-$(CONFIG_FTL) += ftl
 
 # If CONFIG_ENV is pointing at a directory in lib, build it.
 # Out-of-tree env implementations must be built separately by the user.
@@ -53,9 +52,9 @@ ifeq ($(abspath $(CONFIG_ENV)),$(SPDK_ROOT_DIR)/lib/$(ENV_NAME))
 DIRS-y += $(ENV_NAME)
 endif
 
-DEPDIRS-bdev := copy conf env_dpdk json jsonrpc log rpc thread trace util
+DEPDIRS-bdev := copy conf env_dpdk json jsonrpc log notify rpc thread trace util
 DEPDIRS-blob := log util
-DEPDIRS-copy := thread
+DEPDIRS-copy := env_dpdk thread util
 DEPDIRS-event := bdev conf copy env_dpdk json jsonrpc log rpc thread trace util
 DEPDIRS-iscsi := scsi
 

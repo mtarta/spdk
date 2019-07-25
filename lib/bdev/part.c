@@ -36,6 +36,7 @@
  */
 
 #include "spdk/bdev.h"
+#include "spdk/likely.h"
 #include "spdk/log.h"
 #include "spdk/string.h"
 
@@ -146,6 +147,19 @@ spdk_bdev_part_io_type_supported(void *_part, enum spdk_bdev_io_type io_type)
 {
 	struct spdk_bdev_part *part = _part;
 
+	/* We can't decode/modify passthrough NVMe commands, so don't report
+	 *  that a partition supports these io types, even if the underlying
+	 *  bdev does.
+	 */
+	switch (io_type) {
+	case SPDK_BDEV_IO_TYPE_NVME_ADMIN:
+	case SPDK_BDEV_IO_TYPE_NVME_IO:
+	case SPDK_BDEV_IO_TYPE_NVME_IO_MD:
+		return false;
+	default:
+		break;
+	}
+
 	return part->internal.base->bdev->fn_table->io_type_supported(part->internal.base->bdev->ctxt,
 			io_type);
 }
@@ -182,6 +196,73 @@ spdk_bdev_part_get_offset_blocks(struct spdk_bdev_part *part)
 	return part->internal.offset_blocks;
 }
 
+static int
+spdk_bdev_part_remap_dif(struct spdk_bdev_io *bdev_io, uint32_t offset,
+			 uint32_t remapped_offset)
+{
+	struct spdk_bdev *bdev = bdev_io->bdev;
+	struct spdk_dif_ctx dif_ctx;
+	struct spdk_dif_error err_blk = {};
+	int rc;
+
+	if (spdk_likely(!(bdev->dif_check_flags & SPDK_DIF_FLAGS_REFTAG_CHECK))) {
+		return 0;
+	}
+
+	rc = spdk_dif_ctx_init(&dif_ctx,
+			       bdev->blocklen, bdev->md_len, bdev->md_interleave,
+			       bdev->dif_is_head_of_md, bdev->dif_type, bdev->dif_check_flags,
+			       offset, 0, 0, 0, 0);
+	if (rc != 0) {
+		SPDK_ERRLOG("Initialization of DIF context failed\n");
+		return rc;
+	}
+
+	spdk_dif_ctx_set_remapped_init_ref_tag(&dif_ctx, remapped_offset);
+
+	if (bdev->md_interleave) {
+		rc = spdk_dif_remap_ref_tag(bdev_io->u.bdev.iovs, bdev_io->u.bdev.iovcnt,
+					    bdev_io->u.bdev.num_blocks, &dif_ctx, &err_blk);
+	} else {
+		struct iovec md_iov = {
+			.iov_base	= bdev_io->u.bdev.md_buf,
+			.iov_len	= bdev_io->u.bdev.num_blocks * bdev->md_len,
+		};
+
+		rc = spdk_dix_remap_ref_tag(&md_iov, bdev_io->u.bdev.num_blocks, &dif_ctx, &err_blk);
+	}
+
+	if (rc != 0) {
+		SPDK_ERRLOG("Remapping reference tag failed. type=%d, offset=%" PRIu32 "\n",
+			    err_blk.err_type, err_blk.err_offset);
+	}
+
+	return rc;
+}
+
+static void
+spdk_bdev_part_complete_read_io(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
+{
+	struct spdk_bdev_io *part_io = cb_arg;
+	uint32_t offset, remapped_offset;
+	int rc, status;
+
+	offset = bdev_io->u.bdev.offset_blocks;
+	remapped_offset = part_io->u.bdev.offset_blocks;
+
+	if (success) {
+		rc = spdk_bdev_part_remap_dif(bdev_io, offset, remapped_offset);
+		if (rc != 0) {
+			success = false;
+		}
+	}
+
+	status = success ? SPDK_BDEV_IO_STATUS_SUCCESS : SPDK_BDEV_IO_STATUS_FAILED;
+
+	spdk_bdev_io_complete(part_io, status);
+	spdk_bdev_free_io(bdev_io);
+}
+
 static void
 spdk_bdev_part_complete_io(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 {
@@ -198,46 +279,70 @@ spdk_bdev_part_submit_request(struct spdk_bdev_part_channel *ch, struct spdk_bde
 	struct spdk_bdev_part *part = ch->part;
 	struct spdk_io_channel *base_ch = ch->base_ch;
 	struct spdk_bdev_desc *base_desc = part->internal.base->desc;
-	uint64_t offset;
+	uint64_t offset, remapped_offset;
 	int rc = 0;
+
+	offset = bdev_io->u.bdev.offset_blocks;
+	remapped_offset = offset + part->internal.offset_blocks;
 
 	/* Modify the I/O to adjust for the offset within the base bdev. */
 	switch (bdev_io->type) {
 	case SPDK_BDEV_IO_TYPE_READ:
-		offset = bdev_io->u.bdev.offset_blocks + part->internal.offset_blocks;
-		rc = spdk_bdev_readv_blocks(base_desc, base_ch, bdev_io->u.bdev.iovs,
-					    bdev_io->u.bdev.iovcnt, offset,
+		if (bdev_io->u.bdev.md_buf == NULL) {
+			rc = spdk_bdev_readv_blocks(base_desc, base_ch, bdev_io->u.bdev.iovs,
+						    bdev_io->u.bdev.iovcnt, remapped_offset,
+						    bdev_io->u.bdev.num_blocks,
+						    spdk_bdev_part_complete_read_io, bdev_io);
+		} else {
+			rc = spdk_bdev_readv_blocks_with_md(base_desc, base_ch,
+							    bdev_io->u.bdev.iovs,
+							    bdev_io->u.bdev.iovcnt,
+							    bdev_io->u.bdev.md_buf, remapped_offset,
+							    bdev_io->u.bdev.num_blocks,
+							    spdk_bdev_part_complete_read_io, bdev_io);
+		}
+		break;
+	case SPDK_BDEV_IO_TYPE_WRITE:
+		rc = spdk_bdev_part_remap_dif(bdev_io, offset, remapped_offset);
+		if (rc != 0) {
+			return SPDK_BDEV_IO_STATUS_FAILED;
+		}
+
+		if (bdev_io->u.bdev.md_buf == NULL) {
+			rc = spdk_bdev_writev_blocks(base_desc, base_ch, bdev_io->u.bdev.iovs,
+						     bdev_io->u.bdev.iovcnt, remapped_offset,
+						     bdev_io->u.bdev.num_blocks,
+						     spdk_bdev_part_complete_io, bdev_io);
+		} else {
+			rc = spdk_bdev_writev_blocks_with_md(base_desc, base_ch,
+							     bdev_io->u.bdev.iovs,
+							     bdev_io->u.bdev.iovcnt,
+							     bdev_io->u.bdev.md_buf, remapped_offset,
+							     bdev_io->u.bdev.num_blocks,
+							     spdk_bdev_part_complete_io, bdev_io);
+		}
+		break;
+	case SPDK_BDEV_IO_TYPE_WRITE_ZEROES:
+		rc = spdk_bdev_write_zeroes_blocks(base_desc, base_ch, remapped_offset,
+						   bdev_io->u.bdev.num_blocks, spdk_bdev_part_complete_io,
+						   bdev_io);
+		break;
+	case SPDK_BDEV_IO_TYPE_UNMAP:
+		rc = spdk_bdev_unmap_blocks(base_desc, base_ch, remapped_offset,
 					    bdev_io->u.bdev.num_blocks, spdk_bdev_part_complete_io,
 					    bdev_io);
 		break;
-	case SPDK_BDEV_IO_TYPE_WRITE:
-		offset = bdev_io->u.bdev.offset_blocks + part->internal.offset_blocks;
-		rc = spdk_bdev_writev_blocks(base_desc, base_ch, bdev_io->u.bdev.iovs,
-					     bdev_io->u.bdev.iovcnt, offset,
-					     bdev_io->u.bdev.num_blocks, spdk_bdev_part_complete_io,
-					     bdev_io);
-		break;
-	case SPDK_BDEV_IO_TYPE_WRITE_ZEROES:
-		offset = bdev_io->u.bdev.offset_blocks + part->internal.offset_blocks;
-		rc = spdk_bdev_write_zeroes_blocks(base_desc, base_ch, offset, bdev_io->u.bdev.num_blocks,
-						   spdk_bdev_part_complete_io, bdev_io);
-		break;
-	case SPDK_BDEV_IO_TYPE_UNMAP:
-		offset = bdev_io->u.bdev.offset_blocks + part->internal.offset_blocks;
-		rc = spdk_bdev_unmap_blocks(base_desc, base_ch, offset, bdev_io->u.bdev.num_blocks,
-					    spdk_bdev_part_complete_io, bdev_io);
-		break;
 	case SPDK_BDEV_IO_TYPE_FLUSH:
-		offset = bdev_io->u.bdev.offset_blocks + part->internal.offset_blocks;
-		rc = spdk_bdev_flush_blocks(base_desc, base_ch, offset, bdev_io->u.bdev.num_blocks,
-					    spdk_bdev_part_complete_io, bdev_io);
+		rc = spdk_bdev_flush_blocks(base_desc, base_ch, remapped_offset,
+					    bdev_io->u.bdev.num_blocks, spdk_bdev_part_complete_io,
+					    bdev_io);
 		break;
 	case SPDK_BDEV_IO_TYPE_RESET:
 		rc = spdk_bdev_reset(base_desc, base_ch,
 				     spdk_bdev_part_complete_io, bdev_io);
 		break;
 	default:
-		SPDK_ERRLOG("split: unknown I/O type %d\n", bdev_io->type);
+		SPDK_ERRLOG("unknown I/O type %d\n", bdev_io->type);
 		return SPDK_BDEV_IO_STATUS_FAILED;
 	}
 
@@ -333,6 +438,12 @@ spdk_bdev_part_construct(struct spdk_bdev_part *part, struct spdk_bdev_part_base
 	part->internal.bdev.module = base->module;
 	part->internal.bdev.fn_table = base->fn_table;
 
+	part->internal.bdev.md_interleave = base->bdev->md_interleave;
+	part->internal.bdev.md_len = base->bdev->md_len;
+	part->internal.bdev.dif_type = base->bdev->dif_type;
+	part->internal.bdev.dif_is_head_of_md = base->bdev->dif_is_head_of_md;
+	part->internal.bdev.dif_check_flags = base->bdev->dif_check_flags;
+
 	part->internal.bdev.name = strdup(name);
 	part->internal.bdev.product_name = strdup(product_name);
 
@@ -367,7 +478,7 @@ spdk_bdev_part_construct(struct spdk_bdev_part *part, struct spdk_bdev_part_base
 				base->channel_size,
 				name);
 
-	spdk_vbdev_register(&part->internal.bdev, &base->bdev, 1);
+	spdk_bdev_register(&part->internal.bdev);
 	TAILQ_INSERT_TAIL(base->tailq, part, tailq);
 
 	return 0;

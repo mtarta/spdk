@@ -1,32 +1,29 @@
 #!/usr/bin/env bash
 
-set -e
-
 testdir=$(readlink -f $(dirname $0))
 rootdir=$(readlink -f $testdir/../..)
-plugindir=$rootdir/examples/bdev/fio_plugin
+source $rootdir/test/common/autotest_common.sh
+source $testdir/nbd_common.sh
+
 rpc_py="$rootdir/scripts/rpc.py"
 
 function run_fio()
 {
 	if [ $RUN_NIGHTLY -eq 0 ]; then
-		LD_PRELOAD=$plugindir/fio_plugin /usr/src/fio/fio --ioengine=spdk_bdev --iodepth=8 --bs=4k --runtime=10 $testdir/bdev.fio "$@"
+		fio_bdev --ioengine=spdk_bdev --iodepth=8 --bs=4k --runtime=10 $testdir/bdev.fio "$@"
 	elif [ $RUN_NIGHTLY_FAILING -eq 1 ]; then
 		# Use size 192KB which both exceeds typical 128KB max NVMe I/O
 		#  size and will cross 128KB Intel DC P3700 stripe boundaries.
-		LD_PRELOAD=$plugindir/fio_plugin /usr/src/fio/fio --ioengine=spdk_bdev --iodepth=128 --bs=192k --runtime=100 $testdir/bdev.fio "$@"
+		fio_bdev --ioengine=spdk_bdev --iodepth=128 --bs=192k --runtime=100 $testdir/bdev.fio "$@"
 	fi
 }
-
-source $rootdir/test/common/autotest_common.sh
-source $testdir/nbd_common.sh
 
 function nbd_function_test() {
 	if [ $(uname -s) = Linux ] && modprobe -n nbd; then
 		local rpc_server=/var/tmp/spdk-nbd.sock
 		local conf=$1
 		local nbd_num=6
-		local nbd_all=(`ls /dev/nbd* | grep -v p`)
+		local nbd_all=($(ls /dev/nbd* | grep -v p))
 		local bdev_all=($bdevs_name)
 		local nbd_list=(${nbd_all[@]:0:$nbd_num})
 		local bdev_list=(${bdev_all[@]:0:$nbd_num})
@@ -38,14 +35,17 @@ function nbd_function_test() {
 		modprobe nbd
 		$rootdir/test/app/bdev_svc/bdev_svc -r $rpc_server -i 0 -c ${conf} &
 		nbd_pid=$!
+		trap "killprocess $nbd_pid; exit 1" SIGINT SIGTERM EXIT
 		echo "Process nbd pid: $nbd_pid"
 		waitforlisten $nbd_pid $rpc_server
 
+		nbd_rpc_start_stop_verify $rpc_server "${bdev_list[*]}"
 		nbd_rpc_data_verify $rpc_server "${bdev_list[*]}" "${nbd_list[*]}"
 
 		$rpc_py -s $rpc_server delete_passthru_bdev TestPT
 
 		killprocess $nbd_pid
+		trap - SIGINT SIGTERM EXIT
 	fi
 
 	return 0
@@ -68,7 +68,7 @@ if [ $SPDK_TEST_RBD -eq 1 ]; then
 fi
 
 if [ $SPDK_TEST_CRYPTO -eq 1 ]; then
-	$rootdir/scripts/gen_crypto.sh Malloc6 >> $testdir/bdev.conf
+	$testdir/gen_crypto.sh Malloc6 Malloc7 >> $testdir/bdev.conf
 fi
 
 if hash pmempool; then
@@ -78,11 +78,13 @@ if hash pmempool; then
 	echo "  Blk /tmp/spdk-pmem-pool Pmem0" >> $testdir/bdev.conf
 fi
 
-timing_enter hello_bdev
-if grep -q Nvme0 $testdir/bdev.conf; then
-	$rootdir/examples/bdev/hello_world/hello_bdev -c $testdir/bdev.conf -b Nvme0n1
+if [ $RUN_NIGHTLY -eq 1 ]; then
+	timing_enter hello_bdev
+	if grep -q Nvme0 $testdir/bdev.conf; then
+		$rootdir/examples/bdev/hello_world/hello_bdev -c $testdir/bdev.conf -b Nvme0n1
+	fi
+	timing_exit hello_bdev
 fi
-timing_exit hello_bdev
 
 timing_enter bounds
 if [ $(uname -s) = Linux ]; then
@@ -92,7 +94,14 @@ else
 	# Dynamic memory management is not supported on BSD
 	PRE_RESERVED_MEM=2048
 fi
-$testdir/bdevio/bdevio -s $PRE_RESERVED_MEM -c $testdir/bdev.conf
+$testdir/bdevio/bdevio -w -s $PRE_RESERVED_MEM -c $testdir/bdev.conf &
+bdevio_pid=$!
+trap "killprocess $bdevio_pid; exit 1" SIGINT SIGTERM EXIT
+echo "Process bdevio pid: $bdevio_pid"
+waitforlisten $bdevio_pid
+$testdir/bdevio/tests.py perform_tests
+killprocess $bdevio_pid
+trap - SIGINT SIGTERM EXIT
 timing_exit bounds
 
 timing_enter nbd_gpt
@@ -110,7 +119,7 @@ bdevs_name=$(echo $bdevs | jq -r '.name')
 nbd_function_test $testdir/bdev.conf "$bdevs_name"
 timing_exit nbd
 
-if [ -d /usr/src/fio ] && [ $SPDK_RUN_ASAN -eq 0 ]; then
+if [ -d /usr/src/fio ]; then
 	timing_enter fio
 
 	timing_enter fio_rw_verify
@@ -140,6 +149,9 @@ if [ -d /usr/src/fio ] && [ $SPDK_RUN_ASAN -eq 0 ]; then
 	timing_exit fio_trim
 	report_test_completion "bdev_fio"
 	timing_exit fio
+else
+	echo "FIO not available"
+	exit 1
 fi
 
 # Create conf file for bdevperf with gpt
@@ -172,7 +184,6 @@ fi
 rm -f /tmp/aiofile
 rm -f /tmp/spdk-pmem-pool
 rm -f $testdir/bdev.conf
-trap - SIGINT SIGTERM EXIT
 rbd_cleanup
 report_test_completion "bdev"
 timing_exit bdev

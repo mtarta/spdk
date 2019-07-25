@@ -65,6 +65,15 @@
   # poll. Units in microseconds.
   AcceptorPollRate 10000
 
+  # Set how the connection is scheduled among multiple threads, current supported string value are
+  # "RoundRobin", "Host", "Transport".
+  # RoundRobin: Schedule the connection with roundrobin manner.
+  # Host: Schedule the connection according to host IP.
+  # Transport: Schedule the connection according to the transport characteristics.
+  #  For example, for  TCP transport, we can schedule the connection according to socket NAPI_ID info.
+  #  The connection which has the same socket NAPI_ID info will be grouped in the same polling group.
+  ConnectionScheduler RoundRobin
+
 # One valid transport type must be set in each [Transport].
 # The first is the case of RDMA transport and the second is the case of TCP transport.
 [Transport]
@@ -134,6 +143,9 @@
   # Set the number of shared buffers to be cached per poll group
   #BufCacheSize 32
 
+  # Set whether to use the C2H Success optimization, only used for TCP transport.
+  # C2HSuccess true
+
 [Nvme]
   # NVMe Device Whitelist
   # Users may specify which NVMe devices to claim by their transport id.
@@ -193,8 +205,12 @@
   StripSize 64
   # Number of pre-configured bdevs.
   NumDevices 2
-  # Pre-configured bdevs name.
+  # Pre-configured bdevs name with Nvme.
   Devices Nvme2n1 Nvme3n1
+  # Pre-configured bdevs name with Malloc.
+  #Devices Malloc0 Malloc1
+  # Pre-configured bdevs name with AIO.
+  #Devices AIO0 AIO1
 
 # Define an NVMf Subsystem.
 # - NQN is required and must be unique.
@@ -222,6 +238,7 @@
   AllowAnyHost No
   Host nqn.2016-06.io.spdk:init
   SN SPDK00000000000001
+  MN SPDK_Controller1
   MaxNamespaces 20
   Namespace Nvme0n1 1
   Namespace Nvme1n1 2
@@ -235,6 +252,7 @@
   AllowAnyHost No
   Host nqn.2016-06.io.spdk:init
   SN SPDK00000000000002
+  MN SPDK_Controller2
   Namespace Malloc0
   Namespace Malloc1
   Namespace AIO0

@@ -85,17 +85,6 @@ spdk_nvmf_transport_create(enum spdk_nvme_transport_type type,
 	char spdk_mempool_name[MAX_MEMPOOL_NAME_LENGTH];
 	int chars_written;
 
-	if ((opts->max_io_size % opts->io_unit_size != 0) ||
-	    (opts->max_io_size / opts->io_unit_size >
-	     SPDK_NVMF_MAX_SGL_ENTRIES)) {
-		SPDK_ERRLOG("%s: invalid IO size, MaxIO:%d, UnitIO:%d, MaxSGL:%d\n",
-			    spdk_nvme_transport_id_trtype_str(type),
-			    opts->max_io_size,
-			    opts->io_unit_size,
-			    SPDK_NVMF_MAX_SGL_ENTRIES);
-		return NULL;
-	}
-
 	ops = spdk_nvmf_get_transport_ops(type);
 	if (!ops) {
 		SPDK_ERRLOG("Transport type %s unavailable.\n",
@@ -220,6 +209,17 @@ spdk_nvmf_transport_poll_group_create(struct spdk_nvmf_transport *transport)
 		}
 	}
 	return group;
+}
+
+struct spdk_nvmf_transport_poll_group *
+spdk_nvmf_transport_get_optimal_poll_group(struct spdk_nvmf_transport *transport,
+		struct spdk_nvmf_qpair *qpair)
+{
+	if (transport->ops->get_optimal_poll_group) {
+		return transport->ops->get_optimal_poll_group(qpair);
+	} else {
+		return NULL;
+	}
 }
 
 void

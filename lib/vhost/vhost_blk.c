@@ -35,6 +35,7 @@
 
 #include "spdk/env.h"
 #include "spdk/bdev.h"
+#include "spdk/bdev_module.h"
 #include "spdk/conf.h"
 #include "spdk/thread.h"
 #include "spdk/likely.h"
@@ -622,7 +623,7 @@ free_task_pool(struct spdk_vhost_blk_session *bvsession)
 			continue;
 		}
 
-		spdk_dma_free(vq->tasks);
+		spdk_free(vq->tasks);
 		vq->tasks = NULL;
 	}
 }
@@ -652,8 +653,9 @@ alloc_task_pool(struct spdk_vhost_blk_session *bvsession)
 			free_task_pool(bvsession);
 			return -1;
 		}
-		vq->tasks = spdk_dma_zmalloc(sizeof(struct spdk_vhost_blk_task) * task_cnt,
-					     SPDK_CACHE_LINE_SIZE, NULL);
+		vq->tasks = spdk_zmalloc(sizeof(struct spdk_vhost_blk_task) * task_cnt,
+					 SPDK_CACHE_LINE_SIZE, NULL,
+					 SPDK_ENV_LCORE_ID_ANY, SPDK_MALLOC_DMA);
 		if (vq->tasks == NULL) {
 			SPDK_ERRLOG("Controller %s: failed to allocate %"PRIu32" tasks for virtqueue %"PRIu16"\n",
 				    bvdev->vdev.name, task_cnt, i);
@@ -719,24 +721,24 @@ spdk_vhost_blk_start_cb(struct spdk_vhost_dev *vdev,
 	bvsession->requestq_poller = spdk_poller_register(bvdev->bdev ? vdev_worker : no_bdev_vdev_worker,
 				     bvsession, 0);
 	SPDK_INFOLOG(SPDK_LOG_VHOST, "Started poller for vhost controller %s on lcore %d\n",
-		     vdev->name, vsession->lcore);
+		     vdev->name, spdk_env_get_current_core());
 out:
-	spdk_vhost_session_event_done(vsession, rc);
+	spdk_vhost_session_start_done(vsession, rc);
 	return rc;
 }
 
 static int
 spdk_vhost_blk_start(struct spdk_vhost_session *vsession)
 {
+	struct vhost_poll_group *pg;
 	int rc;
 
-	vsession->lcore = spdk_vhost_allocate_reactor(vsession->vdev->cpumask);
-	rc = spdk_vhost_session_send_event(vsession, spdk_vhost_blk_start_cb,
+	pg = spdk_vhost_get_poll_group(vsession->vdev->cpumask);
+	rc = spdk_vhost_session_send_event(pg, vsession, spdk_vhost_blk_start_cb,
 					   3, "start session");
 
 	if (rc != 0) {
-		spdk_vhost_free_reactor(vsession->lcore);
-		vsession->lcore = -1;
+		spdk_vhost_put_poll_group(pg);
 	}
 
 	return rc;
@@ -750,6 +752,10 @@ destroy_session_poller_cb(void *arg)
 	int i;
 
 	if (vsession->task_cnt > 0) {
+		return -1;
+	}
+
+	if (spdk_vhost_trylock() != 0) {
 		return -1;
 	}
 
@@ -767,8 +773,9 @@ destroy_session_poller_cb(void *arg)
 
 	free_task_pool(bvsession);
 	spdk_poller_unregister(&bvsession->stop_poller);
-	spdk_vhost_session_event_done(vsession, 0);
+	spdk_vhost_session_stop_done(vsession, 0);
 
+	spdk_vhost_unlock();
 	return -1;
 }
 
@@ -790,24 +797,15 @@ spdk_vhost_blk_stop_cb(struct spdk_vhost_dev *vdev,
 	return 0;
 
 err:
-	spdk_vhost_session_event_done(vsession, -1);
+	spdk_vhost_session_stop_done(vsession, -1);
 	return -1;
 }
 
 static int
 spdk_vhost_blk_stop(struct spdk_vhost_session *vsession)
 {
-	int rc;
-
-	rc = spdk_vhost_session_send_event(vsession, spdk_vhost_blk_stop_cb,
-					   3, "stop session");
-	if (rc != 0) {
-		return rc;
-	}
-
-	spdk_vhost_free_reactor(vsession->lcore);
-	vsession->lcore = -1;
-	return 0;
+	return spdk_vhost_session_send_event(vsession->poll_group, vsession,
+					     spdk_vhost_blk_stop_cb, 3, "stop session");
 }
 
 static void
@@ -899,6 +897,14 @@ spdk_vhost_blk_get_config(struct spdk_vhost_dev *vdev, uint8_t *config,
 	} else {
 		blk_size = spdk_bdev_get_block_size(bdev);
 		blkcnt = spdk_bdev_get_num_blocks(bdev);
+		if (spdk_bdev_get_buf_align(bdev) > 1) {
+			blkcfg.size_max = SPDK_BDEV_LARGE_BUF_MAX_SIZE;
+			blkcfg.seg_max = spdk_min(SPDK_VHOST_IOVS_MAX - 2 - 1, BDEV_IO_NUM_CHILD_IOV - 2 - 1);
+		} else {
+			blkcfg.size_max = 131072;
+			/*  -2 for REQ and RESP and -1 for region boundary splitting */
+			blkcfg.seg_max = SPDK_VHOST_IOVS_MAX - 2 - 1;
+		}
 	}
 
 	memset(&blkcfg, 0, sizeof(blkcfg));
@@ -907,9 +913,6 @@ spdk_vhost_blk_get_config(struct spdk_vhost_dev *vdev, uint8_t *config,
 	blkcfg.min_io_size = 1;
 	/* expressed in 512 Bytes sectors */
 	blkcfg.capacity = (blkcnt * blk_size) / 512;
-	blkcfg.size_max = 131072;
-	/*  -2 for REQ and RESP and -1 for region boundary splitting */
-	blkcfg.seg_max = SPDK_VHOST_IOVS_MAX - 2 - 1;
 	/* QEMU can overwrite this value when started */
 	blkcfg.num_queues = SPDK_VHOST_MAX_VQUEUES;
 
@@ -1011,7 +1014,7 @@ spdk_vhost_blk_construct(const char *name, const char *cpumask, const char *dev_
 		goto out;
 	}
 
-	bvdev = spdk_dma_zmalloc(sizeof(*bvdev), SPDK_CACHE_LINE_SIZE, NULL);
+	bvdev = calloc(1, sizeof(*bvdev));
 	if (bvdev == NULL) {
 		ret = -ENOMEM;
 		goto out;
@@ -1060,7 +1063,7 @@ spdk_vhost_blk_construct(const char *name, const char *cpumask, const char *dev_
 	SPDK_INFOLOG(SPDK_LOG_VHOST, "Controller %s: using bdev '%s'\n", name, dev_name);
 out:
 	if (ret != 0 && bvdev) {
-		spdk_dma_free(bvdev);
+		free(bvdev);
 	}
 	spdk_vhost_unlock();
 	return ret;
@@ -1087,7 +1090,7 @@ spdk_vhost_blk_destroy(struct spdk_vhost_dev *vdev)
 	}
 	bvdev->bdev = NULL;
 
-	spdk_dma_free(bvdev);
+	free(bvdev);
 	return 0;
 }
 

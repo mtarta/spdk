@@ -282,9 +282,11 @@ spdk_build_eal_cmdline(const struct spdk_env_opts *opts)
 
 #if RTE_VERSION >= RTE_VERSION_NUM(18, 05, 0, 0) && RTE_VERSION < RTE_VERSION_NUM(18, 5, 1, 0)
 	/* Dynamic memory management is buggy in DPDK 18.05.0. Don't use it. */
-	args = spdk_push_arg(args, &argcount, _sprintf_alloc("--legacy-mem"));
-	if (args == NULL) {
-		return -1;
+	if (!opts->env_context || strcmp(opts->env_context, "--legacy-mem") != 0) {
+		args = spdk_push_arg(args, &argcount, _sprintf_alloc("--legacy-mem"));
+		if (args == NULL) {
+			return -1;
+		}
 	}
 #endif
 
@@ -309,6 +311,24 @@ spdk_build_eal_cmdline(const struct spdk_env_opts *opts)
 	 * This can be overridden by specifying the same option in opts->env_context
 	 */
 	args = spdk_push_arg(args, &argcount, strdup("--log-level=lib.eal:6"));
+	if (args == NULL) {
+		return -1;
+	}
+
+	/* Lower default CRYPTO loglevel to RTE_LOG_ERR to avoid a ton of init msgs.
+	 * This can be overridden by specifying the same option in opts->env_context
+	 */
+	args = spdk_push_arg(args, &argcount, strdup("--log-level=lib.cryptodev:5"));
+	if (args == NULL) {
+		return -1;
+	}
+
+	/* `user1` log type is used by rte_vhost, which prints an INFO log for each received
+	 * vhost user message. We don't want that. The same log type is also used by a couple
+	 * of other DPDK libs, but none of which we make use right now. If necessary, this can
+	 * be overridden via opts->env_context.
+	 */
+	args = spdk_push_arg(args, &argcount, strdup("--log-level=user1:6"));
 	if (args == NULL) {
 		return -1;
 	}
@@ -345,9 +365,11 @@ spdk_build_eal_cmdline(const struct spdk_env_opts *opts)
 	 * the memory for a buffer over two allocations meaning the buffer will be split over a memory region.
 	 */
 #if RTE_VERSION >= RTE_VERSION_NUM(19, 02, 0, 0)
-	args = spdk_push_arg(args, &argcount, _sprintf_alloc("%s", "--match-allocations"));
-	if (args == NULL) {
-		return -1;
+	if (!opts->env_context || strcmp(opts->env_context, "--legacy-mem") != 0) {
+		args = spdk_push_arg(args, &argcount, _sprintf_alloc("%s", "--match-allocations"));
+		if (args == NULL) {
+			return -1;
+		}
 	}
 #endif
 
@@ -403,6 +425,8 @@ spdk_env_dpdk_post_init(void)
 void
 spdk_env_dpdk_post_fini(void)
 {
+	spdk_pci_fini();
+
 	spdk_free_args(g_eal_cmdline, g_eal_cmdline_argcount);
 }
 

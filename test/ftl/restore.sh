@@ -1,12 +1,10 @@
 #!/usr/bin/env bash
 
-set -e
-
 testdir=$(readlink -f $(dirname $0))
 rootdir=$(readlink -f $testdir/../..)
-rpc_py=$rootdir/scripts/rpc.py
-
 source $rootdir/test/common/autotest_common.sh
+
+rpc_py=$rootdir/scripts/rpc.py
 
 mount_dir=$(mktemp -d)
 device=$1
@@ -18,6 +16,7 @@ restore_kill() {
 	fi
 	rm -rf $mount_dir
 	rm -f $testdir/testfile.md5
+	rm -f $testdir/testfile2.md5
 	rm -f $testdir/config/ftl.json
 
 	$rpc_py delete_ftl_bdev -b nvme0
@@ -27,8 +26,8 @@ restore_kill() {
 
 trap "restore_kill; exit 1" SIGINT SIGTERM EXIT
 
-$rootdir/test/app/bdev_svc/bdev_svc & svcpid=$!
-# Wait until bdev_svc starts
+$rootdir/app/spdk_tgt/spdk_tgt & svcpid=$!
+# Wait until spdk_tgt starts
 waitforlisten $svcpid
 
 if [ -n "$uuid" ]; then
@@ -56,14 +55,25 @@ md5sum $mount_dir/testfile > $testdir/testfile.md5
 umount $mount_dir
 killprocess $svcpid
 
-$rootdir/test/app/bdev_svc/bdev_svc & svcpid=$!
-# Wait until bdev_svc starts
+$rootdir/app/spdk_tgt/spdk_tgt & svcpid=$!
+# Wait until spdk_tgt starts
 waitforlisten $svcpid
 
 $rpc_py load_config < $testdir/config/ftl.json
+waitfornbd nbd0
 
 mount /dev/nbd0 $mount_dir
+
+# Write second file, to make sure writer thread has restored properly
+dd if=/dev/urandom of=$mount_dir/testfile2 bs=4K count=256K
+md5sum $mount_dir/testfile2 > $testdir/testfile2.md5
+
+# Make sure second file will be read from disk
+echo 3 > /proc/sys/vm/drop_caches
+
+# Check both files have proper data
 md5sum -c $testdir/testfile.md5
+md5sum -c $testdir/testfile2.md5
 
 report_test_completion occsd_restore
 

@@ -69,8 +69,7 @@ struct spdk_app {
 static struct spdk_app g_spdk_app;
 static spdk_msg_fn g_start_fn = NULL;
 static void *g_start_arg = NULL;
-static struct spdk_event *g_shutdown_event = NULL;
-static uint32_t g_init_lcore;
+static struct spdk_thread *g_app_thread = NULL;
 static bool g_delay_subsystem_init = false;
 static bool g_shutdown_sig_received = false;
 static char *g_executable_name;
@@ -121,7 +120,7 @@ static const struct option g_cmdline_options[] = {
 #define WAIT_FOR_RPC_OPT_IDX	258
 	{"wait-for-rpc",		no_argument,		NULL, WAIT_FOR_RPC_OPT_IDX},
 #define HUGE_DIR_OPT_IDX	259
-	{"huge-dir",			no_argument,		NULL, HUGE_DIR_OPT_IDX},
+	{"huge-dir",			required_argument,	NULL, HUGE_DIR_OPT_IDX},
 #define NUM_TRACE_ENTRIES_OPT_IDX	260
 	{"num-trace-entries",		required_argument,	NULL, NUM_TRACE_ENTRIES_OPT_IDX},
 #define MAX_REACTOR_DELAY_OPT_IDX	261
@@ -221,15 +220,21 @@ spdk_app_get_running_config(char **config_str, char *name)
 	return 0;
 }
 
-void
-spdk_app_start_shutdown(void)
+static void
+app_start_shutdown(void *ctx)
 {
-	if (g_shutdown_event != NULL) {
-		spdk_event_call(g_shutdown_event);
-		g_shutdown_event = NULL;
+	if (g_spdk_app.shutdown_cb) {
+		g_spdk_app.shutdown_cb();
+		g_spdk_app.shutdown_cb = NULL;
 	} else {
 		spdk_app_stop(0);
 	}
+}
+
+void
+spdk_app_start_shutdown(void)
+{
+	spdk_thread_send_msg(g_app_thread, app_start_shutdown, NULL);
 }
 
 static void
@@ -239,12 +244,6 @@ __shutdown_signal(int signo)
 		g_shutdown_sig_received = true;
 		spdk_app_start_shutdown();
 	}
-}
-
-static void
-__shutdown_event_cb(void *arg1, void *arg2)
-{
-	g_spdk_app.shutdown_cb();
 }
 
 static int
@@ -295,13 +294,6 @@ spdk_app_setup_signal_handlers(struct spdk_app_opts *opts)
 	sigset_t		sigmask;
 	int			rc;
 
-	/* Set up custom shutdown handling if the user requested it. */
-	if (opts->shutdown_cb != NULL) {
-		g_shutdown_event = spdk_event_allocate(spdk_env_get_current_core(),
-						       __shutdown_event_cb,
-						       NULL, NULL);
-	}
-
 	sigemptyset(&sigmask);
 	memset(&sigact, 0, sizeof(sigact));
 	sigemptyset(&sigact.sa_mask);
@@ -348,9 +340,7 @@ spdk_app_setup_signal_handlers(struct spdk_app_opts *opts)
 static void
 spdk_app_start_application(void)
 {
-	spdk_rpc_set_state(SPDK_RPC_RUNTIME);
-
-	assert(spdk_env_get_current_core() == g_init_lcore);
+	assert(spdk_get_thread() == g_app_thread);
 
 	g_start_fn(g_start_arg);
 }
@@ -360,6 +350,7 @@ spdk_app_start_rpc(void *arg1)
 {
 	spdk_rpc_initialize(g_spdk_app.rpc_addr);
 	if (!g_delay_subsystem_init) {
+		spdk_rpc_set_state(SPDK_RPC_RUNTIME);
 		spdk_app_start_application();
 	}
 }
@@ -509,6 +500,7 @@ spdk_app_setup_env(struct spdk_app_opts *opts)
 	env_opts.num_pci_addr = opts->num_pci_addr;
 	env_opts.pci_blacklist = opts->pci_blacklist;
 	env_opts.pci_whitelist = opts->pci_whitelist;
+	env_opts.env_context = opts->env_context;
 
 	rc = spdk_env_init(&env_opts);
 	free(env_opts.pci_blacklist);
@@ -560,7 +552,7 @@ spdk_app_setup_trace(struct spdk_app_opts *opts)
 }
 
 static void
-bootstrap_fn(void *arg1, void *arg2)
+bootstrap_fn(void *arg1)
 {
 	if (g_spdk_app.json_config_file) {
 		g_delay_subsystem_init = false;
@@ -582,7 +574,7 @@ spdk_app_start(struct spdk_app_opts *opts, spdk_msg_fn start_fn,
 	struct spdk_conf	*config = NULL;
 	int			rc;
 	char			*tty;
-	struct spdk_event	*event;
+	struct spdk_cpuset	*tmp_cpumask;
 
 	if (!opts) {
 		SPDK_ERRLOG("opts should not be NULL\n");
@@ -633,7 +625,7 @@ spdk_app_start(struct spdk_app_opts *opts, spdk_msg_fn start_fn,
 		goto app_start_setup_conf_err;
 	}
 
-	spdk_log_open();
+	spdk_log_open(opts->log);
 	SPDK_NOTICELOG("Total cores available: %d\n", spdk_env_get_core_count());
 
 	/*
@@ -643,6 +635,24 @@ spdk_app_start(struct spdk_app_opts *opts, spdk_msg_fn start_fn,
 	 */
 	if ((rc = spdk_reactors_init()) != 0) {
 		SPDK_ERRLOG("Reactor Initilization failed: rc = %d\n", rc);
+		goto app_start_log_close_err;
+	}
+
+	tmp_cpumask = spdk_cpuset_alloc();
+	if (tmp_cpumask == NULL) {
+		SPDK_ERRLOG("spdk_cpuset_alloc() failed\n");
+		goto app_start_log_close_err;
+	}
+
+	spdk_cpuset_zero(tmp_cpumask);
+	spdk_cpuset_set_cpu(tmp_cpumask, spdk_env_get_current_core(), true);
+
+	/* Now that the reactors have been initialized, we can create an
+	 * initialization thread. */
+	g_app_thread = spdk_thread_create("app_thread", tmp_cpumask);
+	spdk_cpuset_free(tmp_cpumask);
+	if (!g_app_thread) {
+		SPDK_ERRLOG("Unable to create an spdk_thread for initialization\n");
 		goto app_start_log_close_err;
 	}
 
@@ -669,14 +679,11 @@ spdk_app_start(struct spdk_app_opts *opts, spdk_msg_fn start_fn,
 	g_spdk_app.shutdown_cb = opts->shutdown_cb;
 	g_spdk_app.rc = 0;
 
-	g_init_lcore = spdk_env_get_current_core();
 	g_delay_subsystem_init = opts->delay_subsystem_init;
 	g_start_fn = start_fn;
 	g_start_arg = arg1;
 
-	event = spdk_event_allocate(g_init_lcore, bootstrap_fn, NULL, NULL);
-
-	spdk_event_call(event);
+	spdk_thread_send_msg(g_app_thread, bootstrap_fn, NULL);
 
 	/* This blocks until spdk_app_stop is called */
 	spdk_reactors_start();
@@ -705,7 +712,7 @@ spdk_app_fini(void)
 }
 
 static void
-_spdk_app_stop(void *arg1, void *arg2)
+_spdk_app_stop(void *arg1)
 {
 	spdk_rpc_finish();
 	spdk_subsystem_fini(spdk_reactors_stop, NULL);
@@ -719,10 +726,10 @@ spdk_app_stop(int rc)
 	}
 	g_spdk_app.rc = rc;
 	/*
-	 * We want to run spdk_subsystem_fini() from the same lcore where spdk_subsystem_init()
+	 * We want to run spdk_subsystem_fini() from the same thread where spdk_subsystem_init()
 	 * was called.
 	 */
-	spdk_event_call(spdk_event_allocate(g_init_lcore, _spdk_app_stop, NULL, NULL));
+	spdk_thread_send_msg(g_app_thread, _spdk_app_stop, NULL);
 }
 
 static void
@@ -936,7 +943,7 @@ spdk_app_parse_args(int argc, char **argv, struct spdk_app_opts *opts,
 			break;
 		case LOGFLAG_OPT_IDX:
 #ifndef DEBUG
-			fprintf(stderr, "%s must be built with CONFIG_DEBUG=y for -L flag\n",
+			fprintf(stderr, "%s must be configured with --enable-debug for -L flag\n",
 				argv[0]);
 			usage(app_usage);
 			goto out;
@@ -1054,15 +1061,19 @@ spdk_rpc_start_subsystem_init_cpl(void *arg1)
 	struct spdk_jsonrpc_request *request = arg1;
 	struct spdk_json_write_ctx *w;
 
-	assert(spdk_env_get_current_core() == g_init_lcore);
+	assert(spdk_get_thread() == g_app_thread);
 
-	spdk_app_start_application();
-
-	w = spdk_jsonrpc_begin_result(request);
-	if (w == NULL) {
-		return;
+	spdk_rpc_set_state(SPDK_RPC_RUNTIME);
+	/* If we're loading JSON config file, we're still operating on a fake,
+	 * temporary RPC server. We'll have to defer calling the app start callback
+	 * until this temporary server is shut down and a real one - listening on
+	 * the proper socket - is started.
+	 */
+	if (g_spdk_app.json_config_file == NULL) {
+		spdk_app_start_application();
 	}
 
+	w = spdk_jsonrpc_begin_result(request);
 	spdk_json_write_bool(w, true);
 	spdk_jsonrpc_end_result(request, w);
 }
@@ -1094,10 +1105,8 @@ spdk_rpc_subsystem_init_poller_ctx(void *ctx)
 
 	if (spdk_rpc_get_state() == SPDK_RPC_RUNTIME) {
 		w = spdk_jsonrpc_begin_result(poller_ctx->request);
-		if (w != NULL) {
-			spdk_json_write_bool(w, true);
-			spdk_jsonrpc_end_result(poller_ctx->request, w);
-		}
+		spdk_json_write_bool(w, true);
+		spdk_jsonrpc_end_result(poller_ctx->request, w);
 		spdk_poller_unregister(&poller_ctx->init_poller);
 		free(poller_ctx);
 	}
@@ -1114,9 +1123,6 @@ spdk_rpc_wait_subsystem_init(struct spdk_jsonrpc_request *request,
 
 	if (spdk_rpc_get_state() == SPDK_RPC_RUNTIME) {
 		w = spdk_jsonrpc_begin_result(request);
-		if (w == NULL) {
-			return;
-		}
 		spdk_json_write_bool(w, true);
 		spdk_jsonrpc_end_result(request, w);
 	} else {

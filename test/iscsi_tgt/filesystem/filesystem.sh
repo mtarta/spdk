@@ -6,6 +6,10 @@ source $rootdir/test/common/autotest_common.sh
 source $rootdir/test/iscsi_tgt/common.sh
 source $rootdir/scripts/common.sh
 
+# $1 = "iso" - triggers isolation mode (setting up required environment).
+# $2 = test type posix or vpp. defaults to posix.
+iscsitestinit $1 $2
+
 timing_enter filesystem
 
 rpc_py="$rootdir/scripts/rpc.py"
@@ -29,7 +33,7 @@ $ISCSI_APP -m $ISCSI_TEST_CORE_MASK --wait-for-rpc &
 pid=$!
 echo "Process pid: $pid"
 
-trap "killprocess $pid; exit 1" SIGINT SIGTERM EXIT
+trap "killprocess $pid; iscsitestfini $1 $2; exit 1" SIGINT SIGTERM EXIT
 
 waitforlisten $pid
 $rpc_py set_iscsi_options -o 30 -a 16
@@ -60,15 +64,15 @@ sleep 1
 
 iscsiadm -m discovery -t sendtargets -p $TARGET_IP:$ISCSI_PORT
 iscsiadm -m node --login -p $TARGET_IP:$ISCSI_PORT
+waitforiscsidevices 1
 
-trap "remove_backends; umount /mnt/device; rm -rf /mnt/device; iscsicleanup; killprocess $pid; exit 1" SIGINT SIGTERM EXIT
-
-sleep 1
+trap "remove_backends; umount /mnt/device; rm -rf /mnt/device; iscsicleanup; killprocess $pid; iscsitestfini $1 $2; exit 1" SIGINT SIGTERM EXIT
 
 mkdir -p /mnt/device
 
 dev=$(iscsiadm -m session -P 3 | grep "Attached scsi disk" | awk '{print $4}')
 
+waitforfile /dev/$dev
 parted -s /dev/$dev mklabel msdos
 parted -s /dev/$dev mkpart primary '0%' '100%'
 sleep 1
@@ -87,10 +91,13 @@ for fstype in "ext4" "btrfs" "xfs"; do
 		umount /mnt/device
 
 		iscsiadm -m node --logout
-		sleep 1
+		waitforiscsidevices 0
 		iscsiadm -m node --login -p $TARGET_IP:$ISCSI_PORT
-		sleep 1
+		waitforiscsidevices 1
+
 		dev=$(iscsiadm -m session -P 3 | grep "Attached scsi disk" | awk '{print $4}')
+
+		waitforfile /dev/${dev}1
 		mount -o rw /dev/${dev}1 /mnt/device
 		if [ -f "/mnt/device/test" ]; then
 			echo "File existed."
@@ -108,10 +115,13 @@ for fstype in "ext4" "btrfs" "xfs"; do
 		umount /mnt/device
 
 		iscsiadm -m node --logout
-		sleep 1
+		waitforiscsidevices 0
 		iscsiadm -m node --login -p $TARGET_IP:$ISCSI_PORT
-		sleep 1
+		waitforiscsidevices 1
+
 		dev=$(iscsiadm -m session -P 3 | grep "Attached scsi disk" | awk '{print $4}')
+
+		waitforfile /dev/${dev}1
 		mount -o rw /dev/${dev}1 /mnt/device
 
 		if [ -f "/mnt/device/aaa" ]; then
@@ -133,4 +143,5 @@ trap - SIGINT SIGTERM EXIT
 iscsicleanup
 remove_backends
 killprocess $pid
+iscsitestfini $1 $2
 timing_exit filesystem

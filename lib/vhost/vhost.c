@@ -43,10 +43,34 @@
 
 #include "spdk_internal/memory.h"
 
-static uint32_t *g_num_ctrlrs;
+struct vhost_poll_group {
+	struct spdk_thread *thread;
+	unsigned ref;
+	TAILQ_ENTRY(vhost_poll_group) tailq;
+};
+
+static TAILQ_HEAD(, vhost_poll_group) g_poll_groups = TAILQ_HEAD_INITIALIZER(g_poll_groups);
+
+/* Temporary cpuset for poll group assignment */
+static struct spdk_cpuset *g_tmp_cpuset;
 
 /* Path to folder where character device will be created. Can be set by user. */
 static char dev_dirname[PATH_MAX] = "";
+
+/* Thread performing all vhost management operations */
+static struct spdk_thread *g_vhost_init_thread;
+
+static spdk_vhost_fini_cb g_fini_cpl_cb;
+
+/**
+ * DPDK calls our callbacks synchronously but the work those callbacks
+ * perform needs to be async. Luckily, all DPDK callbacks are called on
+ * a DPDK-internal pthread, so we'll just wait on a semaphore in there.
+ */
+static sem_t g_dpdk_sem;
+
+/** Return code for the current DPDK callback */
+static int g_dpdk_response;
 
 struct spdk_vhost_session_fn_ctx {
 	/** Device pointer obtained before enqueuing the event */
@@ -55,14 +79,11 @@ struct spdk_vhost_session_fn_ctx {
 	/** ID of the session to send event to. */
 	uint32_t vsession_id;
 
-	/** User callback function to be executed on given lcore. */
+	/** User callback function to be executed on given thread. */
 	spdk_vhost_session_fn cb_fn;
 
-	/** Semaphore used to signal that event is done. */
-	sem_t sem;
-
-	/** Response to be written by enqueued event. */
-	int response;
+	/** Custom user context */
+	void *user_ctx;
 };
 
 static int new_connection(int vid);
@@ -265,8 +286,13 @@ spdk_vhost_vq_used_signal(struct spdk_vhost_session *vsession,
 		      "Queue %td - USED RING: sending IRQ: last used %"PRIu16"\n",
 		      virtqueue - vsession->virtqueue, virtqueue->last_used_idx);
 
-	eventfd_write(virtqueue->vring.callfd, (eventfd_t)1);
-	return 1;
+	if (rte_vhost_vring_call(vsession->vid, virtqueue->vring_idx) == 0) {
+		/* interrupt signalled */
+		return 1;
+	} else {
+		/* interrupt not signalled */
+		return 0;
+	}
 }
 
 
@@ -359,9 +385,9 @@ spdk_vhost_session_set_coalescing(struct spdk_vhost_dev *vdev,
 	return 0;
 }
 
-int
-spdk_vhost_set_coalescing(struct spdk_vhost_dev *vdev, uint32_t delay_base_us,
-			  uint32_t iops_threshold)
+static int
+vhost_dev_set_coalescing(struct spdk_vhost_dev *vdev, uint32_t delay_base_us,
+			 uint32_t iops_threshold)
 {
 	uint64_t delay_time_base = delay_base_us * spdk_get_ticks_hz() / 1000000ULL;
 	uint32_t io_rate = iops_threshold * SPDK_VHOST_STATS_CHECK_INTERVAL_MS / 1000U;
@@ -377,6 +403,19 @@ spdk_vhost_set_coalescing(struct spdk_vhost_dev *vdev, uint32_t delay_base_us,
 
 	vdev->coalescing_delay_us = delay_base_us;
 	vdev->coalescing_iops_threshold = iops_threshold;
+	return 0;
+}
+
+int
+spdk_vhost_set_coalescing(struct spdk_vhost_dev *vdev, uint32_t delay_base_us,
+			  uint32_t iops_threshold)
+{
+	int rc;
+
+	rc = vhost_dev_set_coalescing(vdev, delay_base_us, iops_threshold);
+	if (rc != 0) {
+		return rc;
+	}
 
 	spdk_vhost_dev_foreach_session(vdev, spdk_vhost_session_set_coalescing, NULL);
 	return 0;
@@ -466,9 +505,8 @@ int
 spdk_vhost_vring_desc_to_iov(struct spdk_vhost_session *vsession, struct iovec *iov,
 			     uint16_t *iov_index, const struct vring_desc *desc)
 {
-	uint32_t remaining = desc->len;
-	uint32_t to_boundary;
-	uint32_t len;
+	uint64_t len;
+	uint64_t remaining = desc->len;
 	uintptr_t payload = desc->addr;
 	uintptr_t vva;
 
@@ -477,30 +515,11 @@ spdk_vhost_vring_desc_to_iov(struct spdk_vhost_session *vsession, struct iovec *
 			SPDK_ERRLOG("SPDK_VHOST_IOVS_MAX(%d) reached\n", SPDK_VHOST_IOVS_MAX);
 			return -1;
 		}
-		vva = (uintptr_t)rte_vhost_gpa_to_vva(vsession->mem, payload);
-		if (vva == 0) {
+		len = remaining;
+		vva = (uintptr_t)rte_vhost_va_from_guest_pa(vsession->mem, payload, &len);
+		if (vva == 0 || len == 0) {
 			SPDK_ERRLOG("gpa_to_vva(%p) == NULL\n", (void *)payload);
 			return -1;
-		}
-		to_boundary = VALUE_2MB - _2MB_OFFSET(payload);
-		if (spdk_likely(remaining <= to_boundary)) {
-			len = remaining;
-		} else {
-			/*
-			 * Descriptor crosses a 2MB hugepage boundary.  vhost memory regions are allocated
-			 *  from hugepage memory, so this means this descriptor may be described by
-			 *  discontiguous vhost memory regions.  Do not blindly split on the 2MB boundary,
-			 *  only split it if the two sides of the boundary do not map to the same vhost
-			 *  memory region.  This helps ensure we do not exceed the max number of IOVs
-			 *  defined by SPDK_VHOST_IOVS_MAX.
-			 */
-			len = to_boundary;
-			while (len < remaining) {
-				if (vva + len != (uintptr_t)rte_vhost_gpa_to_vva(vsession->mem, payload + len)) {
-					break;
-				}
-				len += spdk_min(remaining - len, VALUE_2MB);
-			}
 		}
 		iov[*iov_index].iov_base = (void *)vva;
 		iov[*iov_index].iov_len = len;
@@ -553,12 +572,17 @@ spdk_vhost_session_mem_register(struct spdk_vhost_session *vsession)
 {
 	struct rte_vhost_mem_region *region;
 	uint32_t i;
+	uint64_t previous_start = UINT64_MAX;
 
 	for (i = 0; i < vsession->mem->nregions; i++) {
 		uint64_t start, end, len;
 		region = &vsession->mem->regions[i];
 		start = FLOOR_2MB(region->mmap_addr);
 		end = CEIL_2MB(region->mmap_addr + region->mmap_size);
+		if (start == previous_start) {
+			start += (size_t) SIZE_2MB;
+		}
+		previous_start = start;
 		len = end - start;
 		SPDK_INFOLOG(SPDK_LOG_VHOST, "Registering VM memory for vtophys translation - 0x%jx len:0x%jx\n",
 			     start, len);
@@ -576,12 +600,17 @@ spdk_vhost_session_mem_unregister(struct spdk_vhost_session *vsession)
 {
 	struct rte_vhost_mem_region *region;
 	uint32_t i;
+	uint64_t previous_start = UINT64_MAX;
 
 	for (i = 0; i < vsession->mem->nregions; i++) {
 		uint64_t start, end, len;
 		region = &vsession->mem->regions[i];
 		start = FLOOR_2MB(region->mmap_addr);
 		end = CEIL_2MB(region->mmap_addr + region->mmap_size);
+		if (start == previous_start) {
+			start += (size_t) SIZE_2MB;
+		}
+		previous_start = start;
 		len = end - start;
 
 		if (spdk_vtophys((void *) start, NULL) == SPDK_VTOPHYS_ERROR) {
@@ -593,12 +622,6 @@ spdk_vhost_session_mem_unregister(struct spdk_vhost_session *vsession)
 		}
 	}
 
-}
-
-void
-spdk_vhost_free_reactor(uint32_t lcore)
-{
-	g_num_ctrlrs[lcore]--;
 }
 
 struct spdk_vhost_dev *
@@ -767,8 +790,8 @@ spdk_vhost_dev_register(struct spdk_vhost_dev *vdev, const char *name, const cha
 	TAILQ_INIT(&vdev->vsessions);
 	TAILQ_INSERT_TAIL(&g_spdk_vhost_devices, vdev, tailq);
 
-	spdk_vhost_set_coalescing(vdev, SPDK_VHOST_COALESCING_DELAY_BASE_US,
-				  SPDK_VHOST_VQ_IOPS_COALESCING_THRESHOLD);
+	vhost_dev_set_coalescing(vdev, SPDK_VHOST_COALESCING_DELAY_BASE_US,
+				 SPDK_VHOST_VQ_IOPS_COALESCING_THRESHOLD);
 
 	spdk_vhost_dev_install_rte_compat_hooks(vdev);
 
@@ -848,170 +871,237 @@ spdk_vhost_dev_get_cpumask(struct spdk_vhost_dev *vdev)
 	return vdev->cpumask;
 }
 
-uint32_t
-spdk_vhost_allocate_reactor(struct spdk_cpuset *cpumask)
+struct vhost_poll_group *
+spdk_vhost_get_poll_group(struct spdk_cpuset *cpumask)
 {
-	uint32_t i, selected_core;
+	struct vhost_poll_group *pg, *selected_pg;
 	uint32_t min_ctrlrs;
 
 	min_ctrlrs = INT_MAX;
-	selected_core = spdk_env_get_first_core();
+	selected_pg = TAILQ_FIRST(&g_poll_groups);
 
-	SPDK_ENV_FOREACH_CORE(i) {
-		if (!spdk_cpuset_get_cpu(cpumask, i)) {
+	TAILQ_FOREACH(pg, &g_poll_groups, tailq) {
+		spdk_cpuset_copy(g_tmp_cpuset, cpumask);
+		spdk_cpuset_and(g_tmp_cpuset, spdk_thread_get_cpumask(pg->thread));
+
+		/* ignore threads which could be relocated to a non-masked cpu. */
+		if (!spdk_cpuset_equal(g_tmp_cpuset, spdk_thread_get_cpumask(pg->thread))) {
 			continue;
 		}
 
-		if (g_num_ctrlrs[i] < min_ctrlrs) {
-			selected_core = i;
-			min_ctrlrs = g_num_ctrlrs[i];
+		if (pg->ref < min_ctrlrs) {
+			selected_pg = pg;
+			min_ctrlrs = pg->ref;
 		}
 	}
 
-	g_num_ctrlrs[selected_core]++;
-	return selected_core;
+	assert(selected_pg != NULL);
+	assert(selected_pg->ref < UINT_MAX);
+	selected_pg->ref++;
+	return selected_pg;
 }
 
 void
-spdk_vhost_session_event_done(struct spdk_vhost_session *vsession, int response)
+spdk_vhost_put_poll_group(struct vhost_poll_group *pg)
 {
-	struct spdk_vhost_session_fn_ctx *ctx = vsession->event_ctx;
+	assert(pg->ref > 0);
+	pg->ref--;
+}
 
-	ctx->response = response;
-	sem_post(&ctx->sem);
+void
+spdk_vhost_session_start_done(struct spdk_vhost_session *vsession, int response)
+{
+	if (response == 0) {
+		vsession->started = true;
+		assert(vsession->vdev->active_session_num < UINT32_MAX);
+		vsession->vdev->active_session_num++;
+	}
+
+	g_dpdk_response = response;
+	sem_post(&g_dpdk_sem);
+}
+
+void
+spdk_vhost_session_stop_done(struct spdk_vhost_session *vsession, int response)
+{
+	if (response == 0) {
+		vsession->started = false;
+		assert(vsession->vdev->active_session_num > 0);
+		vsession->vdev->active_session_num--;
+	}
+
+	g_dpdk_response = response;
+	sem_post(&g_dpdk_sem);
 }
 
 static void
-spdk_vhost_event_cb(void *arg1, void *arg2)
+spdk_vhost_event_cb(void *arg1)
 {
 	struct spdk_vhost_session_fn_ctx *ctx = arg1;
 	struct spdk_vhost_session *vsession;
 
+	if (pthread_mutex_trylock(&g_spdk_vhost_mutex) != 0) {
+		spdk_thread_send_msg(spdk_get_thread(), spdk_vhost_event_cb, arg1);
+		return;
+	}
+
 	vsession = spdk_vhost_session_find_by_id(ctx->vdev, ctx->vsession_id);
 	ctx->cb_fn(ctx->vdev, vsession, NULL);
+	pthread_mutex_unlock(&g_spdk_vhost_mutex);
 }
 
-static void spdk_vhost_external_event_foreach_continue(struct spdk_vhost_dev *vdev,
-		struct spdk_vhost_session *vsession,
-		spdk_vhost_session_fn fn, void *arg);
+int
+spdk_vhost_session_send_event(struct vhost_poll_group *pg,
+			      struct spdk_vhost_session *vsession,
+			      spdk_vhost_session_fn cb_fn, unsigned timeout_sec,
+			      const char *errmsg)
+{
+	struct spdk_vhost_session_fn_ctx ev_ctx = {0};
+	struct timespec timeout;
+	int rc;
+
+	ev_ctx.vdev = vsession->vdev;
+	ev_ctx.vsession_id = vsession->id;
+	ev_ctx.cb_fn = cb_fn;
+
+	vsession->poll_group = pg;
+	spdk_thread_send_msg(pg->thread, spdk_vhost_event_cb, &ev_ctx);
+	pthread_mutex_unlock(&g_spdk_vhost_mutex);
+
+	clock_gettime(CLOCK_REALTIME, &timeout);
+	timeout.tv_sec += timeout_sec;
+
+	rc = sem_timedwait(&g_dpdk_sem, &timeout);
+	if (rc != 0) {
+		SPDK_ERRLOG("Timeout waiting for event: %s.\n", errmsg);
+		sem_wait(&g_dpdk_sem);
+	}
+
+	pthread_mutex_lock(&g_spdk_vhost_mutex);
+	return g_dpdk_response;
+}
+
+static void foreach_session_continue(struct spdk_vhost_session_fn_ctx *ev_ctx,
+				     struct spdk_vhost_session *vsession);
 
 static void
-spdk_vhost_event_async_foreach_fn(void *arg1, void *arg2)
+foreach_session_finish_cb(void *arg1)
+{
+	struct spdk_vhost_session_fn_ctx *ctx = arg1;
+	struct spdk_vhost_dev *vdev = ctx->vdev;
+
+	if (pthread_mutex_trylock(&g_spdk_vhost_mutex) != 0) {
+		spdk_thread_send_msg(spdk_get_thread(),
+				     foreach_session_finish_cb, arg1);
+		return;
+	}
+
+	assert(vdev->pending_async_op_num > 0);
+	vdev->pending_async_op_num--;
+	/* Call fn one last time with vsession == NULL */
+	ctx->cb_fn(vdev, NULL, ctx->user_ctx);
+
+	pthread_mutex_unlock(&g_spdk_vhost_mutex);
+	free(ctx);
+}
+
+static void
+foreach_session_continue_cb(void *arg1)
 {
 	struct spdk_vhost_session_fn_ctx *ctx = arg1;
 	struct spdk_vhost_session *vsession = NULL;
 	struct spdk_vhost_dev *vdev = ctx->vdev;
-	struct spdk_event *ev;
 	int rc;
 
 	if (pthread_mutex_trylock(&g_spdk_vhost_mutex) != 0) {
-		ev = spdk_event_allocate(spdk_env_get_current_core(),
-					 spdk_vhost_event_async_foreach_fn, arg1, arg2);
-		spdk_event_call(ev);
+		spdk_thread_send_msg(spdk_get_thread(),
+				     foreach_session_continue_cb, arg1);
 		return;
 	}
 
 	vsession = spdk_vhost_session_find_by_id(vdev, ctx->vsession_id);
-	if (vsession == NULL) {
+	if (vsession == NULL || !vsession->initialized) {
 		/* The session must have been removed in the meantime, so we
 		 * just skip it in our foreach chain
 		 */
 		goto out_unlock_continue;
 	}
 
-	if (vsession->lcore >= 0 &&
-	    (uint32_t)vsession->lcore != spdk_env_get_current_core()) {
-		/* if session has been relocated to other core, it is no longer thread-safe
+	if (vsession->started && vsession->poll_group->thread != spdk_get_thread()) {
+		/* if session has been relocated to other thread, it is no longer thread-safe
 		 * to access its contents here. Even though we're running under the global
 		 * vhost mutex, the session itself (and its pollers) are not. We need to chase
 		 * the session thread as many times as necessary.
 		 */
-		ev = spdk_event_allocate(vsession->lcore,
-					 spdk_vhost_event_async_foreach_fn, arg1, arg2);
-		spdk_event_call(ev);
+		spdk_thread_send_msg(vsession->poll_group->thread,
+				     foreach_session_continue_cb, arg1);
 		pthread_mutex_unlock(&g_spdk_vhost_mutex);
 		return;
 	}
 
-	rc = ctx->cb_fn(vdev, vsession, arg2);
+	rc = ctx->cb_fn(vdev, vsession, ctx->user_ctx);
 	if (rc < 0) {
-		goto out_unlock;
+		pthread_mutex_unlock(&g_spdk_vhost_mutex);
+		free(ctx);
+		return;
 	}
 
 out_unlock_continue:
 	vsession = spdk_vhost_session_next(vdev, ctx->vsession_id);
-	spdk_vhost_external_event_foreach_continue(vdev, vsession, ctx->cb_fn, arg2);
-out_unlock:
+	foreach_session_continue(ctx, vsession);
 	pthread_mutex_unlock(&g_spdk_vhost_mutex);
-	free(ctx);
 }
 
-int
-spdk_vhost_session_send_event(struct spdk_vhost_session *vsession,
-			      spdk_vhost_session_fn cb_fn, unsigned timeout_sec,
-			      const char *errmsg)
+static void
+foreach_session_continue(struct spdk_vhost_session_fn_ctx *ev_ctx,
+			 struct spdk_vhost_session *vsession)
 {
-	struct spdk_vhost_session_fn_ctx ev_ctx = {0};
-	struct spdk_event *ev;
-	struct timespec timeout;
+	struct spdk_vhost_dev *vdev = ev_ctx->vdev;
 	int rc;
 
-	rc = sem_init(&ev_ctx.sem, 0, 0);
-	if (rc != 0) {
-		SPDK_ERRLOG("Failed to initialize semaphore for vhost timed event\n");
-		return -errno;
+	while (vsession != NULL && !vsession->started) {
+		if (vsession->initialized) {
+			rc = ev_ctx->cb_fn(vdev, vsession, ev_ctx->user_ctx);
+			if (rc < 0) {
+				return;
+			}
+		}
+
+		vsession = spdk_vhost_session_next(vdev, vsession->id);
 	}
 
-	ev_ctx.vdev = vsession->vdev;
-	ev_ctx.vsession_id = vsession->id;
-	ev_ctx.cb_fn = cb_fn;
-
-	vsession->event_ctx = &ev_ctx;
-	ev = spdk_event_allocate(vsession->lcore, spdk_vhost_event_cb, &ev_ctx, NULL);
-	assert(ev);
-	spdk_event_call(ev);
-	pthread_mutex_unlock(&g_spdk_vhost_mutex);
-
-	clock_gettime(CLOCK_REALTIME, &timeout);
-	timeout.tv_sec += timeout_sec;
-
-	rc = sem_timedwait(&ev_ctx.sem, &timeout);
-	if (rc != 0) {
-		SPDK_ERRLOG("Timeout waiting for event: %s.\n", errmsg);
-		sem_wait(&ev_ctx.sem);
+	if (vsession != NULL) {
+		ev_ctx->vsession_id = vsession->id;
+		spdk_thread_send_msg(vsession->poll_group->thread,
+				     foreach_session_continue_cb, ev_ctx);
+	} else {
+		ev_ctx->vsession_id = UINT32_MAX;
+		spdk_thread_send_msg(g_vhost_init_thread,
+				     foreach_session_finish_cb, ev_ctx);
 	}
-
-	sem_destroy(&ev_ctx.sem);
-	pthread_mutex_lock(&g_spdk_vhost_mutex);
-	vsession->event_ctx = NULL;
-	return ev_ctx.response;
 }
 
-static int
-spdk_vhost_event_async_send_foreach_continue(struct spdk_vhost_session *vsession,
-		spdk_vhost_session_fn cb_fn, void *arg)
+void
+spdk_vhost_dev_foreach_session(struct spdk_vhost_dev *vdev,
+			       spdk_vhost_session_fn fn, void *arg)
 {
-	struct spdk_vhost_dev *vdev = vsession->vdev;
+	struct spdk_vhost_session *vsession = TAILQ_FIRST(&vdev->vsessions);
 	struct spdk_vhost_session_fn_ctx *ev_ctx;
-	struct spdk_event *ev;
 
 	ev_ctx = calloc(1, sizeof(*ev_ctx));
 	if (ev_ctx == NULL) {
 		SPDK_ERRLOG("Failed to alloc vhost event.\n");
 		assert(false);
-		return -ENOMEM;
+		return;
 	}
 
 	ev_ctx->vdev = vdev;
-	ev_ctx->vsession_id = vsession->id;
-	ev_ctx->cb_fn = cb_fn;
+	ev_ctx->cb_fn = fn;
+	ev_ctx->user_ctx = arg;
 
-	ev = spdk_event_allocate(vsession->lcore,
-				 spdk_vhost_event_async_foreach_fn, ev_ctx, arg);
-	assert(ev);
-	spdk_event_call(ev);
-
-	return 0;
+	assert(vdev->pending_async_op_num < UINT32_MAX);
+	vdev->pending_async_op_num++;
+	foreach_session_continue(ev_ctx, vsession);
 }
 
 static void
@@ -1039,9 +1129,6 @@ _stop_session(struct spdk_vhost_session *vsession)
 
 	spdk_vhost_session_mem_unregister(vsession);
 	free(vsession->mem);
-	vsession->lcore = -1;
-	assert(vdev->active_session_num > 0);
-	vdev->active_session_num--;
 }
 
 static void
@@ -1057,7 +1144,7 @@ stop_device(int vid)
 		return;
 	}
 
-	if (vsession->lcore == -1) {
+	if (!vsession->started) {
 		/* already stopped, nothing to do */
 		pthread_mutex_unlock(&g_spdk_vhost_mutex);
 		return;
@@ -1084,7 +1171,7 @@ start_device(int vid)
 	}
 
 	vdev = vsession->vdev;
-	if (vsession->lcore != -1) {
+	if (vsession->started) {
 		/* already started, nothing to do */
 		rc = 0;
 		goto out;
@@ -1095,9 +1182,11 @@ start_device(int vid)
 	for (i = 0; i < SPDK_VHOST_MAX_VQUEUES; i++) {
 		struct spdk_vhost_virtqueue *q = &vsession->virtqueue[i];
 
+		q->vring_idx = -1;
 		if (rte_vhost_get_vhost_vring(vid, i, &q->vring)) {
 			continue;
 		}
+		q->vring_idx = i;
 
 		if (q->vring.desc == NULL || q->vring.size == 0) {
 			continue;
@@ -1127,17 +1216,6 @@ start_device(int vid)
 		goto out;
 	}
 
-	for (i = 0; i < vsession->mem->nregions; i++) {
-		uint64_t mmap_size = vsession->mem->regions[i].mmap_size;
-
-		if (mmap_size & MASK_2MB) {
-			SPDK_ERRLOG("vhost device %d: Guest mmaped memory size %" PRIx64
-				    " is not a 2MB multiple\n", vid, mmap_size);
-			free(vsession->mem);
-			goto out;
-		}
-	}
-
 	/*
 	 * Not sure right now but this look like some kind of QEMU bug and guest IO
 	 * might be frozed without kicking all queues after live-migration. This look like
@@ -1148,13 +1226,16 @@ start_device(int vid)
 	 * Tested on QEMU 2.10.91 and 2.11.50.
 	 */
 	for (i = 0; i < vsession->max_queues; i++) {
-		if (vsession->virtqueue[i].vring.callfd != -1) {
-			eventfd_write(vsession->virtqueue[i].vring.callfd, (eventfd_t)1);
+		struct spdk_vhost_virtqueue *q = &vsession->virtqueue[i];
+
+		if (q->vring.desc != NULL && q->vring.size > 0) {
+			rte_vhost_vring_call(vsession->vid, q->vring_idx);
 		}
 	}
 
 	spdk_vhost_session_set_coalescing(vdev, vsession, NULL);
 	spdk_vhost_session_mem_register(vsession);
+	vsession->initialized = true;
 	rc = vdev->backend->start_session(vsession);
 	if (rc != 0) {
 		spdk_vhost_session_mem_unregister(vsession);
@@ -1162,8 +1243,6 @@ start_device(int vid)
 		goto out;
 	}
 
-	assert(vdev->active_session_num < UINT32_MAX);
-	vdev->active_session_num++;
 out:
 	pthread_mutex_unlock(&g_spdk_vhost_mutex);
 	return rc;
@@ -1243,21 +1322,6 @@ spdk_vhost_set_socket_path(const char *basename)
 	return 0;
 }
 
-static void *
-session_shutdown(void *arg)
-{
-	struct spdk_vhost_dev *vdev = NULL;
-
-	TAILQ_FOREACH(vdev, &g_spdk_vhost_devices, tailq) {
-		rte_vhost_driver_unregister(vdev->path);
-		vdev->registered = false;
-	}
-
-	SPDK_INFOLOG(SPDK_LOG_VHOST, "Exiting\n");
-	spdk_event_call((struct spdk_event *)arg);
-	return NULL;
-}
-
 void
 spdk_vhost_dump_info_json(struct spdk_vhost_dev *vdev, struct spdk_json_write_ctx *w)
 {
@@ -1307,19 +1371,20 @@ new_connection(int vid)
 		return -EINVAL;
 	}
 
-	vsession = spdk_dma_zmalloc(sizeof(struct spdk_vhost_session) +
-				    vdev->backend->session_ctx_size,
-				    SPDK_CACHE_LINE_SIZE, NULL);
-	if (vsession == NULL) {
-		SPDK_ERRLOG("spdk_dma_zmalloc failed\n");
+	if (posix_memalign((void **)&vsession, SPDK_CACHE_LINE_SIZE, sizeof(*vsession) +
+			   vdev->backend->session_ctx_size)) {
+		SPDK_ERRLOG("vsession alloc failed\n");
 		pthread_mutex_unlock(&g_spdk_vhost_mutex);
 		return -1;
 	}
+	memset(vsession, 0, sizeof(*vsession) + vdev->backend->session_ctx_size);
 
 	vsession->vdev = vdev;
 	vsession->id = vdev->vsessions_num++;
 	vsession->vid = vid;
-	vsession->lcore = -1;
+	vsession->poll_group = NULL;
+	vsession->started = false;
+	vsession->initialized = false;
 	vsession->next_stats_check_time = 0;
 	vsession->stats_check_interval = SPDK_VHOST_STATS_CHECK_INTERVAL_MS *
 					 spdk_get_ticks_hz() / 1000UL;
@@ -1343,58 +1408,13 @@ destroy_connection(int vid)
 		return;
 	}
 
-	if (vsession->lcore != -1) {
+	if (vsession->started) {
 		_stop_session(vsession);
 	}
 
 	TAILQ_REMOVE(&vsession->vdev->vsessions, vsession, tailq);
-	spdk_dma_free(vsession);
+	free(vsession);
 	pthread_mutex_unlock(&g_spdk_vhost_mutex);
-}
-
-static void
-spdk_vhost_external_event_foreach_continue(struct spdk_vhost_dev *vdev,
-		struct spdk_vhost_session *vsession,
-		spdk_vhost_session_fn fn, void *arg)
-{
-	int rc;
-
-	if (vsession == NULL) {
-		goto out_finish_foreach;
-	}
-
-	while (vsession->lcore == -1) {
-		rc = fn(vdev, vsession, arg);
-		if (rc < 0) {
-			return;
-		}
-		vsession = spdk_vhost_session_next(vdev, vsession->id);
-		if (vsession == NULL) {
-			goto out_finish_foreach;
-		}
-	}
-
-	spdk_vhost_event_async_send_foreach_continue(vsession, fn, arg);
-	return;
-
-out_finish_foreach:
-	/* there are no more sessions to iterate through, so call the
-	 * fn one last time with vsession == NULL
-	 */
-	assert(vdev->pending_async_op_num > 0);
-	vdev->pending_async_op_num--;
-	fn(vdev, NULL, arg);
-}
-
-void
-spdk_vhost_dev_foreach_session(struct spdk_vhost_dev *vdev,
-			       spdk_vhost_session_fn fn, void *arg)
-{
-	struct spdk_vhost_session *vsession = TAILQ_FIRST(&vdev->vsessions);
-
-	assert(vdev->pending_async_op_num < UINT32_MAX);
-	vdev->pending_async_op_num++;
-	spdk_vhost_external_event_foreach_continue(vdev, vsession, fn, arg);
 }
 
 void
@@ -1403,23 +1423,84 @@ spdk_vhost_lock(void)
 	pthread_mutex_lock(&g_spdk_vhost_mutex);
 }
 
+int
+spdk_vhost_trylock(void)
+{
+	return -pthread_mutex_trylock(&g_spdk_vhost_mutex);
+}
+
 void
 spdk_vhost_unlock(void)
 {
 	pthread_mutex_unlock(&g_spdk_vhost_mutex);
 }
 
-int
-spdk_vhost_init(void)
+static void
+vhost_create_poll_group_done(void *ctx)
 {
-	uint32_t last_core;
+	spdk_vhost_init_cb init_cb = ctx;
+	int ret;
+
+	if (TAILQ_EMPTY(&g_poll_groups)) {
+		/* No threads? Iteration failed? */
+		init_cb(-ECHILD);
+		return;
+	}
+
+	ret = spdk_vhost_scsi_controller_construct();
+	if (ret != 0) {
+		SPDK_ERRLOG("Cannot construct vhost controllers\n");
+		goto out;
+	}
+
+	ret = spdk_vhost_blk_controller_construct();
+	if (ret != 0) {
+		SPDK_ERRLOG("Cannot construct vhost block controllers\n");
+		goto out;
+	}
+
+#ifdef SPDK_CONFIG_VHOST_INTERNAL_LIB
+	ret = spdk_vhost_nvme_controller_construct();
+	if (ret != 0) {
+		SPDK_ERRLOG("Cannot construct vhost NVMe controllers\n");
+		goto out;
+	}
+#endif
+
+out:
+	init_cb(ret);
+}
+
+static void
+vhost_create_poll_group(void *ctx)
+{
+	struct vhost_poll_group *pg;
+
+	pg = calloc(1, sizeof(*pg));
+	if (!pg) {
+		SPDK_ERRLOG("Not enough memory to allocate poll groups\n");
+		spdk_app_stop(-ENOMEM);
+		return;
+	}
+
+	pg->thread = spdk_get_thread();
+	TAILQ_INSERT_TAIL(&g_poll_groups, pg, tailq);
+}
+
+void
+spdk_vhost_init(spdk_vhost_init_cb init_cb)
+{
 	size_t len;
 	int ret;
+
+	g_vhost_init_thread = spdk_get_thread();
+	assert(g_vhost_init_thread != NULL);
 
 	if (dev_dirname[0] == '\0') {
 		if (getcwd(dev_dirname, sizeof(dev_dirname) - 1) == NULL) {
 			SPDK_ERRLOG("getcwd failed (%d): %s\n", errno, spdk_strerror(errno));
-			return -1;
+			ret = -1;
+			goto err_out;
 		}
 
 		len = strlen(dev_dirname);
@@ -1429,42 +1510,33 @@ spdk_vhost_init(void)
 		}
 	}
 
-	last_core = spdk_env_get_last_core();
-	g_num_ctrlrs = calloc(last_core + 1, sizeof(uint32_t));
-	if (!g_num_ctrlrs) {
-		SPDK_ERRLOG("Could not allocate array size=%u for g_num_ctrlrs\n",
-			    last_core + 1);
-		return -1;
+	g_tmp_cpuset = spdk_cpuset_alloc();
+	if (g_tmp_cpuset == NULL) {
+		ret = -1;
+		goto err_out;
 	}
 
-	ret = spdk_vhost_scsi_controller_construct();
+	ret = sem_init(&g_dpdk_sem, 0, 0);
 	if (ret != 0) {
-		SPDK_ERRLOG("Cannot construct vhost controllers\n");
-		return -1;
+		SPDK_ERRLOG("Failed to initialize semaphore for rte_vhost pthread.\n");
+		spdk_cpuset_free(g_tmp_cpuset);
+		ret = -1;
+		goto err_out;
 	}
 
-	ret = spdk_vhost_blk_controller_construct();
-	if (ret != 0) {
-		SPDK_ERRLOG("Cannot construct vhost block controllers\n");
-		return -1;
-	}
-
-#ifdef SPDK_CONFIG_VHOST_INTERNAL_LIB
-	ret = spdk_vhost_nvme_controller_construct();
-	if (ret != 0) {
-		SPDK_ERRLOG("Cannot construct vhost NVMe controllers\n");
-		return -1;
-	}
-#endif
-
-	return 0;
+	spdk_for_each_thread(vhost_create_poll_group,
+			     init_cb,
+			     vhost_create_poll_group_done);
+	return;
+err_out:
+	init_cb(ret);
 }
 
 static void
-_spdk_vhost_fini(void *arg1, void *arg2)
+_spdk_vhost_fini(void *arg1)
 {
-	spdk_vhost_fini_cb fini_cb = arg1;
 	struct spdk_vhost_dev *vdev, *tmp;
+	struct vhost_poll_group *pg, *tpg;
 
 	spdk_vhost_lock();
 	vdev = spdk_vhost_dev_next(NULL);
@@ -1477,8 +1549,28 @@ _spdk_vhost_fini(void *arg1, void *arg2)
 	spdk_vhost_unlock();
 
 	/* All devices are removed now. */
-	free(g_num_ctrlrs);
-	fini_cb();
+	sem_destroy(&g_dpdk_sem);
+	spdk_cpuset_free(g_tmp_cpuset);
+	TAILQ_FOREACH_SAFE(pg, &g_poll_groups, tailq, tpg) {
+		TAILQ_REMOVE(&g_poll_groups, pg, tailq);
+		free(pg);
+	}
+	g_fini_cpl_cb();
+}
+
+static void *
+session_shutdown(void *arg)
+{
+	struct spdk_vhost_dev *vdev = NULL;
+
+	TAILQ_FOREACH(vdev, &g_spdk_vhost_devices, tailq) {
+		rte_vhost_driver_unregister(vdev->path);
+		vdev->registered = false;
+	}
+
+	SPDK_INFOLOG(SPDK_LOG_VHOST, "Exiting\n");
+	spdk_thread_send_msg(g_vhost_init_thread, _spdk_vhost_fini, NULL);
+	return NULL;
 }
 
 void
@@ -1486,15 +1578,15 @@ spdk_vhost_fini(spdk_vhost_fini_cb fini_cb)
 {
 	pthread_t tid;
 	int rc;
-	struct spdk_event *fini_ev;
 
-	fini_ev = spdk_event_allocate(spdk_env_get_current_core(), _spdk_vhost_fini, fini_cb, NULL);
+	assert(spdk_get_thread() == g_vhost_init_thread);
+	g_fini_cpl_cb = fini_cb;
 
 	/* rte_vhost API for removing sockets is not asynchronous. Since it may call SPDK
 	 * ops for stopping a device or removing a connection, we need to call it from
 	 * a separate thread to avoid deadlock.
 	 */
-	rc = pthread_create(&tid, NULL, &session_shutdown, fini_ev);
+	rc = pthread_create(&tid, NULL, &session_shutdown, NULL);
 	if (rc < 0) {
 		SPDK_ERRLOG("Failed to start session shutdown thread (%d): %s\n", rc, spdk_strerror(rc));
 		abort();

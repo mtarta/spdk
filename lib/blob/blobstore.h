@@ -148,7 +148,7 @@ struct spdk_blob {
 	TAILQ_ENTRY(spdk_blob) link;
 
 	uint32_t frozen_refcnt;
-	bool resize_in_progress;
+	bool locked_operation_in_progress;
 	enum blob_clear_method clear_method;
 };
 
@@ -215,6 +215,7 @@ enum spdk_blob_op_type {
 
 #define BLOB_SNAPSHOT "SNAP"
 #define SNAPSHOT_IN_PROGRESS "SNAPTMP"
+#define SNAPSHOT_PENDING_REMOVAL "SNAPRM"
 
 struct spdk_blob_bs_dev {
 	struct spdk_bs_dev bs_dev;
@@ -319,6 +320,8 @@ struct spdk_blob_md_page {
 };
 #define SPDK_BS_PAGE_SIZE 0x1000
 SPDK_STATIC_ASSERT(SPDK_BS_PAGE_SIZE == sizeof(struct spdk_blob_md_page), "Invalid md page size");
+
+#define SPDK_BS_MAX_DESC_SIZE sizeof(((struct spdk_blob_md_page*)0)->descriptors)
 
 #define SPDK_BS_SUPER_BLOCK_SIG "SPDKBLOB"
 

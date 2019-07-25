@@ -36,6 +36,7 @@
 #include "env_internal.h"
 
 #include <rte_config.h>
+#include <rte_memory.h>
 #include <rte_eal_memconfig.h>
 
 #include "spdk_internal/assert.h"
@@ -934,6 +935,8 @@ vtophys_get_paddr_pagemap(uint64_t vaddr)
 {
 	uintptr_t paddr;
 
+	/* Silence static analyzers */
+	assert(vaddr != 0);
 	paddr = rte_mem_virt2iova((void *)vaddr);
 	if (paddr == RTE_BAD_IOVA) {
 		/*

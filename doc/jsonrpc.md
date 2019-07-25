@@ -69,6 +69,7 @@ sig_name                | Required | string      | Signal to send (SIGINT, SIGTE
 ### Example
 
 Example request:
+
 ~~~
 {
   "jsonrpc": "2.0",
@@ -81,6 +82,7 @@ Example request:
 ~~~
 
 Example response:
+
 ~~~
 {
   "jsonrpc": "2.0",
@@ -108,6 +110,7 @@ enabled                 | boolean     | The current state of context switch moni
 ### Example
 
 Example request:
+
 ~~~
 {
   "jsonrpc": "2.0",
@@ -120,6 +123,7 @@ Example request:
 ~~~
 
 Example response:
+
 ~~~
 {
   "jsonrpc": "2.0",
@@ -147,6 +151,7 @@ Completion status of SPDK subsystem initialization is returned as a boolean.
 ### Example
 
 Example request:
+
 ~~~
 {
   "jsonrpc": "2.0",
@@ -156,6 +161,7 @@ Example request:
 ~~~
 
 Example response:
+
 ~~~
 {
   "jsonrpc": "2.0",
@@ -180,6 +186,7 @@ Returns True when subsystems have been initialized.
 ### Example
 
 Example request:
+
 ~~~
 {
   "jsonrpc": "2.0",
@@ -189,6 +196,7 @@ Example request:
 ~~~
 
 Example response:
+
 ~~~
 {
   "jsonrpc": "2.0",
@@ -197,7 +205,7 @@ Example response:
 }
 ~~~
 
-## get_rpc_methods {#rpc_get_rpc_methods}
+## rpc_get_methods {#rpc_rpc_get_methods}
 
 Get an array of supported RPC methods.
 
@@ -214,15 +222,17 @@ The response is an array of supported RPC methods.
 ### Example
 
 Example request:
+
 ~~~
 {
   "jsonrpc": "2.0",
   "id": 1,
-  "method": "get_rpc_methods"
+  "method": "rpc_get_methods"
 }
 ~~~
 
 Example response:
+
 ~~~
 {
   "jsonrpc": "2.0",
@@ -321,6 +331,7 @@ The response is an array of name and dependency relationship of SPDK subsystems 
 ### Example
 
 Example request:
+
 ~~~
 {
   "jsonrpc": "2.0",
@@ -330,6 +341,7 @@ Example request:
 ~~~
 
 Example response:
+
 ~~~
 {
   "jsonrpc": "2.0",
@@ -407,6 +419,7 @@ Null is returned if it is not retrievable by the get_subsystem_config method and
 ### Example
 
 Example request:
+
 ~~~
 {
   "jsonrpc": "2.0",
@@ -419,6 +432,7 @@ Example request:
 ~~~
 
 Example response:
+
 ~~~
 {
   "jsonrpc": "2.0",
@@ -470,6 +484,47 @@ Example response:
 }
 ~~~
 
+## thread_get_stats {#rpc_thread_get_stats}
+
+Retrieve current statistics of all the threads.
+
+### Parameters
+
+This method has no parameters.
+
+### Response
+
+The response is an array of objects containing threads statistics.
+
+### Example
+
+Example request:
+~~~
+{
+  "jsonrpc": "2.0",
+  "method": "thread_get_stats",
+  "id": 1
+}
+~~~
+
+Example response:
+~~~
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "tick_rate": 2400000000,
+    "threads": [
+      {
+        "name": "reactor_0",
+        "busy": 139223208,
+        "idle": 8641080608
+      }
+    ]
+  }
+}
+~~~
+
 # Block Device Abstraction Layer {#jsonrpc_components_bdev}
 
 ## set_bdev_options {#rpc_set_bdev_options}
@@ -487,6 +542,7 @@ bdev_io_cache_size      | Optional | number      | Maximum number of spdk_bdev_i
 ### Example
 
 Example request:
+
 ~~~
 {
   "jsonrpc": "2.0",
@@ -500,6 +556,7 @@ Example request:
 ~~~
 
 Example response:
+
 ~~~
 {
   "jsonrpc": "2.0",
@@ -528,6 +585,7 @@ The response is an array of objects containing information about the requested b
 ### Example
 
 Example request:
+
 ~~~
 {
   "jsonrpc": "2.0",
@@ -540,6 +598,7 @@ Example request:
 ~~~
 
 Example response:
+
 ~~~
 {
   "jsonrpc": "2.0",
@@ -587,6 +646,7 @@ The response is an array of objects containing I/O statistics of the requested b
 ### Example
 
 Example request:
+
 ~~~
 {
   "jsonrpc": "2.0",
@@ -599,31 +659,32 @@ Example request:
 ~~~
 
 Example response:
+
 ~~~
 {
   "jsonrpc": "2.0",
   "id": 1,
-  "result": [
-    {
-      "tick_rate": 2200000000
-    },
-    {
-      "name": "Nvme0n1",
-      "bytes_read": 36864,
-      "num_read_ops": 2,
-      "bytes_written": 0,
-      "num_write_ops": 0,
-      "bytes_unmapped": 0,
-      "num_unmap_ops": 0,
-      "read_latency_ticks": 178904,
-      "write_latency_ticks": 0,
-      "unmap_latency_ticks": 0,
-      "queue_depth_polling_period": 2,
-      "queue_depth": 0,
-      "io_time": 0,
-      "weighted_io_time": 0
-    }
-  ]
+  "result": {
+    "tick_rate": 2200000000,
+    "bdevs" : [
+      {
+        "name": "Nvme0n1",
+        "bytes_read": 36864,
+        "num_read_ops": 2,
+        "bytes_written": 0,
+        "num_write_ops": 0,
+        "bytes_unmapped": 0,
+        "num_unmap_ops": 0,
+        "read_latency_ticks": 178904,
+        "write_latency_ticks": 0,
+        "unmap_latency_ticks": 0,
+        "queue_depth_polling_period": 2,
+        "queue_depth": 0,
+        "io_time": 0,
+        "weighted_io_time": 0
+      }
+    ]
+  }
 }
 ~~~
 
@@ -641,6 +702,7 @@ enable                  | Required | boolean     | Enable or disable histogram o
 ### Example
 
 Example request:
+
 ~~~
 {
   "jsonrpc": "2.0",
@@ -654,6 +716,7 @@ Example request:
 ~~~
 
 Example response:
+
 ~~~
 {
   "jsonrpc": "2.0",
@@ -683,6 +746,7 @@ tsc_rate                | Ticks per second
 ### Example
 
 Example request:
+
 ~~~
 {
   "jsonrpc": "2.0",
@@ -726,6 +790,7 @@ w_mbytes_per_sec        | Optional | number      | Number of Write megabytes per
 ### Example
 
 Example request:
+
 ~~~
 {
   "jsonrpc": "2.0",
@@ -742,6 +807,7 @@ Example request:
 ~~~
 
 Example response:
+
 ~~~
 {
   "jsonrpc": "2.0",
@@ -754,14 +820,14 @@ Example response:
 
 Construct new OCF bdev.
 Command accepts cache mode that is going to be used.
-Currently, we support Write-Through and Pass-Through OCF cache modes.
+Currently, we support Write-Through, Pass-Through and Write-Back OCF cache modes.
 
 ### Parameters
 
 Name                    | Optional | Type        | Description
 ----------------------- | -------- | ----------- | -----------
 name                    | Required | string      | Bdev name to use
-mode                    | Required | string      | OCF cache mode ('wt' or 'pt')
+mode                    | Required | string      | OCF cache mode ('wb' or 'wt' or 'pt')
 cache_bdev_name         | Required | string      | Name of underlying cache bdev
 core_bdev_name          | Required | string      | Name of underlying core bdev
 
@@ -1042,7 +1108,9 @@ Get list of OCF devices including unregistered ones.
 
 ### Parameters
 
-This method has no parameters.
+Name                    | Optional | Type        | Description
+----------------------- | -------- | ----------- | -----------
+name                    | Optional | string      | Name of OCF vbdev or name of cache device or name of core device
 
 ### Response
 
@@ -1476,6 +1544,7 @@ The response is an array of objects containing information about the requested N
 ### Example
 
 Example request:
+
 ~~~
 {
   "jsonrpc": "2.0",
@@ -1488,6 +1557,7 @@ Example request:
 ~~~
 
 Example response:
+
 ~~~
 {
   "jsonrpc": "2.0",
@@ -1631,6 +1701,92 @@ Example request:
   "method": "delete_rbd_bdev",
   "id": 1
 }
+~~~
+
+Example response:
+
+~~~
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": true
+}
+~~~
+
+## bdev_delay_create {#rpc_bdev_delay_create}
+
+Create delay bdev. This bdev type redirects all IO to it's base bdev and inserts a delay on the completion
+path to create an artificial drive latency.
+
+### Parameters
+
+Name                    | Optional | Type        | Description
+----------------------- | -------- | ----------- | -----------
+name                    | Required | string      | Bdev name
+base_bdev_name          | Required | string      | Base bdev name
+avg_read_latency        | Required | number      | average read latency (us)
+p99_read_latency        | Required | number      | p99 read latency (us)
+avg_write_latency       | Required | number      | average write latency (us)
+p99_write_latency       | Required | number      | p99 write latency (us)
+
+### Result
+
+Name of newly created bdev.
+
+### Example
+
+Example request:
+
+~~~
+{
+  "params": {
+    "base_bdev_name": "Null0",
+    "name": "Delay0",
+    "avg_read_latency": "15",
+    "p99_read_latency": "50",
+    "avg_write_latency": "40",
+    "p99_write_latency": "110",
+  },
+  "jsonrpc": "2.0",
+  "method": "bdev_delay_create",
+  "id": 1
+}
+~~~
+
+Example response:
+
+~~~
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": "Delay0"
+}
+~~~
+
+## bdev_delay_delete {#rpc_bdev_delay_delete}
+
+Delete delay bdev.
+
+### Parameters
+
+Name                    | Optional | Type        | Description
+----------------------- | -------- | ----------- | -----------
+name                    | Required | string      | Bdev name
+
+### Example
+
+Example request:
+
+~~~
+{
+  "params": {
+    "name": "Delay0"
+  },
+  "jsonrpc": "2.0",
+  "method": "bdev_delay_delete",
+  "id": 1
+}
+
 ~~~
 
 Example response:
@@ -1814,6 +1970,7 @@ trtype                  | Required | string      | Transport type
 traddr                  | Required | string      | NVMe target address
 punits                  | Required | string      | Parallel unit range in the form of start-end e.g 4-8
 uuid                    | Optional | string      | UUID of restored bdev (not applicable when creating new instance)
+cache                   | Optional | string      | Name of the bdev to be used as a write buffer cache
 
 ### Result
 
@@ -2349,7 +2506,6 @@ first_burst_length          | Optional | number  | Session specific parameter, F
 immediate_data              | Optional | boolean | Session specific parameter, ImmediateData (default: `true`)
 error_recovery_level        | Optional | number  | Session specific parameter, ErrorRecoveryLevel (default: 0)
 allow_duplicated_isid       | Optional | boolean | Allow duplicated initiator session ID (default: `false`)
-min_connections_per_core    | Optional | number  | Allocation unit of connections per core (default: 4)
 
 To load CHAP shared secret file, its path is required to specify explicitly in the parameter `auth_file`.
 
@@ -2432,7 +2588,6 @@ Example response:
     "max_sessions": 128,
     "error_recovery_level": 0,
     "auth_file": "/usr/local/etc/spdk/auth.conf",
-    "min_connections_per_core": 4,
     "disable_chap": true,
     "default_time2wait": 2,
     "require_chap": false
@@ -2526,6 +2681,7 @@ Example request:
 ~~~
 
 Example response:
+
 ~~~
 {
   "jsonrpc": "2.0",
@@ -3456,10 +3612,16 @@ io_unit_size                | Optional | number  | I/O unit size (bytes)
 max_aq_depth                | Optional | number  | Max number of admin cmds per AQ
 num_shared_buffers          | Optional | number  | The number of pooled data buffers available to the transport
 buf_cache_size              | Optional | number  | The number of shared buffers to reserve for each poll group
+max_srq_depth               | Optional | number  | The number of elements in a per-thread shared receive queue (RDMA only)
+no_srq                      | Optional | boolean | Disable shared receive queue even for devices that support it. (RDMA only)
+c2h_success                 | Optional | boolean | Disable C2H success optimization (TCP only)
+dif_insert_or_strip         | Optional | boolean | Enable DIF insert for write I/O and DIF strip for read I/O DIF (TCP only)
+sock_priority               | Optional | number  | The socket priority of the connection owned by this transport (TCP only)
 
 ### Example:
 
 Example request:
+
 ~~~
 {
   "jsonrpc": "2.0",
@@ -3473,6 +3635,7 @@ Example request:
 ~~~
 
 Example response:
+
 ~~~
 {
   "jsonrpc": "2.0",
@@ -3490,6 +3653,7 @@ This method has no parameters.
 ### Example
 
 Example request:
+
 ~~~
 {
   "jsonrpc": "2.0",
@@ -3499,6 +3663,7 @@ Example request:
 ~~~
 
 Example response:
+
 ~~~
 {
   "jsonrpc": "2.0",
@@ -3527,6 +3692,7 @@ Example response:
       ],
       "allow_any_host": false,
       "serial_number": "abcdef",
+      "model_number": "ghijklmnop",
       "namespaces": [
         {"nsid": 1, "name": "Malloc2"},
         {"nsid": 2, "name": "Nvme0n1"}
@@ -3546,6 +3712,7 @@ Name                    | Optional | Type        | Description
 ----------------------- | -------- | ----------- | -----------
 nqn                     | Required | string      | Subsystem NQN
 serial_number           | Optional | string      | Serial number of virtual controller
+model_number            | Optional | string      | Model number of virtual controller
 max_namespaces          | Optional | number      | Maximum number of namespaces that can be attached to the subsystem. Default: 0 (Unlimited)
 allow_any_host          | Optional | boolean     | Allow any host (`true`) or enforce allowed host whitelist (`false`). Default: `false`.
 
@@ -3562,6 +3729,7 @@ Example request:
     "nqn": "nqn.2016-06.io.spdk:cnode1",
     "allow_any_host": false,
     "serial_number": "abcdef",
+    "model_number": "ghijklmnop"
   }
 }
 ~~~
@@ -3682,6 +3850,7 @@ bdev_name               | Required | string      | Name of bdev to expose as a n
 nguid                   | Optional | string      | 16-byte namespace globally unique identifier in hexadecimal (e.g. "ABCDEF0123456789ABCDEF0123456789")
 eui64                   | Optional | string      | 8-byte namespace EUI-64 in hexadecimal (e.g. "ABCDEF0123456789")
 uuid                    | Optional | string      | RFC 4122 UUID (e.g. "ceccf520-691e-4b46-9546-34af789907c5")
+ptpl_file               | Optional | string      | File path to save/restore persistent reservation information
 
 ### Example
 
@@ -3696,7 +3865,8 @@ Example request:
     "nqn": "nqn.2016-06.io.spdk:cnode1",
     "namespace": {
       "nsid": 3,
-      "bdev_name": "Nvme0n1"
+      "bdev_name": "Nvme0n1",
+      "ptpl_file": "/opt/Nvme0n1PR.json"
     }
   }
 }
@@ -3874,6 +4044,7 @@ max_subsystems          | Required | number      | Maximum number of NVMe-oF sub
 ### Example
 
 Example request:
+
 ~~~
 {
   "jsonrpc": "2.0",
@@ -3886,6 +4057,7 @@ Example request:
 ~~~
 
 Example response:
+
 ~~~
 {
   "jsonrpc": "2.0",
@@ -3908,6 +4080,7 @@ acceptor_poll_rate      | Optional | number      | Polling interval of the accep
 ### Example
 
 Example request:
+
 ~~~
 {
   "jsonrpc": "2.0",
@@ -3920,6 +4093,7 @@ Example request:
 ~~~
 
 Example response:
+
 ~~~
 {
   "jsonrpc": "2.0",
@@ -3937,6 +4111,7 @@ This method has no parameters.
 ### Example
 
 Example request:
+
 ~~~
 {
   "jsonrpc": "2.0",
@@ -3946,6 +4121,7 @@ Example request:
 ~~~
 
 Example response:
+
 ~~~
 {
   "jsonrpc": "2.0",
@@ -3960,6 +4136,47 @@ Example response:
       "io_unit_size": 131072
     }
   ]
+}
+~~~
+
+## nvmf_get_stats method {#rpc_nvmf_get_stats}
+
+Retrieve current statistics of the NVMf subsystem.
+
+### Parameters
+
+This method has no parameters.
+
+### Response
+
+The response is an object containing NVMf subsystem statistics.
+
+### Example
+
+Example request:
+~~~
+{
+  "jsonrpc": "2.0",
+  "method": "nvmf_get_stats",
+  "id": 1
+}
+~~~
+
+Example response:
+~~~
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "poll_groups": [
+      {
+        "name": "app_thread",
+        "admin_qpairs": 1,
+        "io_qpairs": 4,
+        "pending_bdev_io": 1721
+      }
+    ]
+  }
 }
 ~~~
 
@@ -4479,6 +4696,7 @@ UUID of the created logical volume store is returned.
 ### Example
 
 Example request:
+
 ~~~
 {
   "jsonrpc": "2.0",
@@ -4493,6 +4711,7 @@ Example request:
 ~~~
 
 Example response:
+
 ~~~
 {
   "jsonrpc": "2.0",
@@ -4517,6 +4736,7 @@ Either uuid or lvs_name must be specified, but not both.
 ### Example
 
 Example request:
+
 ~~~
 {
   "jsonrpc": "2.0",
@@ -4529,6 +4749,7 @@ Example request:
 ~~~
 
 Example response:
+
 ~~~
 {
   "jsonrpc": "2.0",
@@ -4554,6 +4775,7 @@ If both uuid and lvs_name are omitted, information about all logical volume stor
 ### Example
 
 Example request:
+
 ~~~
 {
   "jsonrpc": "2.0",
@@ -4566,6 +4788,7 @@ Example request:
 ~~~
 
 Example response:
+
 ~~~
 {
   "jsonrpc": "2.0",
@@ -4598,6 +4821,7 @@ new_name                | Required | string      | New logical volume store name
 ### Example
 
 Example request:
+
 ~~~
 {
   "jsonrpc": "2.0",
@@ -4611,6 +4835,7 @@ Example request:
 ~~~
 
 Example response:
+
 ~~~
 {
   "jsonrpc": "2.0",
@@ -4644,6 +4869,7 @@ UUID of the created logical volume is returned.
 ### Example
 
 Example request:
+
 ~~~
 {
   "jsonrpc": "2.0",
@@ -4660,6 +4886,7 @@ Example request:
 ~~~
 
 Example response:
+
 ~~~
 {
   "jsonrpc": "2.0",
@@ -4686,6 +4913,7 @@ UUID of the created logical volume snapshot is returned.
 ### Example
 
 Example request:
+
 ~~~
 {
   "jsonrpc": "2.0",
@@ -4699,6 +4927,7 @@ Example request:
 ~~~
 
 Example response:
+
 ~~~
 {
   "jsonrpc": "2.0",
@@ -4725,6 +4954,7 @@ UUID of the created logical volume clone is returned.
 ### Example
 
 Example request:
+
 ~~~
 {
   "jsonrpc": "2.0"
@@ -4738,6 +4968,7 @@ Example request:
 ~~~
 
 Example response:
+
 ~~~
 {
   "jsonrpc": "2.0",
@@ -4760,6 +4991,7 @@ new_name                | Required | string      | New logical volume name
 ### Example
 
 Example request:
+
 ~~~
 {
   "jsonrpc": "2.0",
@@ -4773,6 +5005,7 @@ Example request:
 ~~~
 
 Example response:
+
 ~~~
 {
   "jsonrpc": "2.0",
@@ -4795,6 +5028,7 @@ size                    | Required | number      | Desired size of the logical v
 ### Example
 
 Example request:
+
 ~~~
 {
   "jsonrpc": "2.0",
@@ -4808,6 +5042,7 @@ Example request:
 ~~~
 
 Example response:
+
 ~~~
 {
   "jsonrpc": "2.0",
@@ -4829,6 +5064,7 @@ name                    | Required | string      | UUID or alias of the logical 
 ### Example
 
 Example request:
+
 ~~~
 {
   "jsonrpc": "2.0",
@@ -4841,6 +5077,7 @@ Example request:
 ~~~
 
 Example response:
+
 ~~~
 {
   "jsonrpc": "2.0",
@@ -4862,6 +5099,7 @@ name                    | Required | string      | UUID or alias of the logical 
 ### Example
 
 Example request:
+
 ~~~
 {
   "jsonrpc": "2.0",
@@ -4874,6 +5112,7 @@ Example request:
 ~~~
 
 Example response:
+
 ~~~
 {
   "jsonrpc": "2.0",
@@ -4895,6 +5134,7 @@ name                    | Required | string      | UUID or alias of the logical 
 ### Example
 
 Example request:
+
 ~~~
 {
   "jsonrpc": "2.0",
@@ -4907,6 +5147,7 @@ Example request:
 ~~~
 
 Example response:
+
 ~~~
 {
   "jsonrpc": "2.0",
@@ -4928,6 +5169,7 @@ name                    | Required | string      | UUID or alias of the logical 
 ### Example
 
 Example request:
+
 ~~~
 {
   "jsonrpc": "2.0",
@@ -4940,6 +5182,7 @@ Example request:
 ~~~
 
 Example response:
+
 ~~~
 {
   "jsonrpc": "2.0",
@@ -4947,6 +5190,361 @@ Example response:
   "result": true
 }
 ~~~
+
+# RAID
+
+## get_raid_bdevs {#rpc_get_raid_bdevs}
+
+This is used to list all the raid bdev names based on the input category requested. Category should be one
+of 'all', 'online', 'configuring' or 'offline'. 'all' means all the raid bdevs whether they are online or
+configuring or offline. 'online' is the raid bdev which is registered with bdev layer. 'configuring' is
+the raid bdev which does not have full configuration discovered yet. 'offline' is the raid bdev which is
+not registered with bdev as of now and it has encountered any error or user has requested to offline
+the raid bdev.
+
+### Parameters
+
+Name                    | Optional | Type        | Description
+----------------------- | -------- | ----------- | -----------
+category                | Required | string      | all or online or configuring or offline
+
+### Example
+
+Example request:
+
+~~~
+{
+  "jsonrpc": "2.0",
+  "method": "get_raid_bdevs",
+  "id": 1,
+  "params": {
+    "category": "all"
+  }
+}
+~~~
+
+Example response:
+
+~~~
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": [
+    "Raid0"
+  ]
+}
+~~~
+
+## construct_raid_bdev {#rpc_construct_raid_bdev}
+
+Constructs new RAID bdev.
+
+### Parameters
+
+Name                    | Optional | Type        | Description
+----------------------- | -------- | ----------- | -----------
+name                    | Required | string      | RAID bdev name
+strip_size_kb           | Required | number      | Strip size in KB
+raid_level              | Required | number      | RAID level
+base_bdevs              | Required | string      | Base bdevs name, whitespace separated list in quotes
+
+
+### Example
+
+Example request:
+
+~~~
+{
+  "jsonrpc": "2.0",
+  "method": "construct_raid_bdev",
+  "id": 1,
+  "params": {
+    "name": "Raid0",
+    "raid_level": 0,
+    "base_bdevs": [
+      "Malloc0",
+      "Malloc1",
+      "Malloc2",
+      "Malloc3"
+    ],
+    "strip_size": 4096
+  }
+}
+~~~
+
+Example response:
+
+~~~
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": true
+}
+~~~
+
+## destroy_raid_bdev {#rpc_destroy_raid_bdev}
+
+Removes RAID bdev.
+
+### Parameters
+
+Name                    | Optional | Type        | Description
+----------------------- | -------- | ----------- | -----------
+name                    | Required | string      | RAID bdev name
+
+### Example
+
+Example request:
+
+~~~
+{
+  "jsonrpc": "2.0",
+  "method": "destroy_raid_bdev",
+  "id": 1,
+  "params": {
+    "name": "Raid0"
+  }
+}
+~~~
+
+Example response:
+
+~~~
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": true
+}
+~~~
+
+# Notifications
+
+## get_notification_types {#rpc_get_notification_types}
+
+Return list of all supported notification types.
+
+### Parameters
+
+None
+
+### Response
+
+The response is an array of strings - supported RPC notification types.
+
+### Example
+
+Example request:
+
+~~~
+{
+  "jsonrpc": "2.0",
+  "method": "get_notification_types",
+  "id": 1
+}
+~~~
+
+Example response:
+
+~~~
+{
+  "id": 1,
+  "result": [
+    "bdev_register",
+    "bdev_unregister"
+  ],
+  "jsonrpc": "2.0"
+}
+~~~
+
+## get_notifications {#get_notifications}
+
+Request notifications. Returns array of notifications that happend since the specified id (or first that is available).
+
+Notice: Notifications are kept in circular buffer with limited size. Older notifications might be inaccesible due to being overwritten by new ones.
+
+### Parameters
+
+Name                    | Optional | Type        | Description
+----------------------- | -------- | ----------- | -----------
+id                      | Optional | number      | First Event ID to fetch (default: first available).
+max                     | Optional | number      | Maximum number of event to return (default: no limit).
+
+### Response
+
+Response is an array of event objects.
+
+Name                    | Optional | Type        | Description
+----------------------- | -------- | ----------- | -----------
+id                      | Optional | number      | Event ID.
+type                    | Optional | number      | Type of the event.
+ctx                     | Optional | string      | Event context.
+
+### Example
+
+Example request:
+
+~~~
+{
+  "id": 1,
+  "jsonrpc": "2.0",
+  "method": "get_notifications",
+  "params": {
+    "id": 1,
+    "max": 10
+  }
+}
+
+~~~
+
+Example response:
+
+~~~
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": [
+    {
+      "ctx": "Malloc0",
+      "type": "bdev_register",
+      "id": 1
+    },
+    {
+      "ctx": "Malloc2",
+      "type": "bdev_register",
+      "id": 2
+    }
+  ]
+}
+~~~
+
+# Linux Network Block Device (NBD) {#jsonrpc_components_nbd}
+
+SPDK supports exporting bdevs through Linux nbd. These devices then appear as standard Linux kernel block devices and can be accessed using standard utilities like fdisk.
+
+In order to export a device over nbd, first make sure the Linux kernel nbd driver is loaded by running 'modprobe nbd'.
+
+## start_nbd_disk {#rpc_start_nbd_disk}
+
+Start to export one SPDK bdev as NBD disk
+
+### Parameters
+
+Name                    | Optional | Type        | Description
+----------------------- | -------- | ----------- | -----------
+bdev_name               | Required | string      | Bdev name to export
+nbd_device              | Optional | string      | NBD device name to assign
+
+### Response
+
+Path of exported NBD disk
+
+### Example
+
+Example request:
+
+~~~
+{
+ "params": {
+    "nbd_device": "/dev/nbd1",
+    "bdev_name": "Malloc1"
+  },
+  "jsonrpc": "2.0",
+  "method": "start_nbd_disk",
+  "id": 1
+}
+~~~
+
+Example response:
+
+~~~
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": "/dev/nbd1"
+}
+~~~
+
+## stop_nbd_disk {#rpc_stop_nbd_disk}
+
+Stop one NBD disk which is based on SPDK bdev.
+
+### Parameters
+
+Name                    | Optional | Type        | Description
+----------------------- | -------- | ----------- | -----------
+nbd_device              | Required | string      | NBD device name to stop
+
+### Example
+
+Example request:
+
+~~~
+{
+ "params": {
+    "nbd_device": "/dev/nbd1",
+  },
+  "jsonrpc": "2.0",
+  "method": "stop_nbd_disk",
+  "id": 1
+}
+~~~
+
+Example response:
+
+~~~
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": "true"
+}
+~~~
+
+## get_nbd_disks {#rpc_get_nbd_disks}
+
+Display all or specified NBD device list
+
+### Parameters
+
+Name                    | Optional | Type        | Description
+----------------------- | -------- | ----------- | -----------
+nbd_device              | Optional | string      | NBD device name to display
+
+### Response
+
+The response is an array of exported NBD devices and their corresponding SPDK bdev.
+
+### Example
+
+Example request:
+
+~~~
+{
+  "jsonrpc": "2.0",
+  "method": "get_nbd_disks",
+  "id": 1
+}
+~~~
+
+Example response:
+
+~~~
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result":  [
+    {
+      "bdev_name": "Malloc0",
+      "nbd_device": "/dev/nbd0"
+    },
+    {
+      "bdev_name": "Malloc1",
+      "nbd_device": "/dev/nbd1"
+    }
+  ]
+}
+~~~
+
+# Miscellaneous RPC commands
 
 ## send_nvme_cmd {#rpc_send_nvme_cmd}
 
@@ -4979,6 +5577,7 @@ metadata                | string      | Metadata transferred from controller to 
 ### Example
 
 Example request:
+
 ~~~
 {
   "jsonrpc": "2.0",
@@ -4995,6 +5594,7 @@ Example request:
 ~~~
 
 Example response:
+
 ~~~
 {
   "jsonrpc": "2.0",
@@ -5006,3 +5606,43 @@ Example response:
 
 }
 ~~~
+
+## get_spdk_version {#rpc_get_spdk_version}
+
+Get the version info of the running SPDK application.
+
+### Parameters
+
+This method has no parameters.
+
+### Response
+
+The response is the version number including major version number, minor version number, patch level number and suffix string.
+
+### Example
+
+Example request:
+~~
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "get_spdk_version"
+}
+~~
+
+Example response:
+~~
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result":  {
+    "version": "19.04-pre",
+    "fields" : {
+      "major": 19,
+      "minor": 4,
+      "patch": 0,
+      "suffix": "-pre"
+    }
+  }
+}
+~~

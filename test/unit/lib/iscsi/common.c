@@ -1,7 +1,6 @@
 #include "iscsi/task.h"
 #include "iscsi/iscsi.h"
 #include "iscsi/conn.h"
-#include "iscsi/acceptor.h"
 
 #include "spdk/env.h"
 #include "spdk/event.h"
@@ -98,26 +97,6 @@ spdk_scsi_dev_get_name(const struct spdk_scsi_dev *dev)
 	return NULL;
 }
 
-DEFINE_STUB_V(spdk_iscsi_acceptor_start, (struct spdk_iscsi_portal *p));
-
-DEFINE_STUB_V(spdk_iscsi_acceptor_stop, (struct spdk_iscsi_portal *p));
-
-struct spdk_sock *
-spdk_sock_listen(const char *ip, int port)
-{
-	static int g_sock;
-
-	return (struct spdk_sock *)&g_sock;
-}
-
-int
-spdk_sock_close(struct spdk_sock **sock)
-{
-	*sock = NULL;
-
-	return 0;
-}
-
 static struct spdk_cpuset *g_app_core_mask;
 
 struct spdk_cpuset *
@@ -149,8 +128,6 @@ spdk_app_parse_core_mask(const char *mask, struct spdk_cpuset *cpumask)
 	return 0;
 }
 
-DEFINE_STUB(spdk_env_get_current_core, uint32_t, (void), 0);
-
 DEFINE_STUB(spdk_event_allocate, struct spdk_event *,
 	    (uint32_t core, spdk_event_fn fn, void *arg1, void *arg2), NULL);
 
@@ -161,7 +138,8 @@ DEFINE_STUB(spdk_scsi_dev_construct, struct spdk_scsi_dev *,
 	     void *hotremove_ctx),
 	    NULL);
 
-DEFINE_STUB_V(spdk_scsi_dev_destruct, (struct spdk_scsi_dev *dev));
+DEFINE_STUB_V(spdk_scsi_dev_destruct,
+	      (struct spdk_scsi_dev *dev, spdk_scsi_dev_destruct_cb_t cb_fn, void *cb_arg));
 
 DEFINE_STUB(spdk_scsi_dev_add_port, int,
 	    (struct spdk_scsi_dev *dev, uint64_t id, const char *name), 0);
@@ -174,6 +152,10 @@ DEFINE_STUB(spdk_scsi_dev_delete_port, int,
 	    (struct spdk_scsi_dev *dev, uint64_t id), 0);
 
 DEFINE_STUB_V(spdk_shutdown_iscsi_conns, (void));
+
+DEFINE_STUB_V(spdk_iscsi_conns_start_exit, (struct spdk_iscsi_tgt_node *target));
+
+DEFINE_STUB(spdk_iscsi_get_active_conns, int, (struct spdk_iscsi_tgt_node *target), 0);
 
 void
 spdk_iscsi_task_cpl(struct spdk_scsi_task *scsi_task)

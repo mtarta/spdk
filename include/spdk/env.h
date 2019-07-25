@@ -96,10 +96,9 @@ struct spdk_env_opts {
  * with the given size, alignment and socket id.
  *
  * \param size Size in bytes.
- * \param align Alignment value for the allocated memory. If '0', the allocated
- * buffer is suitably aligned (in the same manner as malloc()). Otherwise, the
- * allocated buffer is aligned to the multiple of align. In this case, it must
- * be a power of two.
+ * \param align If non-zero, the allocated buffer is aligned to a multiple of
+ * align. In this case, it must be a power of two. The returned buffer is always
+ * aligned to at least cache line size.
  * \param phys_addr **Deprecated**. Please use spdk_vtophys() for retrieving physical
  * addresses. A pointer to the variable to hold the physical address of
  * the allocated buffer is passed. If NULL, the physical address is not returned.
@@ -117,10 +116,9 @@ void *spdk_malloc(size_t size, size_t align, uint64_t *phys_addr, int socket_id,
  * with the given size, alignment and socket id. Also, the buffer will be zeroed.
  *
  * \param size Size in bytes.
- * \param align Alignment value for the allocated memory. If '0', the allocated
- * buffer is suitably aligned (in the same manner as malloc()). Otherwise, the
- * allocated buffer is aligned to the multiple of align. In this case, it must
- * be a power of two.
+ * \param align If non-zero, the allocated buffer is aligned to a multiple of
+ * align. In this case, it must be a power of two. The returned buffer is always
+ * aligned to at least cache line size.
  * \param phys_addr **Deprecated**. Please use spdk_vtophys() for retrieving physical
  * addresses. A pointer to the variable to hold the physical address of
  * the allocated buffer is passed. If NULL, the physical address is not returned.
@@ -138,10 +136,9 @@ void *spdk_zmalloc(size_t size, size_t align, uint64_t *phys_addr, int socket_id
  *
  * \param buf Buffer to resize.
  * \param size Size in bytes.
- * \param align Alignment value for the allocated memory. If '0', the allocated
- * buffer is suitably aligned (in the same manner as malloc()). Otherwise, the
- * allocated buffer is aligned to the multiple of align. In this case, it must
- * be a power of two.
+ * \param align If non-zero, the allocated buffer is aligned to a multiple of
+ * align. In this case, it must be a power of two. The returned buffer is always
+ * aligned to at least cache line size.
  *
  * \return a pointer to the resized memory buffer.
  */
@@ -182,10 +179,9 @@ void spdk_env_fini(void);
  * Allocate a pinned memory buffer with the given size and alignment.
  *
  * \param size Size in bytes.
- * \param align Alignment value for the allocated memory. If '0', the allocated
- * buffer is suitably aligned (in the same manner as malloc()). Otherwise, the
- * allocated buffer is aligned to the multiple of align. In this case, it must
- * be a power of two.
+ * \param align If non-zero, the allocated buffer is aligned to a multiple of
+ * align. In this case, it must be a power of two. The returned buffer is always
+ * aligned to at least cache line size.
  * \param phys_addr A pointer to the variable to hold the physical address of
  * the allocated buffer is passed. If NULL, the physical address is not returned.
  *
@@ -197,10 +193,9 @@ void *spdk_dma_malloc(size_t size, size_t align, uint64_t *phys_addr);
  * Allocate a pinned, memory buffer with the given size, alignment and socket id.
  *
  * \param size Size in bytes.
- * \param align Alignment value for the allocated memory. If '0', the allocated
- * buffer is suitably aligned (in the same manner as malloc()). Otherwise, the
- * allocated buffer is aligned to the multiple of align. In this case, it must
- * be a power of two.
+ * \param align If non-zero, the allocated buffer is aligned to a multiple of
+ * align. In this case, it must be a power of two. The returned buffer is always
+ * aligned to at least cache line size.
  * \param phys_addr A pointer to the variable to hold the physical address of
  * the allocated buffer is passed. If NULL, the physical address is not returned.
  * \param socket_id Socket ID to allocate memory on, or SPDK_ENV_SOCKET_ID_ANY
@@ -215,10 +210,9 @@ void *spdk_dma_malloc_socket(size_t size, size_t align, uint64_t *phys_addr, int
  * will be zeroed.
  *
  * \param size Size in bytes.
- * \param align Alignment value for the allocated memory. If '0', the allocated
- * buffer is suitably aligned (in the same manner as malloc()). Otherwise, the
- * allocated buffer is aligned to the multiple of align. In this case, it must
- * be a power of two.
+ * \param align If non-zero, the allocated buffer is aligned to a multiple of
+ * align. In this case, it must be a power of two. The returned buffer is always
+ * aligned to at least cache line size.
  * \param phys_addr A pointer to the variable to hold the physical address of
  * the allocated buffer is passed. If NULL, the physical address is not returned.
  *
@@ -231,10 +225,9 @@ void *spdk_dma_zmalloc(size_t size, size_t align, uint64_t *phys_addr);
  * The buffer will be zeroed.
  *
  * \param size Size in bytes.
- * \param align Alignment value for the allocated memory. If '0', the allocated
- * buffer is suitably aligned (in the same manner as malloc()). Otherwise, the
- * allocated buffer is aligned to the multiple of align. In this case, it must
- * be a power of two.
+ * \param align If non-zero, the allocated buffer is aligned to a multiple of
+ * align. In this case, it must be a power of two. The returned buffer is always
+ * aligned to at least cache line size.
  * \param phys_addr A pointer to the variable to hold the physical address of
  * the allocated buffer is passed. If NULL, the physical address is not returned.
  * \param socket_id Socket ID to allocate memory on, or SPDK_ENV_SOCKET_ID_ANY
@@ -250,10 +243,9 @@ void *spdk_dma_zmalloc_socket(size_t size, size_t align, uint64_t *phys_addr, in
  *
  * \param buf Buffer to resize.
  * \param size Size in bytes.
- * \param align Alignment value for the allocated memory. If '0', the allocated
- * buffer is suitably aligned (in the same manner as malloc()). Otherwise, the
- * allocated buffer is aligned to the multiple of align. In this case, it must
- * be a power of two.
+ * \param align If non-zero, the allocated buffer is aligned to a multiple of
+ * align. In this case, it must be a power of two. The returned buffer is always
+ * aligned to at least cache line size.
  * \param phys_addr A pointer to the variable to hold the physical address of
  * the allocated buffer is passed. If NULL, the physical address is not returned.
  *
@@ -433,6 +425,27 @@ void spdk_mempool_put_bulk(struct spdk_mempool *mp, void **ele_arr, size_t count
 size_t spdk_mempool_count(const struct spdk_mempool *pool);
 
 /**
+ * Iterate through all elements of the pool and call a function on each one.
+ *
+ * \param mp Memory pool to iterate on.
+ * \param obj_cb Function to call on each element.
+ * \param obj_cb_arg Opaque pointer passed to the callback function.
+ *
+ * \return Number of elements iterated.
+ */
+uint32_t spdk_mempool_obj_iter(struct spdk_mempool *mp, spdk_mempool_obj_cb_t obj_cb,
+			       void *obj_cb_arg);
+
+/**
+ * Lookup the memory pool identified by the given name.
+ *
+ * \param name Name of the memory pool.
+ *
+ * \return a pointer to the memory pool on success, or NULL on failure.
+ */
+struct spdk_mempool *spdk_mempool_lookup(const char *name);
+
+/**
  * Get the number of dedicated CPU cores utilized by this env abstraction.
  *
  * \return the number of dedicated CPU cores.
@@ -584,10 +597,12 @@ size_t spdk_ring_count(struct spdk_ring *ring);
  * \param ring A pointer to the ring.
  * \param objs A pointer to the array to be queued.
  * \param count Length count of the array of objects.
+ * \param free_space If non-NULL, amount of free space after the enqueue has finished.
  *
  * \return the number of objects enqueued.
  */
-size_t spdk_ring_enqueue(struct spdk_ring *ring, void **objs, size_t count);
+size_t spdk_ring_enqueue(struct spdk_ring *ring, void **objs, size_t count,
+			 size_t *free_space);
 
 /**
  * Dequeue count objects from the ring into the array objs.
@@ -637,6 +652,7 @@ struct spdk_pci_id {
 };
 
 struct spdk_pci_device {
+	struct spdk_pci_device		*parent;
 	void				*dev_handle;
 	struct spdk_pci_addr		addr;
 	struct spdk_pci_id		id;
@@ -655,6 +671,13 @@ struct spdk_pci_device {
 	struct _spdk_pci_device_internal {
 		struct spdk_pci_driver		*driver;
 		bool				attached;
+		bool				pending_removal;
+		/* The device was successfully removed on a DPDK interrupt thread,
+		 * but to prevent data races we couldn't remove it from the global
+		 * device list right away. It'll be removed as soon as possible
+		 * on a regular thread when any public pci function is called.
+		 */
+		bool				removed;
 		TAILQ_ENTRY(spdk_pci_device)	tailq;
 	} internal;
 };
@@ -667,6 +690,13 @@ typedef int (*spdk_pci_enum_cb)(void *enum_ctx, struct spdk_pci_device *pci_dev)
  * \return PCI driver.
  */
 struct spdk_pci_driver *spdk_pci_nvme_get_driver(void);
+
+/**
+ * Get the VMD PCI driver object.
+ *
+ * \return PCI driver.
+ */
+struct spdk_pci_driver *spdk_pci_vmd_get_driver(void);
 
 /**
  * Get the I/OAT PCI driver object.
@@ -701,6 +731,25 @@ struct spdk_pci_driver *spdk_pci_virtio_get_driver(void);
  *         0 otherwise
  */
 int spdk_pci_enumerate(struct spdk_pci_driver *driver, spdk_pci_enum_cb enum_cb, void *enum_ctx);
+
+/**
+ * Begin iterating over enumerated PCI device by calling this function to get
+ * the first PCI device. If there no PCI devices enumerated, return NULL
+ *
+ * \return a pointer to a PCI device on success, NULL otherwise.
+ */
+struct spdk_pci_device *spdk_pci_get_first_device(void);
+
+/**
+ * Continue iterating over enumerated PCI devices.
+ * If no additional PCI devices, return NULL
+ *
+ * \param prev Previous PCI device returned from \ref spdk_pci_get_first_device
+ * or \ref spdk_pci_get_next_device
+ *
+ * \return a pointer to the next PCI device on success, NULL otherwise.
+ */
+struct spdk_pci_device *spdk_pci_get_next_device(struct spdk_pci_device *prev);
 
 /**
  * Map a PCI BAR in the current process.
@@ -978,6 +1027,19 @@ int spdk_pci_device_cfg_read32(struct spdk_pci_device *dev, uint32_t *value, uin
  * \return 0 on success, -1 on failure.
  */
 int spdk_pci_device_cfg_write32(struct spdk_pci_device *dev, uint32_t value, uint32_t offset);
+
+/**
+ * Check if device was requested to be removed from the process. This can be
+ * caused either by physical device hotremoval or OS-triggered removal. In the
+ * latter case, the device may continue to function properly even if this
+ * function returns \c true . The upper-layer driver may check this function
+ * periodically and eventually detach the device.
+ *
+ * \param dev PCI device.
+ *
+ * \return if device was requested to be removed
+ */
+bool spdk_pci_device_is_removed(struct spdk_pci_device *dev);
 
 /**
  * Compare two PCI addresses.
