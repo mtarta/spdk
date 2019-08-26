@@ -31,16 +31,37 @@
  *   OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-#ifndef SPDK_BDEV_AIO_RPC_H
-#define SPDK_BDEV_AIO_RPC_H
+/** \file
+ * AIO Block Device Interface
+ *
+ * For information on why this exists, see json rpc.
+ */
+
+#ifndef SPDK_BDEV_AIO_H
+#define SPDK_BDEV_AIO_H
+
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 #include "spdk/stdinc.h"
+
 #include "spdk/bdev.h"
+#include "spdk/json.h"
+#include "spdk/thread.h"
 
-typedef void (*delete_aio_bdev_complete)(void *cb_arg, int bdeverrno);
+int spdk_bdev_aio_destruct(void *ctx);
+void spdk_bdev_aio_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io);
+bool spdk_bdev_aio_io_type_supported(void *ctx, enum spdk_bdev_io_type io_type);
+struct spdk_io_channel *spdk_bdev_aio_get_io_channel(void *ctx);
+int spdk_bdev_aio_dump_info_json(void *ctx, struct spdk_json_write_ctx *w);
+void spdk_bdev_aio_write_json_config(struct spdk_bdev *bdev, struct spdk_json_write_ctx *w);
 
-int create_aio_bdev(const char *name, const char *filename, uint32_t block_size);
+int spdk_bdev_aio_create_cb(void *io_device, void *ctx_buf);
+void spdk_bdev_aio_destroy_cb(void *io_device, void *ctx_buf);
 
-void delete_aio_bdev(struct spdk_bdev *bdev, delete_aio_bdev_complete cb_fn, void *cb_arg);
+#ifdef __cplusplus
+}
+#endif
 
-#endif /* SPDK_BDEV_AIO_RPC_H */
+#endif /* SPDK_BDEV_AIO_H */
