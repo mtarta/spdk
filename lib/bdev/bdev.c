@@ -129,6 +129,8 @@ static struct spdk_bdev_mgr g_bdev_mgr = {
 static struct spdk_bdev_opts	g_bdev_opts = {
 	.bdev_io_pool_size = SPDK_BDEV_IO_POOL_SIZE,
 	.bdev_io_cache_size = SPDK_BDEV_IO_CACHE_SIZE,
+	.bdev_buf_small_pool_size = BUF_SMALL_POOL_SIZE,
+	.bdev_buf_large_pool_size = BUF_LARGE_POOL_SIZE
 };
 
 static spdk_bdev_init_cb	g_init_cb_fn = NULL;
@@ -984,6 +986,7 @@ spdk_bdev_initialize(spdk_bdev_init_cb cb_fn, void *cb_arg)
 	struct spdk_conf_section *sp;
 	struct spdk_bdev_opts bdev_opts;
 	int32_t bdev_io_pool_size, bdev_io_cache_size;
+	int32_t bdev_buf_small_pool_size, bdev_buf_large_pool_size;
 	int cache_size;
 	int rc = 0;
 	char mempool_name[32];
@@ -1002,6 +1005,16 @@ spdk_bdev_initialize(spdk_bdev_init_cb cb_fn, void *cb_arg)
 		bdev_io_cache_size = spdk_conf_section_get_intval(sp, "BdevIoCacheSize");
 		if (bdev_io_cache_size >= 0) {
 			bdev_opts.bdev_io_cache_size = bdev_io_cache_size;
+		}
+
+		bdev_buf_small_pool_size = spdk_conf_section_get_intval(sp, "BdevBufSmallPoolSize");
+		if (bdev_buf_small_pool_size >= 0) {
+			bdev_opts.bdev_buf_small_pool_size = bdev_buf_small_pool_size;
+		}
+
+		bdev_buf_large_pool_size = spdk_conf_section_get_intval(sp, "BdevBufLargePoolSize");
+		if (bdev_buf_large_pool_size >= 0) {
+			bdev_opts.bdev_buf_large_pool_size = bdev_buf_large_pool_size;
 		}
 
 		if (spdk_bdev_set_opts(&bdev_opts)) {
@@ -1033,16 +1046,18 @@ spdk_bdev_initialize(spdk_bdev_init_cb cb_fn, void *cb_arg)
 		return;
 	}
 
+	SPDK_NOTICELOG("I/O pool size: %d\n", g_bdev_opts.bdev_io_pool_size);
+
 	/**
 	 * Ensure no more than half of the total buffers end up local caches, by
 	 *   using spdk_thread_get_count() to determine how many local caches we need
 	 *   to account for.
 	 */
-	cache_size = BUF_SMALL_POOL_SIZE / (2 * spdk_thread_get_count());
+	cache_size = bdev_opts.bdev_buf_small_pool_size / (2 * spdk_thread_get_count());
 	snprintf(mempool_name, sizeof(mempool_name), "buf_small_pool_%d", getpid());
 
 	g_bdev_mgr.buf_small_pool = spdk_mempool_create(mempool_name,
-				    BUF_SMALL_POOL_SIZE,
+				    bdev_opts.bdev_buf_small_pool_size,
 				    SPDK_BDEV_BUF_SIZE_WITH_MD(SPDK_BDEV_SMALL_BUF_MAX_SIZE) +
 				    SPDK_BDEV_POOL_ALIGNMENT,
 				    cache_size,
@@ -1053,11 +1068,13 @@ spdk_bdev_initialize(spdk_bdev_init_cb cb_fn, void *cb_arg)
 		return;
 	}
 
-	cache_size = BUF_LARGE_POOL_SIZE / (2 * spdk_thread_get_count());
+	SPDK_NOTICELOG("Small buffer pool size: %d\n", g_bdev_opts.bdev_buf_small_pool_size);
+
+	cache_size = bdev_opts.bdev_buf_large_pool_size / (2 * spdk_thread_get_count());
 	snprintf(mempool_name, sizeof(mempool_name), "buf_large_pool_%d", getpid());
 
 	g_bdev_mgr.buf_large_pool = spdk_mempool_create(mempool_name,
-				    BUF_LARGE_POOL_SIZE,
+				    bdev_opts.bdev_buf_large_pool_size,
 				    SPDK_BDEV_BUF_SIZE_WITH_MD(SPDK_BDEV_LARGE_BUF_MAX_SIZE) +
 				    SPDK_BDEV_POOL_ALIGNMENT,
 				    cache_size,
@@ -1067,6 +1084,8 @@ spdk_bdev_initialize(spdk_bdev_init_cb cb_fn, void *cb_arg)
 		spdk_bdev_init_complete(-1);
 		return;
 	}
+
+	SPDK_NOTICELOG("Large buffer pool size: %d\n", g_bdev_opts.bdev_buf_large_pool_size);
 
 	g_bdev_mgr.zero_buffer = spdk_zmalloc(ZERO_BUFFER_SIZE, ZERO_BUFFER_SIZE,
 					      NULL, SPDK_ENV_LCORE_ID_ANY, SPDK_MALLOC_DMA);
@@ -1106,17 +1125,17 @@ spdk_bdev_mgr_unregister_cb(void *io_device)
 			    g_bdev_opts.bdev_io_pool_size);
 	}
 
-	if (spdk_mempool_count(g_bdev_mgr.buf_small_pool) != BUF_SMALL_POOL_SIZE) {
+	if (spdk_mempool_count(g_bdev_mgr.buf_small_pool) != g_bdev_opts.bdev_buf_small_pool_size) {
 		SPDK_ERRLOG("Small buffer pool count is %zu but should be %u\n",
 			    spdk_mempool_count(g_bdev_mgr.buf_small_pool),
-			    BUF_SMALL_POOL_SIZE);
+			    g_bdev_opts.bdev_buf_small_pool_size);
 		assert(false);
 	}
 
-	if (spdk_mempool_count(g_bdev_mgr.buf_large_pool) != BUF_LARGE_POOL_SIZE) {
+	if (spdk_mempool_count(g_bdev_mgr.buf_large_pool) != g_bdev_opts.bdev_buf_large_pool_size) {
 		SPDK_ERRLOG("Large buffer pool count is %zu but should be %u\n",
 			    spdk_mempool_count(g_bdev_mgr.buf_large_pool),
-			    BUF_LARGE_POOL_SIZE);
+			    g_bdev_opts.bdev_buf_large_pool_size);
 		assert(false);
 	}
 
