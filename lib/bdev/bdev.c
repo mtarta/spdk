@@ -1053,11 +1053,11 @@ spdk_bdev_initialize(spdk_bdev_init_cb cb_fn, void *cb_arg)
 	 *   using spdk_thread_get_count() to determine how many local caches we need
 	 *   to account for.
 	 */
-	cache_size = bdev_opts.bdev_buf_small_pool_size / (2 * spdk_thread_get_count());
+	cache_size = g_bdev_opts.bdev_buf_small_pool_size / (2 * spdk_thread_get_count());
 	snprintf(mempool_name, sizeof(mempool_name), "buf_small_pool_%d", getpid());
 
 	g_bdev_mgr.buf_small_pool = spdk_mempool_create(mempool_name,
-				    bdev_opts.bdev_buf_small_pool_size,
+				    g_bdev_opts.bdev_buf_small_pool_size,
 				    SPDK_BDEV_BUF_SIZE_WITH_MD(SPDK_BDEV_SMALL_BUF_MAX_SIZE) +
 				    SPDK_BDEV_POOL_ALIGNMENT,
 				    cache_size,
@@ -1070,11 +1070,11 @@ spdk_bdev_initialize(spdk_bdev_init_cb cb_fn, void *cb_arg)
 
 	SPDK_NOTICELOG("Small buffer pool size: %d\n", g_bdev_opts.bdev_buf_small_pool_size);
 
-	cache_size = bdev_opts.bdev_buf_large_pool_size / (2 * spdk_thread_get_count());
+	cache_size = g_bdev_opts.bdev_buf_large_pool_size / (2 * spdk_thread_get_count());
 	snprintf(mempool_name, sizeof(mempool_name), "buf_large_pool_%d", getpid());
 
 	g_bdev_mgr.buf_large_pool = spdk_mempool_create(mempool_name,
-				    bdev_opts.bdev_buf_large_pool_size,
+				    g_bdev_opts.bdev_buf_large_pool_size,
 				    SPDK_BDEV_BUF_SIZE_WITH_MD(SPDK_BDEV_LARGE_BUF_MAX_SIZE) +
 				    SPDK_BDEV_POOL_ALIGNMENT,
 				    cache_size,
